@@ -69,9 +69,40 @@ declare module 'harper.js' {
 		dialect?: Dialect;
 	}
 
+	/** A flat map of rule name -> enabled (true/false) or null (use default). */
+	export type LintConfig = Record<string, boolean | null>;
+
 	export class LocalLinter {
 		constructor(init: LinterInit);
 		setup(): Promise<void>;
 		lint(text: string, options?: LintOptions): Promise<Lint[]>;
+		/** Lint, keeping each Lint grouped under the source rule name. */
+		organizedLints(text: string, options?: LintOptions): Promise<Record<string, Lint[]>>;
+
+		// --- dialect -----------------------------------------------------------
+		getDialect(): Promise<Dialect>;
+		/** Rebuilds the underlying linter for the new dialect. */
+		setDialect(dialect: Dialect): Promise<void>;
+
+		// --- rule config -------------------------------------------------------
+		getDefaultLintConfig(): Promise<LintConfig>;
+		getLintConfig(): Promise<LintConfig>;
+		setLintConfig(config: LintConfig): Promise<void>;
+
+		// --- user dictionary ---------------------------------------------------
+		/** Add words to the user dictionary. Batch where possible. */
+		importWords(words: string[]): Promise<void>;
+		/** Clear words added via importWords (leaves the curated dictionary). */
+		clearWords(): Promise<void>;
+		exportWords(): Promise<string[]>;
+
+		// --- ignored lints -----------------------------------------------------
+		ignoreLint(source: string, lint: Lint): Promise<void>;
+		ignoreLints(source: string, lints: Lint[]): Promise<void>;
+		/** Serialize ignored lints to a JSON list of privacy-respecting hashes. */
+		exportIgnoredLints(): Promise<string>;
+		/** Append ignored lints from a previously exported JSON list. */
+		importIgnoredLints(json: string): Promise<void>;
+		clearIgnoredLints(): Promise<void>;
 	}
 }

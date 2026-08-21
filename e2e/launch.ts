@@ -53,8 +53,27 @@ export function assertE2EReady(): void {
   }
 }
 
-/** Create a fresh, isolated Joplin profile. Loads this plugin from ./dist unless loadPlugin=false. */
-export function createProfile(loadPlugin = true): string {
+/** The Joplin settings.json prefix for this plugin's own settings (see Joplin's
+ * getPluginSettingKeyPrefix: `plugin-<id>.`). Our settings use File storage, so presetting
+ * `plugin-<id>.<key>` in settings.json makes the plugin read that value on startup. */
+export const PLUGIN_SETTING_PREFIX = `plugin-${PLUGIN_ID}.`;
+
+/** Build a `plugin-<id>.<key>` settings.json key for one of this plugin's settings. */
+export function pluginSettingKey(key: string): string {
+  return `${PLUGIN_SETTING_PREFIX}${key}`;
+}
+
+/**
+ * Create a fresh, isolated Joplin profile. Loads this plugin from ./dist unless loadPlugin=false.
+ *
+ * `harperSettings` presets this plugin's own settings (e.g. `{ dialect: 'British' }`) into
+ * settings.json under the `plugin-<id>.` namespace, so a spec can boot Joplin with the plugin
+ * already configured (dialect, external dictionary path, …) without driving the settings UI.
+ */
+export function createProfile(
+  loadPlugin = true,
+  harperSettings: Record<string, unknown> = {}
+): string {
   const profilesRoot = path.join(REPO_ROOT, 'e2e', '.profiles');
   fs.mkdirSync(profilesRoot, { recursive: true });
   const profileDir = fs.mkdtempSync(path.join(profilesRoot, 'profile-'));
@@ -68,6 +87,9 @@ export function createProfile(loadPlugin = true): string {
     'sync.target': 0,
   };
   if (loadPlugin) settings['plugins.devPluginPaths'] = PLUGIN_DIST;
+  for (const [key, value] of Object.entries(harperSettings)) {
+    settings[pluginSettingKey(key)] = value;
+  }
   fs.writeFileSync(
     path.join(profileDir, 'settings.json'),
     JSON.stringify(settings, null, 2),
@@ -129,11 +151,11 @@ function waitForExit(child: ChildProcess, timeoutMs: number): Promise<void> {
  * sometimes starts, answers the debugging endpoint and then quits again over the profile lock.
  */
 export async function launchJoplin(
-  opts: { loadPlugin?: boolean; profileDir?: string } = {}
+  opts: { loadPlugin?: boolean; profileDir?: string; harperSettings?: Record<string, unknown> } = {}
 ): Promise<JoplinInstance> {
   const { loadPlugin = true } = opts;
   assertE2EReady();
-  const profileDir = opts.profileDir ?? createProfile(loadPlugin);
+  const profileDir = opts.profileDir ?? createProfile(loadPlugin, opts.harperSettings ?? {});
 
   let lastError: unknown;
   for (let attempt = 1; attempt <= 3; attempt++) {

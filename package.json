@@ -1,6 +1,6 @@
 {
   "name": "joplin-plugin-harper",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Harper grammar checker for the Joplin desktop Markdown (CodeMirror 6) editor.",
   "repository": {
     "type": "git",

@@ -217,8 +217,11 @@ const pluginConfig = { ...baseConfig, entry: './src/index.ts',
 					},
 				},
 				// HARPER: ship the WASM binary inside dist/ so it is tarred into the .jpl. The plugin
-				// main process loads it at runtime via a file:// URL built from installationDir().
-				// (Deviation from the stock generator config; see docs/SPEC.md WASM loading decision.)
+				// main process reads these bytes at runtime (Node `fs` via __non_webpack_require__),
+				// base64-encodes them into a `data:` URL and hands that to createBinaryModuleFromUrl.
+				// We deliberately do NOT use a file:// URL: harper.js's file:// path does a native
+				// `import('fs')` that the Electron renderer's Blink module loader cannot resolve.
+				// (Deviation from the stock generator config; see docs/research/phase0-spike-*.md.)
 				{
 					from: 'harper_wasm_bg.wasm',
 					context: path.resolve(__dirname, 'node_modules/harper.js/dist'),

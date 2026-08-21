@@ -1,20 +1,39 @@
-// Harper walking-skeleton harness suite.
+// Harper harness suite (Phase 1 MVP).
 //
 // Runner + assertion frame follow joplin-plugin-cockpit's test/run.js (a tiny homemade test()
-// runner with a failures counter; process.exit(failures ? 1 : 0)). The fixtures and assertions are
-// Harper's: they drive the REAL harper.js linter (LocalLinter works in Node) through the compiled
-// dist/index.js bundle via the stubbed joplin global, and they pin the version quadruple.
+// runner with a failures counter; process.exit(failures ? 1 : 0)). The fixtures drive the REAL
+// harper.js linter (LocalLinter works in Node) through the compiled dist/index.js bundle via the
+// stubbed joplin global. Dictionary/ignore-state IO goes through joplin.require('fs-extra'), which
+// we back with the real fs-extra wrapped in a readFileSync counter so budget claims are testable.
 
 const assert = require('assert');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+const fsExtra = require('fs-extra');
 const { run } = require('./harness');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const DIST_DIR = path.join(REPO_ROOT, 'dist');
 
-// index.ts does not call joplin.require(); a throwing stub proves that.
-const noRequire = (name) => { throw new Error(`Unexpected joplin.require(${name})`); };
+// Wrap the real fs-extra so a test can count how many readFileSync calls a given operation makes
+// (used to prove the 60s dictionary poll does ZERO file reads when the mtime is unchanged).
+let fsReadCount = 0;
+const countingFsExtra = new Proxy(fsExtra, {
+	get(target, prop) {
+		if (prop === 'readFileSync') {
+			return (...args) => {
+				fsReadCount++;
+				return target.readFileSync(...args);
+			};
+		}
+		return target[prop];
+	},
+});
+const requireStub = (name) => {
+	if (name === 'fs-extra') return countingFsExtra;
+	throw new Error(`Unexpected joplin.require(${name})`);
+};
 
 let failures = 0;
 async function test(name, fn) {
@@ -59,12 +78,15 @@ async function main() {
 		throw new Error('dist/harper_wasm_bg.wasm not found — the WASM copy step did not run.');
 	}
 
+	// A throwaway per-run data dir so the plugin can write userWords.txt / ignoredLints.json.
+	const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-test-data-'));
+
 	// installationDir points at the built dist/, where the .wasm was copied, so the plugin's
-	// file:// loader finds the real binary — exactly as it will inside a real Joplin install.
+	// data:-URL loader finds the real binary — exactly as it will inside a real Joplin install.
 	const state = await run({
-		dataDir: path.join(DIST_DIR),
+		dataDir,
 		installationDir: DIST_DIR,
-		require: noRequire,
+		require: requireStub,
 		versionInfo: { version: '3.6.14', platform: 'desktop' },
 	});
 
@@ -87,8 +109,32 @@ async function main() {
 		);
 	});
 
-	// ---- lint round-trip (real harper.js) -----------------------------------
+	// ---- settings registration ----------------------------------------------
+	await test("settings section 'harper' + all 5 keys registered with correct defaults", () => {
+		const defs = state.registeredSettings;
+		assert.ok(defs, 'registerSettings was called');
+		const keys = ['enabled', 'dialect', 'debounceMs', 'dictionaryPath', 'ruleOverrides'];
+		for (const k of keys) assert.ok(defs[k], `setting "${k}" is registered`);
+		assert.strictEqual(defs.enabled.value, true, 'enabled default true');
+		assert.strictEqual(defs.dialect.value, 'American', 'dialect default American');
+		assert.strictEqual(defs.debounceMs.value, 500, 'debounceMs default 500');
+		assert.strictEqual(defs.dictionaryPath.value, '', 'dictionaryPath default empty');
+		assert.strictEqual(defs.ruleOverrides.value, '', 'ruleOverrides default empty');
+		for (const k of keys) assert.strictEqual(defs[k].section, 'harper', `${k} in section harper`);
+		for (const k of keys) assert.strictEqual(defs[k].public, true, `${k} is public`);
+		assert.strictEqual(defs.dialect.isEnum, true, 'dialect isEnum');
+		assert.ok(defs.dialect.options && defs.dialect.options.British, 'dialect exposes British option');
+		assert.strictEqual(defs.ruleOverrides.advanced, true, 'ruleOverrides is advanced');
+	});
+
+	// ---- config handshake ---------------------------------------------------
 	const handler = state.contentScriptMessageHandlers['harperCm'];
+	await test('getConfig returns {enabled, debounceMs} for the content script', async () => {
+		const config = await handler({ type: 'getConfig' });
+		assert.deepStrictEqual(config, { enabled: true, debounceMs: 500 });
+	});
+
+	// ---- lint round-trip (real harper.js) -----------------------------------
 	const sampleText = 'This is an test of the plugin. I beleive it works.';
 
 	// Measure linter init: the FIRST lint call pays the binary load + setup cost.
@@ -98,8 +144,6 @@ async function main() {
 
 	await test('lint response is a plain-JSON array (no WASM handles leak across IPC)', () => {
 		assert.ok(Array.isArray(response), 'response is an array');
-		// A round-trip through JSON must be a deep-equal no-op: WASM Lint/Suggestion handles would
-		// either throw or serialize to {} and fail this. Plain objects survive unchanged.
 		assert.deepStrictEqual(JSON.parse(JSON.stringify(response)), response, 'response is plain JSON');
 	});
 
@@ -107,6 +151,13 @@ async function main() {
 		assert.ok(response.length >= 1, `expected >=1 lint, got ${response.length}`);
 		const withSuggestion = response.filter((l) => l.suggestions && l.suggestions.length >= 1);
 		assert.ok(withSuggestion.length >= 1, 'at least one lint carries a suggestion');
+	});
+
+	await test('every lint carries a non-empty ruleName (organizedLints key)', () => {
+		for (const lint of response) {
+			assert.strictEqual(typeof lint.ruleName, 'string', 'ruleName is a string');
+			assert.ok(lint.ruleName.length >= 1, `ruleName present for "${lint.problemText}"`);
+		}
 	});
 
 	await test('every span indexes its own problemText in the source string', () => {
@@ -139,6 +190,114 @@ async function main() {
 		}
 	});
 
+	// ---- external dictionary + poll budget ----------------------------------
+	const dictFile = path.join(dataDir, 'external-dict.txt');
+	fs.writeFileSync(dictFile, 'Sxope\nZlorp\n', 'utf8');
+	await state.setSetting('dictionaryPath', dictFile);
+
+	await test('words in the external dictionary are not flagged; an unknown word is', async () => {
+		const r = await handler({ type: 'lint', text: 'Sxope and Zlorp but not Qwertyxz.' });
+		const spelled = r.filter((l) => l.kind === 'Spelling').map((l) => l.problemText);
+		assert.ok(!spelled.includes('Sxope'), '"Sxope" (in dict) is not a Spelling lint');
+		assert.ok(!spelled.includes('Zlorp'), '"Zlorp" (in dict) is not a Spelling lint');
+		assert.ok(spelled.includes('Qwertyxz'), '"Qwertyxz" (not in dict) IS a Spelling lint');
+	});
+
+	await test('dictionary poll with unchanged mtime does ZERO file reads', async () => {
+		const pollTimer = state.intervals.find((i) => i.ms === 60000 && !i.cleared);
+		assert.ok(pollTimer, 'a 60s dictionary poll interval was armed');
+		const before = fsReadCount;
+		await pollTimer.fn();
+		assert.strictEqual(fsReadCount, before, 'no readFileSync during an unchanged poll tick');
+	});
+
+	// ---- add-to-dictionary flow ---------------------------------------------
+	await test('addWord appends exactly "word\\n" to the external file and stops flagging it', async () => {
+		assert.ok(
+			(await handler({ type: 'lint', text: 'Qwertyxz alone.' })).some(
+				(l) => l.problemText === 'Qwertyxz' && l.kind === 'Spelling',
+			),
+			'precondition: Qwertyxz is flagged before adding',
+		);
+		const before = fs.readFileSync(dictFile, 'utf8');
+		await handler({ type: 'addWord', word: 'Qwertyxz' });
+		const after = fs.readFileSync(dictFile, 'utf8');
+		assert.strictEqual(after, `${before}Qwertyxz\n`, 'appended exactly "Qwertyxz\\n"');
+		const r = await handler({ type: 'lint', text: 'Qwertyxz alone.' });
+		assert.ok(
+			!r.some((l) => l.problemText === 'Qwertyxz' && l.kind === 'Spelling'),
+			'Qwertyxz no longer flagged after addWord',
+		);
+	});
+
+	// ---- disable-rule flow --------------------------------------------------
+	await test('disableRule removes the rule from subsequent lints and persists {rule:false}', async () => {
+		const anBefore = (await handler({ type: 'lint', text: 'This is an test.' })).filter(
+			(l) => l.ruleName === 'AnA',
+		);
+		assert.ok(anBefore.length >= 1, 'precondition: AnA fires on "an test"');
+		await handler({ type: 'disableRule', ruleName: 'AnA' });
+		const anAfter = (await handler({ type: 'lint', text: 'This is an test.' })).filter(
+			(l) => l.ruleName === 'AnA',
+		);
+		assert.strictEqual(anAfter.length, 0, 'AnA no longer fires after disableRule');
+		const overrides = JSON.parse(await state.settings.ruleOverrides);
+		assert.strictEqual(overrides.AnA, false, 'ruleOverrides setting contains {AnA:false}');
+		// reset so later assertions are unaffected
+		await state.setSetting('ruleOverrides', '');
+	});
+
+	// ---- ignore-lint flow ---------------------------------------------------
+	await test('ignoreLint drops that finding and persists an ignore-state file in dataDir', async () => {
+		const text = 'I saw teh cat.';
+		const before = await handler({ type: 'lint', text });
+		const teh = before.find((l) => l.problemText === 'teh');
+		assert.ok(teh, 'precondition: "teh" is flagged');
+		await handler({
+			type: 'ignoreLint',
+			text,
+			start: teh.start,
+			end: teh.end,
+			ruleName: teh.ruleName,
+		});
+		const after = await handler({ type: 'lint', text });
+		assert.ok(!after.some((l) => l.problemText === 'teh'), '"teh" finding is gone after ignoreLint');
+		assert.ok(
+			fs.existsSync(path.join(dataDir, 'ignoredLints.json')),
+			'ignoredLints.json persisted in dataDir',
+		);
+	});
+
+	// ---- enabled=false returns [] -------------------------------------------
+	await test('enabled=false makes lint requests return []', async () => {
+		await state.setSetting('enabled', false);
+		const r = await handler({ type: 'lint', text: 'This is an test with beleive.' });
+		assert.deepStrictEqual(r, [], 'no lints while disabled');
+		await state.setSetting('enabled', true);
+	});
+
+	// ---- dialect change -----------------------------------------------------
+	await test('dialect: "colour" flagged under American, not under British', async () => {
+		await state.setSetting('dialect', 'American');
+		const us = await handler({ type: 'lint', text: 'I like the colour red.' });
+		assert.ok(
+			us.some((l) => l.problemText === 'colour' && l.kind === 'Spelling'),
+			'"colour" is a Spelling lint under American',
+		);
+		await state.setSetting('dialect', 'British');
+		const gb = await handler({ type: 'lint', text: 'I like the colour red.' });
+		assert.ok(!gb.some((l) => l.problemText === 'colour'), '"colour" not flagged under British');
+		await state.setSetting('dialect', 'American');
+	});
+
+	// ---- invalid ruleOverrides JSON never throws ----------------------------
+	await test('invalid ruleOverrides JSON is ignored and never throws', async () => {
+		await state.setSetting('ruleOverrides', 'this is { not json');
+		const r = await handler({ type: 'lint', text: 'This is an test.' });
+		assert.ok(Array.isArray(r), 'lint still returns an array with invalid ruleOverrides');
+		await state.setSetting('ruleOverrides', '');
+	});
+
 	// ---- latency on a ~5 KB doc, median of 5 --------------------------------
 	const doc = makeMarkdownDoc(5 * 1024);
 	const docBytes = Buffer.byteLength(doc, 'utf8');
@@ -159,12 +318,12 @@ async function main() {
 	// The four version fields (package.json, src/manifest.json, and BOTH package-lock fields) must
 	// stay pinned together; a stale lockfile drifted them once in the sibling project. Bump all four
 	// on every release, or the harness (and thus the publish gate) fails.
-	await test('version: package.json, manifest, and both package-lock fields are all 0.1.0', () => {
+	await test('version: package.json, manifest, and both package-lock fields are all 0.2.0', () => {
 		const readJSON = (...rel) => JSON.parse(fs.readFileSync(path.join(REPO_ROOT, ...rel), 'utf8'));
 		const pkg = readJSON('package.json');
 		const manifest = readJSON('src', 'manifest.json');
 		const lock = readJSON('package-lock.json');
-		const expected = '0.1.0';
+		const expected = '0.2.0';
 		assert.strictEqual(pkg.version, expected, 'package.json version');
 		assert.strictEqual(manifest.version, expected, 'src/manifest.json version');
 		assert.strictEqual(lock.version, expected, 'package-lock.json top-level version');
