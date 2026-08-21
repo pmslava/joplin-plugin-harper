@@ -22,6 +22,8 @@ function makeJoplin(options) {
         toolbarButtons: [],
         menus: [],
         commands: [],
+        // HARPER: every joplin.commands.execute(name, ...args), in order.
+        commandExecutions: [],
         workspaceEvents: [],
         messageBoxes: [],
         notePuts: [],
@@ -129,7 +131,12 @@ function makeJoplin(options) {
         },
         commands: {
             register: async (command) => { state.commands.push(command) },
+            // HARPER: record every execute() call so a test can assert the plugin poked the editor's
+            // `harper.forceLint` re-lint command (via the built-in `editor.execCommand`) after a
+            // settings change. Built-in commands like `editor.execCommand` aren't registered by the
+            // plugin, so they just record + no-op here.
             execute: async (name, ...args) => {
+                state.commandExecutions.push({ name, args })
                 const command = state.commands.find(c => c.name === name)
                 if (command) return await command.execute(...args)
             },

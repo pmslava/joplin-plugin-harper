@@ -8,8 +8,8 @@ request: your notes never leave your computer. The whole checker (a compiled Web
 ships inside the plugin, so it works fully offline.
 
 As you type in the Markdown editor, Harper underlines spelling and grammar issues with a coloured
-squiggle, and hovering over one opens a small card with the problem, one-click fixes, and follow-up
-actions.
+squiggle, and hovering over (or clicking) an underline opens a small card with the problem,
+one-click fixes, and follow-up actions.
 
 ![The Harper suggestion card and coloured underlines in the Joplin Markdown editor](https://raw.githubusercontent.com/pmslava/joplin-plugin-harper/main/docs/screenshots/card-light.png)
 
@@ -26,8 +26,8 @@ suggestion:
   lint kinds — Spelling, Grammar, Punctuation, Word Choice, Repetition, Redundancy, Style, and more
   (21 in all) — and each kind gets its own squiggle colour, so you can tell a misspelling from a
   style nudge at a glance. The colours are Harper's own and work in both light and dark themes.
-- **A suggestion card.** Hover over an underline to open a card that shows the issue type, Harper's
-  explanation with the flagged word highlighted, and the available fixes.
+- **A suggestion card.** Hover over (or click) an underline to open a card that shows the issue
+  type, Harper's explanation with the flagged word highlighted, and the available fixes.
 - **Apply a fix in one click.** Each suggestion is a pill; clicking it rewrites the text (replace,
   remove, or insert) directly in the editor.
 - **Add to dictionary.** Spelling cards include an add-to-dictionary button, so a name or term you
@@ -64,7 +64,7 @@ Open **Tools → Options → Harper** (desktop).
 | --- | --- | --- |
 | **Enable Harper grammar checking** | On | Master switch. When off, no underlines are shown. |
 | **English dialect** | American | Which English variety Harper checks against: American, British, Australian, or Canadian. |
-| **Lint debounce (ms)** | `500` | How long the editor waits after you stop typing before re-checking, in milliseconds (0–10000). Reopen the note to apply a change to this value. |
+| **Lint debounce (ms)** | `500` | How long the editor waits after you stop typing before re-checking, in milliseconds (0–10000). Changes apply immediately. |
 | **External dictionary file** | *(empty)* | Absolute path to a plain-text dictionary (one word per line). Empty means the plugin uses its own private word list. See [External dictionary](#external-dictionary). |
 | **Rule overrides (JSON)** | *(empty)* | *Advanced.* A JSON object of `{"RuleName": true \| false}` applied on top of the defaults, e.g. `{"SpelledNumbers": false}`. Invalid JSON is ignored. |
 

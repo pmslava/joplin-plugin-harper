@@ -525,7 +525,7 @@ async function registerSettings(): Promise<void> {
 			maximum: 10000,
 			step: 50,
 			label: 'Lint debounce (ms)',
-			description: 'Idle delay after typing before re-linting. Reopen the note to apply a change.',
+			description: 'Idle delay after typing before re-linting. Changes apply immediately.',
 			storage: SettingStorage.File,
 		},
 		dictionaryPath: {

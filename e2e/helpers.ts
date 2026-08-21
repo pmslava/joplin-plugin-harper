@@ -140,6 +140,32 @@ export async function openHarperCard(win: Page, word: string) {
 export const openLintTooltip = openHarperCard;
 
 /**
+ * Open the Harper card by CLICKING the lint underline for `word` (v1.0.1 click-to-open) — NOT via the
+ * hover helper. We click the `.cm-lintRange`, then move the pointer to a neutral corner and wait: a
+ * hover tooltip would close once the pointer leaves, so a card that SURVIVES the pointer-away proves
+ * it was opened by the click path. Returns the click-tooltip's `.harper-container` locator.
+ *
+ * (Playwright's `.click()` necessarily moves the mouse onto the element to click it; the pointer-away
+ * step afterwards is what isolates the click path from the hover path.)
+ */
+export async function openHarperCardByClick(win: Page, word: string) {
+  const range = win.locator('.cm-lintRange').filter({ hasText: word }).first();
+  await range.scrollIntoViewIfNeeded();
+  await range.click({ force: true });
+  // Park the pointer far from any underline so the hover tooltip cannot be what we then observe.
+  await win.mouse.move(4, 4);
+  await win.waitForTimeout(400);
+  const card = win.locator('.cm-tooltip.harper-click-tooltip .harper-container');
+  for (let attempt = 0; attempt < 6; attempt++) {
+    if (await card.count()) return card.first();
+    await range.click({ force: true });
+    await win.mouse.move(4, 4);
+    await win.waitForTimeout(400);
+  }
+  throw new Error(`Harper click-to-open card for "${word}" never appeared`);
+}
+
+/**
  * Click the FIRST suggestion pill in an open card. Suggestion pills live in the LEFT footer cluster
  * (`.harper-footer > .harper-child-cont:first-child > .harper-btn`), so the first pill is the top
  * suggested fix. Returns its label for assertions.

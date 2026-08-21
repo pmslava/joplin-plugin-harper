@@ -134,6 +134,24 @@ async function main() {
 		assert.deepStrictEqual(config, { enabled: true, debounceMs: 500 });
 	});
 
+	// ---- live debounce apply (v1.0.1) ---------------------------------------
+	// The content script owns a MUTABLE debounce delay that it refreshes by re-querying `getConfig`
+	// when the plugin main process pokes the `harper.forceLint` editor command after a settings
+	// change. Timing behavior lives in the CM6 content script (not driven by this harness), so we
+	// prove the two halves the harness CAN observe: (a) a debounceMs change is a poke, and (b)
+	// getConfig immediately reflects the new value — i.e. the live-refresh reads the fresh delay.
+	await test('changing debounceMs pokes harper.forceLint and getConfig reflects the new value live', async () => {
+		const before = state.commandExecutions.length;
+		await state.setSetting('debounceMs', 1234);
+		const pokes = state.commandExecutions
+			.slice(before)
+			.filter((e) => e.name === 'editor.execCommand' && e.args[0] && e.args[0].name === 'harper.forceLint');
+		assert.ok(pokes.length >= 1, 'a debounceMs change pokes editor.execCommand{harper.forceLint}');
+		const config = await handler({ type: 'getConfig' });
+		assert.strictEqual(config.debounceMs, 1234, 'getConfig returns the just-changed debounceMs (live, no reopen)');
+		await state.setSetting('debounceMs', 500); // restore default for later measurements
+	});
+
 	// ---- lint round-trip (real harper.js) -----------------------------------
 	const sampleText = 'This is an test of the plugin. I beleive it works.';
 
@@ -343,12 +361,12 @@ async function main() {
 	// The four version fields (package.json, src/manifest.json, and BOTH package-lock fields) must
 	// stay pinned together; a stale lockfile drifted them once in the sibling project. Bump all four
 	// on every release, or the harness (and thus the publish gate) fails.
-	await test('version: package.json, manifest, and both package-lock fields are all 1.0.0', () => {
+	await test('version: package.json, manifest, and both package-lock fields are all 1.0.1', () => {
 		const readJSON = (...rel) => JSON.parse(fs.readFileSync(path.join(REPO_ROOT, ...rel), 'utf8'));
 		const pkg = readJSON('package.json');
 		const manifest = readJSON('src', 'manifest.json');
 		const lock = readJSON('package-lock.json');
-		const expected = '1.0.0';
+		const expected = '1.0.1';
 		assert.strictEqual(pkg.version, expected, 'package.json version');
 		assert.strictEqual(manifest.version, expected, 'src/manifest.json version');
 		assert.strictEqual(lock.version, expected, 'package-lock.json top-level version');

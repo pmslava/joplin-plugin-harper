@@ -40,10 +40,21 @@ function findFile(dir: string, name: string): string | null {
  * E2E (b) — IGNORE / DISMISS (Phase-2 card affordance).
  *
  * Dismisses a lint via the card's grey "Dismiss" pill and asserts BOTH that its underline clears
- * while a different lint's underline survives, AND that `ignoredLints.json` now exists in the
- * profile's plugin data dir. Also captures the LIGHT-theme card + underline screenshots (the
- * ui-conformance spec captures the dark-theme pair).
+ * while a different lint's underline survives, AND that `ignoredLints.json` is actually MUTATED by
+ * the dismiss: captured before (absent here, fresh profile) and after, it must now be valid JSON of
+ * harper's export shape (`{"context_hashes":[<u64>,…]}`) with strictly MORE persisted entries than
+ * before. Also captures the LIGHT-theme card + underline screenshots (ui-conformance does the dark pair).
  */
+
+/** Count harper's persisted ignore entries from an exportIgnoredLints() JSON string (or null). */
+function countIgnoredEntries(content: string | null): number {
+  if (!content || !content.trim()) return 0;
+  const parsed = JSON.parse(content) as { context_hashes?: unknown[] };
+  if (!parsed || !Array.isArray(parsed.context_hashes)) {
+    throw new Error(`ignoredLints.json is not harper's {context_hashes:[…]} shape: ${content}`);
+  }
+  return parsed.context_hashes.length;
+}
 test.describe('Harper ignore/dismiss (card)', () => {
   let joplin: JoplinInstance;
 
@@ -80,6 +91,21 @@ test.describe('Harper ignore/dismiss (card)', () => {
     const cardForShot = await openHarperCard(win, 'should of');
     await screenshotCard(win, cardForShot, path.join(SHOTS_DIR, 'card-light.png'));
 
+    // Capture the ignore-state file BEFORE dismissing (fresh profile => normally absent, count 0).
+    const readIgnoreFile = (): string | null => {
+      const p = findFile(profileDir, 'ignoredLints.json');
+      if (!p) return null;
+      try {
+        return fs.readFileSync(p, 'utf8');
+      } catch {
+        return null;
+      }
+    };
+    const beforeContent = readIgnoreFile();
+    const beforeCount = countIgnoredEntries(beforeContent);
+    // eslint-disable-next-line no-console
+    console.log(`[harper-e2e] ignoredLints.json before dismiss: ${JSON.stringify(beforeContent)} (count ${beforeCount})`);
+
     // Re-open the card fresh right before acting: the screenshot's settle wait can let the hover
     // tooltip close, so we don't rely on the just-captured card still being open.
     const card = await openHarperCard(win, 'should of');
@@ -92,13 +118,37 @@ test.describe('Harper ignore/dismiss (card)', () => {
     // ...while the other underline survives.
     expect(await lintRangeCountForWord(win, 'beleive')).toBeGreaterThan(0);
 
-    // ignoredLints.json was persisted in the profile's plugin data dir.
+    // The dismiss must MUTATE ignoredLints.json: the file now exists AND its content changed AND it
+    // holds strictly more persisted entries than before, in harper's {context_hashes:[…]} shape.
     await expect
-      .poll(() => (findFile(profileDir, 'ignoredLints.json') ? 'found' : ''), { timeout: 20_000 })
-      .toBe('found');
+      .poll(
+        () => {
+          const c = readIgnoreFile();
+          if (c === null || c === beforeContent) return -1;
+          try {
+            return countIgnoredEntries(c);
+          } catch {
+            return -1;
+          }
+        },
+        { timeout: 20_000 },
+      )
+      .toBeGreaterThan(beforeCount);
+
     const ignorePath = findFile(profileDir, 'ignoredLints.json');
+    const afterContent = readIgnoreFile();
+    const afterCount = countIgnoredEntries(afterContent);
     // eslint-disable-next-line no-console
-    console.log(`[harper-e2e] ignoredLints.json at ${ignorePath}`);
+    console.log(`[harper-e2e] ignoredLints.json at ${ignorePath} after dismiss: ${JSON.stringify(afterContent)} (count ${afterCount})`);
+
+    // Explicit shape + growth assertions on the final content (the poll already guaranteed change).
     expect(ignorePath).toBeTruthy();
+    expect(afterContent).not.toBe(beforeContent);
+    expect(afterCount).toBeGreaterThan(beforeCount);
+    const parsed = JSON.parse(afterContent as string);
+    expect(Array.isArray(parsed.context_hashes)).toBe(true);
+    expect(parsed.context_hashes.length).toBe(afterCount);
+    // The dismissed "should of" finding is now persisted as at least one ignore entry.
+    expect(afterCount).toBeGreaterThanOrEqual(1);
   });
 });

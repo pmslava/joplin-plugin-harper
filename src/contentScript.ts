@@ -16,11 +16,14 @@
 //     and our injected stylesheet paints the per-kind squiggle for that class.
 //   - the card: each Diagnostic sets `renderMessage(view)` to a hand-built Harper card, and carries
 //     NO stock `actions`, so the hover tooltip shows only our card (Joplin's bundled renderer inserts
-//     the renderMessage() node in place of the default `.cm-diagnosticText`). Hover-to-open is the CM
-//     idiom (the extension uses click) and the one Phase-1's e2e already drives.
+//     the renderMessage() node in place of the default `.cm-diagnosticText`).
+//   - CLICK-to-open (v1.0.1): in ADDITION to hover, a `click` on a lint underline opens the SAME card
+//     (same `renderMessage`/renderCard path) via our own `showTooltip` StateField — see the
+//     `clickCardField` / `buildClickTooltip` block. Hover behavior is untouched.
 
-import { linter, setDiagnostics, Diagnostic } from '@codemirror/lint';
-import { EditorView } from '@codemirror/view';
+import { linter, setDiagnostics, forEachDiagnostic, Diagnostic } from '@codemirror/lint';
+import { EditorView, showTooltip, Tooltip } from '@codemirror/view';
+import { StateField, StateEffect } from '@codemirror/state';
 
 interface PlainSuggestion {
 	kind: 'Replace' | 'Remove' | 'InsertAfter';
@@ -55,6 +58,25 @@ interface CodeMirrorControl {
 
 // Fallback debounce if the config handshake fails (ms).
 const DEFAULT_DELAY_MS = 500;
+
+// -----------------------------------------------------------------------------
+// Click-to-open card (v1.0.1). The card historically opened only on the @codemirror/lint hover
+// tooltip. We add a click affordance WITHOUT touching that path: a StateField holds at most one
+// Tooltip and feeds it to `showTooltip`; a `click` domEventHandler (see the `plugin()` body)
+// hit-tests the diagnostic ranges at the click position and dispatches `setClickCard` with a tooltip
+// whose body is built by the SAME `diagnostic.renderMessage()` (renderCard) used on hover — identical
+// DOM/render path. The field self-closes on any document edit (map-through is unnecessary because the
+// card is transient); Escape, an outside click, and every in-card action dispatch `setClickCard.of(null)`.
+const setClickCard = StateEffect.define<Tooltip | null>();
+const clickCardField = StateField.define<Tooltip | null>({
+	create: () => null,
+	update(value, tr) {
+		if (tr.docChanged) return null; // close on any doc change
+		for (const e of tr.effects) if (e.is(setClickCard)) value = e.value;
+		return value;
+	},
+	provide: (f) => showTooltip.from(f),
+});
 
 // -----------------------------------------------------------------------------
 // Harper's canonical LintKind -> color map (byte-identical to
@@ -145,6 +167,9 @@ const CARD_CSS = `
 .cm-tooltip-lint .cm-diagnostic{padding:0;margin:0;border:none;background:transparent;}
 .cm-tooltip-lint .cm-diagnosticText{display:block;margin:0;}
 .cm-tooltip-lint .cm-diagnosticSource{display:none;}
+/* Click-to-open (v1.0.1): our own showTooltip wrapper is a plain .cm-tooltip (NOT .cm-tooltip-lint),
+   so neutralize the default tooltip chrome — the .harper-container supplies its own border/shadow. */
+.cm-tooltip.harper-click-tooltip{background:transparent;border:none;padding:0;}
 .harper-container{max-width:420px;max-height:400px;overflow-y:auto;background:#ffffff;border:1px solid #d0d7de;border-radius:8px;box-shadow:0 4px 12px rgba(140,149,159,0.3);padding:8px;display:flex;flex-direction:column;z-index:5000;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;pointer-events:auto;}
 /* Joplin's CM editor injects a generated-theme rule ".ͼ1g div,span,a{font-family:inherit}"
    (specificity 0,1,1) that beats ".harper-container" (0,1,0), so the card inherited the editor's
@@ -321,6 +346,16 @@ function closeCard(container: HTMLElement, view: EditorView): void {
 	const tooltip = container.closest('.cm-tooltip') as HTMLElement | null;
 	if (tooltip) tooltip.style.display = 'none';
 	else container.style.display = 'none';
+	// If this card was opened via click-to-open, clear the StateField too so the tooltip is fully
+	// torn down (not merely hidden). Harmless when the card came from the hover tooltip (the field is
+	// already null). Guarded because `view` may be mid-teardown.
+	try {
+		if (view.state.field(clickCardField, false)) {
+			view.dispatch({ effects: setClickCard.of(null) });
+		}
+	} catch {
+		/* ignore */
+	}
 	try {
 		view.focus();
 	} catch {
@@ -515,6 +550,35 @@ function toDiagnostic(
 	};
 }
 
+/**
+ * Build the `showTooltip` Tooltip for a click-opened card. Anchors to the diagnostic span [from,to)
+ * and renders the card via `diagnostic.renderMessage(view)` — the exact same builder the hover
+ * tooltip uses, so the card DOM is identical.
+ *
+ * CM6 adds the `cm-tooltip` class DIRECTLY to the TooltipView's `dom` (it does not interpose its own
+ * wrapper). If we returned the `.harper-container` as `dom`, CM's `.cm-tooltip` base-theme chrome
+ * would land on the card itself and fight its own border/background/padding. So we return a thin
+ * WRAPPER div (which becomes `.cm-tooltip.harper-click-tooltip`, neutralized by CARD_CSS exactly like
+ * the hover card's `.cm-tooltip-lint` wrapper) and nest the real card inside it — mirroring the hover
+ * DOM: `.cm-tooltip.harper-click-tooltip > .harper-container`.
+ */
+function buildClickTooltip(from: number, to: number, diagnostic: Diagnostic): Tooltip {
+	return {
+		pos: from,
+		end: to,
+		above: false,
+		create: (view: EditorView) => {
+			const card = diagnostic.renderMessage
+				? (diagnostic.renderMessage(view) as HTMLElement)
+				: document.createElement('div');
+			const dom = document.createElement('div');
+			dom.className = 'harper-click-tooltip';
+			dom.appendChild(card);
+			return { dom };
+		},
+	};
+}
+
 export default (context: ContentScriptContext) => {
 	return {
 		plugin: (editorControl: CodeMirrorControl) => {
@@ -551,15 +615,65 @@ export default (context: ContentScriptContext) => {
 				);
 			};
 
-			// Ask the plugin main process for the configured debounce before building the linter.
-			// (Changing debounceMs later requires reopening the note; documented tradeoff.)
+			// LIVE DEBOUNCE (v1.0.1). The @codemirror/lint `linter()` delay is fixed at creation, so a
+			// debounceMs change used to require reopening the note. Instead we run the linter with delay
+			// 0 and do our OWN debouncing here against a MUTABLE `currentDelay`: every doc-changed call
+			// clears the previous timer and arms a new one, so only the last settles into a `runLint`
+			// (one lint per idle window). `currentDelay` is refreshed live by the `harper.forceLint`
+			// command below, which the plugin main process pokes after any settings change.
+			let currentDelay = DEFAULT_DELAY_MS;
+			let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+			const debouncedLint = (view: EditorView): Promise<Diagnostic[]> =>
+				new Promise<Diagnostic[]>((resolve) => {
+					if (debounceTimer) clearTimeout(debounceTimer);
+					debounceTimer = setTimeout(() => {
+						debounceTimer = null;
+						void runLint(view).then(resolve, () => resolve([]));
+					}, currentDelay);
+				});
+
+			// Click-to-open: hit-test the diagnostic ranges at the click position and (if a lint is hit)
+			// open the SAME card anchored to that diagnostic; Escape / an outside click close it.
+			const clickExtension = [
+				clickCardField,
+				EditorView.domEventHandlers({
+					mousedown: (event: MouseEvent, view: EditorView): boolean => {
+						// Only react to a primary-button click that lands ON a lint underline; otherwise,
+						// if a card is open, an "outside" click closes it. Return false so we never
+						// interfere with cursor placement / selection.
+						if (event.button !== 0) return false;
+						const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
+						if (pos == null) return false;
+						let hit: { from: number; to: number; d: Diagnostic } | null = null;
+						forEachDiagnostic(view.state, (d, from, to) => {
+							if (!hit && from <= pos && pos <= to) hit = { from, to, d };
+						});
+						if (hit) {
+							const h = hit as { from: number; to: number; d: Diagnostic };
+							view.dispatch({ effects: setClickCard.of(buildClickTooltip(h.from, h.to, h.d)) });
+						} else if (view.state.field(clickCardField, false)) {
+							view.dispatch({ effects: setClickCard.of(null) });
+						}
+						return false;
+					},
+					keydown: (event: KeyboardEvent, view: EditorView): boolean => {
+						if (event.key === 'Escape' && view.state.field(clickCardField, false)) {
+							view.dispatch({ effects: setClickCard.of(null) });
+						}
+						return false;
+					},
+				}),
+			];
+			editorControl.addExtension(clickExtension);
+
+			// Ask the plugin main process for the configured debounce before building the linter, then
+			// keep it live via the `harper.forceLint` poke.
 			void (async () => {
-				let delay = DEFAULT_DELAY_MS;
 				try {
 					const config = (await context.postMessage({ type: 'getConfig' })) as
 						| { enabled: boolean; debounceMs: number }
 						| null;
-					if (config && typeof config.debounceMs === 'number') delay = config.debounceMs;
+					if (config && typeof config.debounceMs === 'number') currentDelay = config.debounceMs;
 				} catch {
 					/* keep the default */
 				}
@@ -567,14 +681,25 @@ export default (context: ContentScriptContext) => {
 				// Inject styles eagerly so the first underline paints with the per-kind color.
 				ensureStyles();
 
-				editorControl.addExtension(linter(runLint, { delay }));
+				// linter delay 0: our `debouncedLint` owns the idle-delay against the mutable value.
+				editorControl.addExtension(linter(debouncedLint, { delay: 0 }));
 
 				// Register the command the plugin main process pokes after settings/dictionary changes.
 				// We read `editorControl.editor` freshly on each invocation so a note switch (new view)
 				// is handled, and re-lint via `relint` (setDiagnostics) rather than the no-op
-				// `forceLinting`. `harper.forceLint` therefore genuinely refreshes the underlines.
+				// `forceLinting`. `harper.forceLint` therefore genuinely refreshes the underlines AND
+				// re-reads debounceMs (via getConfig) so a debounce change applies live — no note reopen.
 				try {
 					editorControl.registerCommand('harper.forceLint', () => {
+						void context.postMessage({ type: 'getConfig' }).then(
+							(config) => {
+								const c = config as { debounceMs?: number } | null;
+								if (c && typeof c.debounceMs === 'number') currentDelay = c.debounceMs;
+							},
+							() => {
+								/* keep the current delay */
+							},
+						);
 						const current = editorControl.editor;
 						if (current) relint(current);
 					});
