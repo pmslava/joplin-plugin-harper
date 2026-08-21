@@ -146,9 +146,19 @@ const CARD_CSS = `
 .cm-tooltip-lint .cm-diagnosticText{display:block;margin:0;}
 .cm-tooltip-lint .cm-diagnosticSource{display:none;}
 .harper-container{max-width:420px;max-height:400px;overflow-y:auto;background:#ffffff;border:1px solid #d0d7de;border-radius:8px;box-shadow:0 4px 12px rgba(140,149,159,0.3);padding:8px;display:flex;flex-direction:column;z-index:5000;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;pointer-events:auto;}
+/* Joplin's CM editor injects a generated-theme rule ".ͼ1g div,span,a{font-family:inherit}"
+   (specificity 0,1,1) that beats ".harper-container" (0,1,0), so the card inherited the editor's
+   MONOSPACE font. Re-apply the spec's sans stack to the container's div/span/a descendants at higher
+   specificity (0,2,1) so the card renders sans-serif like Harper's extension; <code> stays monospace. */
+.harper-container,.harper-container div,.harper-container span,.harper-container a{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;}
+.harper-container button{font-family:inherit;}
 .harper-header{display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:14px;line-height:20px;color:#1f2328;padding-bottom:4px;margin-bottom:4px;user-select:none;}
 .harper-title{display:flex;align-items:center;gap:6px;}
-.harper-body{font-size:14px;line-height:20px;color:#57606a;}
+/* Spec (§2.3) pins font-size/line-height/color but is SILENT on body margins, and §2.7's footer has
+   no margin-top, so the message line sat 4px below the header and 0px above the pills — cramped vs the
+   extension. Judgment call: add modest vertical margins (top 4px -> 8px total header gap given the
+   header's spec'd margin-bottom:4px; bottom 8px -> 8px pill gap) for the extension's roomier rhythm. */
+.harper-body{font-size:14px;line-height:20px;color:#57606a;margin-top:4px;margin-bottom:8px;}
 .harper-body code{text-decoration:underline solid var(--harper-kind-color) 2px;padding:0.125rem;border-radius:0.25rem;}
 .harper-btn{display:inline-flex;align-items:center;justify-content:center;gap:4px;cursor:pointer;border:none;border-radius:6px;padding:3px 6px;min-height:28px;font-size:13px;font-weight:600;line-height:20px;transition:background 120ms ease,transform 80ms ease;}
 .harper-btn:hover{filter:brightness(0.92);}
