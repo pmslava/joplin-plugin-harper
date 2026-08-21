@@ -1,10 +1,15 @@
 {
   "name": "joplin-plugin-harper",
-  "version": "0.3.1",
-  "description": "Harper grammar checker for the Joplin desktop Markdown (CodeMirror 6) editor.",
+  "version": "1.0.0",
+  "description": "Fast, offline, private grammar and spelling checking for the Joplin desktop Markdown editor, powered by Harper.",
+  "author": "pmslava",
+  "homepage": "https://github.com/pmslava/joplin-plugin-harper#readme",
+  "bugs": {
+    "url": "https://github.com/pmslava/joplin-plugin-harper/issues"
+  },
   "repository": {
     "type": "git",
-    "url": "https://github.com/pmslava/joplin-plugin-harper"
+    "url": "git+https://github.com/pmslava/joplin-plugin-harper.git"
   },
   "publishConfig": {
     "access": "public"
@@ -25,8 +30,10 @@
     "harper",
     "grammar",
     "spelling",
+    "spell-check",
     "linter",
-    "proofreading"
+    "proofreading",
+    "writing"
   ],
   "devDependencies": {
     "@codemirror/lint": "^6.8.0",
