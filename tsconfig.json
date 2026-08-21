@@ -1,0 +1,21 @@
+{
+	"compilerOptions": {
+		"outDir": "./dist/",
+		"module": "commonjs",
+		"target": "es2015",
+		"jsx": "react",
+		"allowJs": true,
+		"skipLibCheck": true,
+		"baseUrl": "."
+	},
+	"include": ["src", "api"],
+	"exclude": [
+		"node_modules",
+		"dist",
+		"publish",
+		".e2e-cache",
+		"e2e/.profiles",
+		"playwright-report",
+		"test-results"
+	]
+}
