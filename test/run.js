@@ -160,6 +160,31 @@ async function main() {
 		}
 	});
 
+	// ---- Phase-2 payload fields (card UI) -----------------------------------
+	// The card needs a pretty kind label and Harper's rendered message markup. Both must ride the
+	// same plain-JSON channel as the rest of the lint (no WASM handles), so the content script can
+	// build the title + the <code> word chip without touching harper.js.
+	await test('every lint carries plain-JSON kindPretty + messageHtml for the card', () => {
+		for (const lint of response) {
+			assert.strictEqual(typeof lint.kindPretty, 'string', 'kindPretty is a string');
+			assert.ok(lint.kindPretty.length >= 1, `kindPretty present for "${lint.problemText}"`);
+			assert.strictEqual(typeof lint.messageHtml, 'string', 'messageHtml is a string');
+			assert.ok(lint.messageHtml.length >= 1, `messageHtml present for "${lint.problemText}"`);
+		}
+		// Whole payload survives a JSON round-trip unchanged (no non-serializable handles leaked).
+		assert.deepStrictEqual(JSON.parse(JSON.stringify(response)), response, 'still plain JSON');
+	});
+
+	await test('the "beleive" Spelling lint has kindPretty "Spelling" and a <code> chip in messageHtml', () => {
+		const spelling = response.find((l) => l.problemText === 'beleive');
+		assert.ok(spelling, 'a lint whose problemText is "beleive"');
+		assert.strictEqual(spelling.kindPretty, 'Spelling', 'kindPretty is the human label "Spelling"');
+		assert.ok(
+			/<code>[^<]*<\/code>/.test(spelling.messageHtml),
+			`messageHtml wraps the word in <code>: ${JSON.stringify(spelling.messageHtml)}`,
+		);
+	});
+
 	await test('every span indexes its own problemText in the source string', () => {
 		for (const lint of response) {
 			assert.strictEqual(
@@ -318,12 +343,12 @@ async function main() {
 	// The four version fields (package.json, src/manifest.json, and BOTH package-lock fields) must
 	// stay pinned together; a stale lockfile drifted them once in the sibling project. Bump all four
 	// on every release, or the harness (and thus the publish gate) fails.
-	await test('version: package.json, manifest, and both package-lock fields are all 0.2.0', () => {
+	await test('version: package.json, manifest, and both package-lock fields are all 0.3.0', () => {
 		const readJSON = (...rel) => JSON.parse(fs.readFileSync(path.join(REPO_ROOT, ...rel), 'utf8'));
 		const pkg = readJSON('package.json');
 		const manifest = readJSON('src', 'manifest.json');
 		const lock = readJSON('package-lock.json');
-		const expected = '0.2.0';
+		const expected = '0.3.0';
 		assert.strictEqual(pkg.version, expected, 'package.json version');
 		assert.strictEqual(manifest.version, expected, 'src/manifest.json version');
 		assert.strictEqual(lock.version, expected, 'package-lock.json top-level version');

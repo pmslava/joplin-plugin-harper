@@ -8,8 +8,8 @@ import {
   editorIsPresent,
   setEditorBody,
   lintRangeCountForWord,
-  openLintTooltip,
-  clickDiagnosticAction,
+  openHarperCard,
+  clickAddToDictionary,
 } from './helpers';
 
 /**
@@ -58,8 +58,8 @@ test.describe('Harper add-to-dictionary', () => {
       .poll(() => lintRangeCountForWord(win, UNKNOWN_WORD), { timeout: 60_000 })
       .toBeGreaterThan(0);
 
-    const tooltip = await openLintTooltip(win, UNKNOWN_WORD);
-    await clickDiagnosticAction(win, tooltip, 'Add to dictionary');
+    const card = await openHarperCard(win, UNKNOWN_WORD);
+    await clickAddToDictionary(win, card);
 
     // The underline disappears (importWords + forced re-lint).
     await expect

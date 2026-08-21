@@ -115,57 +115,138 @@ export async function lintRangeCountForWord(win: Page, word: string): Promise<nu
 }
 
 /**
- * Open the stock @codemirror/lint hover tooltip for the lint mark underlining `word` and return the
- * tooltip locator. The `linter()` extension registers a hoverTooltip (300 ms hover), so we hover the
- * `.cm-lintRange` and wait for `.cm-tooltip-lint` to appear. The tooltip stays open while the pointer
- * moves into it, which is what lets a follow-up click land on an action button.
+ * Open the Harper suggestion CARD (Phase 2) for the lint mark underlining `word` and return the
+ * `.harper-container` locator. The plugin renders the card via the @codemirror/lint hover tooltip's
+ * `renderMessage`, so we hover the `.cm-lintRange` and wait for `.harper-container` to appear. The
+ * tooltip stays open while the pointer moves into it, which is what lets a follow-up click land on a
+ * pill/icon.
  */
-export async function openLintTooltip(win: Page, word: string) {
+export async function openHarperCard(win: Page, word: string) {
   const range = win
     .locator('.cm-lintRange')
     .filter({ hasText: word })
     .first();
   await range.scrollIntoViewIfNeeded();
-  const tooltip = win.locator('.cm-tooltip-lint');
-  for (let attempt = 0; attempt < 5; attempt++) {
+  const card = win.locator('.harper-container');
+  for (let attempt = 0; attempt < 6; attempt++) {
     await range.hover({ force: true });
     await win.waitForTimeout(500);
-    if (await tooltip.count()) return tooltip.first();
+    if (await card.count()) return card.first();
   }
-  throw new Error(`Lint tooltip for "${word}" never appeared`);
+  throw new Error(`Harper card for "${word}" never appeared`);
 }
 
-/**
- * Click a diagnostic action button (`.cm-diagnosticAction`) in an open lint tooltip whose label
- * contains `labelSubstring`. Pass an already-opened tooltip locator (from openLintTooltip).
- */
-export async function clickDiagnosticAction(
-  win: Page,
-  tooltip: ReturnType<Page['locator']>,
-  labelSubstring: string,
-): Promise<void> {
-  const action = tooltip
-    .locator('.cm-diagnosticAction')
-    .filter({ hasText: labelSubstring })
-    .first();
-  await action.click();
-  await win.waitForTimeout(300);
-}
+/** Back-compat alias: openLintTooltip now returns the Harper card container. */
+export const openLintTooltip = openHarperCard;
 
 /**
- * Click the FIRST diagnostic action in an open lint tooltip. The plugin renders one action per
- * harper suggestion first (Replace/Remove/Insert), before the Add-to-dictionary / Ignore / Disable
- * actions, so the first button is always the top suggested fix. Returns its label for assertions.
+ * Click the FIRST suggestion pill in an open card. Suggestion pills live in the LEFT footer cluster
+ * (`.harper-footer > .harper-child-cont:first-child > .harper-btn`), so the first pill is the top
+ * suggested fix. Returns its label for assertions.
  */
-export async function clickFirstDiagnosticAction(
+export async function clickFirstSuggestionPill(
   win: Page,
-  tooltip: ReturnType<Page['locator']>,
+  card: ReturnType<Page['locator']>,
 ): Promise<string> {
-  const first = tooltip.locator('.cm-diagnosticAction').first();
+  const first = card.locator('.harper-footer .harper-child-cont').first().locator('.harper-btn').first();
   const label = (await first.textContent()) ?? '';
-  await first.click();
+  await first.click({ force: true, timeout: 15000 });
   await win.waitForTimeout(300);
   return label;
+}
+
+/** Click the add-to-dictionary icon button (`.harper-dict-btn`, Spelling cards only). */
+export async function clickAddToDictionary(
+  win: Page,
+  card: ReturnType<Page['locator']>,
+): Promise<void> {
+  await card.locator('.harper-dict-btn').first().click({ force: true, timeout: 15000 });
+  await win.waitForTimeout(300);
+}
+
+/** Click the "Dismiss" grey pill (our Ignore action) in an open card. */
+export async function clickDismiss(win: Page, card: ReturnType<Page['locator']>): Promise<void> {
+  await card.locator('.harper-btn', { hasText: 'Dismiss' }).first().click({ force: true, timeout: 15000 });
+  await win.waitForTimeout(300);
+}
+
+/** Click the header disable-rule toggle icon (`.harper-disable-btn`) in an open card. */
+export async function clickDisableRule(win: Page, card: ReturnType<Page['locator']>): Promise<void> {
+  await card.locator('.harper-disable-btn').first().click({ force: true, timeout: 15000 });
+  await win.waitForTimeout(300);
+}
+
+/**
+ * The computed squiggle underline color (hex) for the lint mark underlining `word`. The per-kind
+ * squiggle is a `background-image` SVG data-URI whose `stroke="#RRGGBB"` is the kind color, so we
+ * read the computed `background-image` and pull the stroke hex back out.
+ */
+export async function underlineColorForWord(win: Page, word: string): Promise<string | null> {
+  return win
+    .locator('.cm-lintRange')
+    .filter({ hasText: word })
+    .first()
+    .evaluate((el) => {
+      const bg = getComputedStyle(el as HTMLElement).backgroundImage;
+      let decoded = bg;
+      try {
+        decoded = decodeURIComponent(bg);
+      } catch {
+        /* keep raw */
+      }
+      // Match the SVG stroke color in either the decoded (stroke="#RRGGBB") or the still-encoded
+      // (stroke%3D%22%23RRGGBB) form of the background-image data-URI.
+      const m =
+        decoded.match(/stroke="(#[0-9A-Fa-f]{6})"/) ||
+        bg.match(/stroke%3D%22(%23[0-9A-Fa-f]{6})/);
+      if (!m) return null;
+      return m[1].replace('%23', '#').toUpperCase();
+    });
+}
+
+/**
+ * Screenshot an open Harper card to `filePath`. Uses a bounding-box-clipped PAGE screenshot (not an
+ * element screenshot): the card is a hover tooltip with a `fade-in` opacity/scale animation, and an
+ * isolated element screenshot can capture it mid-fade (blank). A short settle + page-level clip goes
+ * through the real compositor and reliably captures the painted card. Falls back to a full-page shot.
+ */
+export async function screenshotCard(
+  win: Page,
+  card: ReturnType<Page['locator']>,
+  filePath: string,
+): Promise<void> {
+  await win.waitForTimeout(500); // let fade-in + tooltip positioning settle
+  // Freeze the fade-in (opacity/scale) so the capture can't catch a mid-animation frame, and pin the
+  // card at a fixed on-screen spot so it can't be repositioned/clipped out of a page screenshot.
+  await card.evaluate((el) => {
+    const c = el as HTMLElement;
+    c.style.animation = 'none';
+    c.style.opacity = '1';
+    c.style.transform = 'none';
+    const tip = c.closest('.cm-tooltip') as HTMLElement | null;
+    if (tip) {
+      tip.style.transform = 'none';
+      tip.style.inset = 'auto';
+      tip.style.left = '20px';
+      tip.style.top = '20px';
+    }
+  });
+  await win.waitForTimeout(150);
+  // Full-page screenshot: captures the card wherever it is painted (no bounding-box clip math that a
+  // CM tooltip transform can defeat).
+  await win.screenshot({ path: filePath });
+}
+
+/** The `harper-lintRange-<Kind>` class suffix on the lint mark underlining `word`. */
+export async function underlineKindForWord(win: Page, word: string): Promise<string | null> {
+  return win
+    .locator('.cm-lintRange')
+    .filter({ hasText: word })
+    .first()
+    .evaluate((el) => {
+      const cls = Array.from((el as HTMLElement).classList).find((c) => c.startsWith('harper-lintRange-'));
+      return cls ? cls.replace('harper-lintRange-', '') : null;
+    });
 }
 
 /** True if the plugin's hidden background page is running (its URL carries ?pluginId=<id>). */

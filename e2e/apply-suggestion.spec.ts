@@ -8,8 +8,8 @@ import {
   getEditorBody,
   lintRangeCount,
   lintRangeCountForWord,
-  openLintTooltip,
-  clickFirstDiagnosticAction,
+  openHarperCard,
+  clickFirstSuggestionPill,
 } from './helpers';
 
 /**
@@ -46,10 +46,10 @@ test.describe('Harper apply-suggestion', () => {
       .poll(() => lintRangeCountForWord(win, 'beleive'), { timeout: 60_000 })
       .toBeGreaterThan(0);
 
-    const tooltip = await openLintTooltip(win, 'beleive');
-    const label = await clickFirstDiagnosticAction(win, tooltip);
+    const card = await openHarperCard(win, 'beleive');
+    const label = await clickFirstSuggestionPill(win, card);
     // eslint-disable-next-line no-console
-    console.log(`[harper-e2e] applied suggestion action: "${label}"`);
+    console.log(`[harper-e2e] applied suggestion pill: "${label}"`);
 
     // The document text is now corrected...
     await expect.poll(() => getEditorBody(win), { timeout: 20_000 }).toContain('believe');

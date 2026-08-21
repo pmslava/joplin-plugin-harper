@@ -26,9 +26,17 @@ export interface PlainLint {
 	start: number;
 	end: number;
 	kind: string;
+	/** Human-friendly kind label for the card title, e.g. "Spelling" (lint_kind_pretty()). */
+	kindPretty: string;
 	/** The harper rule name (organizedLints key) that produced this finding. */
 	ruleName: string;
 	message: string;
+	/**
+	 * Harper's markdown-rendered message (message_html()), e.g. `Did you mean to spell
+	 * <code>CLAUDE</code> this way?`. Crosses postMessage as a plain-JSON string; the content
+	 * script sanitizes it to an allowlist before innerHTML. This is what draws the word "chip".
+	 */
+	messageHtml: string;
 	problemText: string;
 	suggestions: PlainSuggestion[];
 }
@@ -302,8 +310,10 @@ function lintToPlain(lint: Lint, ruleName: string): PlainLint {
 		start: span.start,
 		end: span.end,
 		kind: lint.lint_kind(),
+		kindPretty: lint.lint_kind_pretty(),
 		ruleName,
 		message: lint.message(),
+		messageHtml: lint.message_html(),
 		problemText: lint.get_problem_text(),
 		suggestions,
 	};
