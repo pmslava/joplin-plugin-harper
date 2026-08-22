@@ -8,7 +8,7 @@ request: your notes never leave your computer. The whole checker (a compiled Web
 ships inside the plugin, so it works fully offline.
 
 As you type in the Markdown editor, Harper underlines spelling and grammar issues with a coloured
-squiggle, and hovering over (or clicking) an underline opens a small card with the problem,
+squiggle, and clicking an underline opens a small card with the problem,
 one-click fixes, and follow-up actions.
 
 ![The Harper suggestion card and coloured underlines in the Joplin Markdown editor](https://raw.githubusercontent.com/pmslava/joplin-plugin-harper/main/docs/screenshots/card-light.png)
@@ -26,7 +26,7 @@ suggestion:
   lint kinds — Spelling, Grammar, Punctuation, Word Choice, Repetition, Redundancy, Style, and more
   (21 in all) — and each kind gets its own squiggle colour, so you can tell a misspelling from a
   style nudge at a glance. The colours are Harper's own and work in both light and dark themes.
-- **A suggestion card.** Hover over (or click) an underline to open a card that shows the issue
+- **A suggestion card.** Click an underline to open a card that shows the issue
   type, Harper's explanation with the flagged word highlighted, and the available fixes.
 - **Apply a fix in one click.** Each suggestion is a pill; clicking it rewrites the text (replace,
   remove, or insert) directly in the editor.

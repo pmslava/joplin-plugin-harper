@@ -8,7 +8,7 @@ import {
   editorIsPresent,
   setEditorBody,
   lintRangeCountForWord,
-  openHarperCard,
+  openHarperCardByClick,
   clickDismiss,
   screenshotCard,
 } from './helpers';
@@ -88,7 +88,7 @@ test.describe('Harper ignore/dismiss (card)', () => {
     await win.locator('.cm-content').first().screenshot({
       path: path.join(SHOTS_DIR, 'underlines-light.png'),
     });
-    const cardForShot = await openHarperCard(win, 'should of');
+    const cardForShot = await openHarperCardByClick(win, 'should of');
     await screenshotCard(win, cardForShot, path.join(SHOTS_DIR, 'card-light.png'));
 
     // Capture the ignore-state file BEFORE dismissing (fresh profile => normally absent, count 0).
@@ -106,9 +106,9 @@ test.describe('Harper ignore/dismiss (card)', () => {
     // eslint-disable-next-line no-console
     console.log(`[harper-e2e] ignoredLints.json before dismiss: ${JSON.stringify(beforeContent)} (count ${beforeCount})`);
 
-    // Re-open the card fresh right before acting: the screenshot's settle wait can let the hover
-    // tooltip close, so we don't rely on the just-captured card still being open.
-    const card = await openHarperCard(win, 'should of');
+    // Re-open the card fresh right before acting: the screenshot step manipulated/settled the earlier
+    // card, so we don't rely on the just-captured card still being open.
+    const card = await openHarperCardByClick(win, 'should of');
     await clickDismiss(win, card);
 
     // The dismissed lint's underline clears...

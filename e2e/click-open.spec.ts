@@ -12,13 +12,13 @@ import {
 } from './helpers';
 
 /**
- * E2E — CLICK-TO-OPEN CARD (v1.0.1).
+ * E2E — CLICK-TO-OPEN CARD (v1.0.1; the sole trigger as of v1.0.2).
  *
- * Proves the new click affordance end-to-end, WITHOUT the hover helper: types a misspelling, waits
- * for Harper's underline, CLICKS the underline (then parks the pointer away so the surviving card
- * can only be the click-opened one — a hover tooltip would have closed), asserts the card DOM opened
- * as a `.harper-click-tooltip`, then applies the first suggestion pill from that clicked card and
- * asserts the document text was corrected. The card DOM/render path is identical to the hover card.
+ * Proves the click affordance end-to-end: types a misspelling, waits for Harper's underline, CLICKS
+ * the underline, asserts the card DOM opened inside our `.harper-click-tooltip` wrapper, then applies
+ * the first suggestion pill from that clicked card and asserts the document text was corrected. Since
+ * v1.0.2 suppresses the stock hover tooltip entirely, no pointer-parking is needed to attribute the
+ * card to the click path — a card can only ever be a click card.
  */
 test.describe('Harper click-to-open card', () => {
   let joplin: JoplinInstance;
@@ -45,10 +45,10 @@ test.describe('Harper click-to-open card', () => {
       .poll(() => lintRangeCountForWord(win, 'beleive'), { timeout: 60_000 })
       .toBeGreaterThan(0);
 
-    // Open by CLICK (helper parks the pointer away afterwards to rule out the hover path).
+    // Open by CLICK — the only trigger as of v1.0.2.
     const card = await openHarperCardByClick(win, 'beleive');
     await expect(card).toBeVisible();
-    // The card lives inside our click tooltip specifically (not the lint hover tooltip).
+    // The card lives inside our click tooltip specifically.
     expect(await win.locator('.cm-tooltip.harper-click-tooltip .harper-container').count()).toBeGreaterThan(0);
 
     // Apply the first suggestion from the CLICK-opened card.

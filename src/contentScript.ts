@@ -14,12 +14,16 @@
 //     harper-squiggly-style"`. Joplin's bundled @codemirror/lint applies markClass to the range
 //     decoration (verified: the bundle builds `class:"cm-lintRange cm-lintRange-<sev> <markClass>"`),
 //     and our injected stylesheet paints the per-kind squiggle for that class.
-//   - the card: each Diagnostic sets `renderMessage(view)` to a hand-built Harper card, and carries
-//     NO stock `actions`, so the hover tooltip shows only our card (Joplin's bundled renderer inserts
-//     the renderMessage() node in place of the default `.cm-diagnosticText`).
-//   - CLICK-to-open (v1.0.1): in ADDITION to hover, a `click` on a lint underline opens the SAME card
-//     (same `renderMessage`/renderCard path) via our own `showTooltip` StateField — see the
-//     `clickCardField` / `buildClickTooltip` block. Hover behavior is untouched.
+//   - the card: each Diagnostic sets `renderMessage(view)` to a hand-built Harper card. The card is
+//     built by that same `renderMessage`/renderCard path on the CLICK trigger below.
+//   - CLICK is the ONLY trigger (v1.0.2): a `click` on a lint underline opens the card via our own
+//     `showTooltip` StateField — see the `clickCardField` / `buildClickTooltip` block.
+//   - NO HOVER (v1.0.2): the @codemirror/lint hover tooltip is fully suppressed at its source by
+//     passing `tooltipFilter: () => null` to `linter()`. The bundled hover source (`lintTooltip`)
+//     does `if (found && filter) found = filter(found, state); if (!found) return null;`, so a
+//     null return makes the hover source return null and CM6 never creates the `.cm-tooltip-lint`
+//     element at all — suppression at the source, not a CSS hide. See the `linter()` call for the
+//     full rationale. Matches Harper's own browser extension, which is click-only on prose.
 
 import { linter, setDiagnostics, forEachDiagnostic, Diagnostic } from '@codemirror/lint';
 import { EditorView, showTooltip, Tooltip } from '@codemirror/view';
@@ -60,13 +64,14 @@ interface CodeMirrorControl {
 const DEFAULT_DELAY_MS = 500;
 
 // -----------------------------------------------------------------------------
-// Click-to-open card (v1.0.1). The card historically opened only on the @codemirror/lint hover
-// tooltip. We add a click affordance WITHOUT touching that path: a StateField holds at most one
-// Tooltip and feeds it to `showTooltip`; a `click` domEventHandler (see the `plugin()` body)
-// hit-tests the diagnostic ranges at the click position and dispatches `setClickCard` with a tooltip
-// whose body is built by the SAME `diagnostic.renderMessage()` (renderCard) used on hover — identical
-// DOM/render path. The field self-closes on any document edit (map-through is unnecessary because the
-// card is transient); Escape, an outside click, and every in-card action dispatch `setClickCard.of(null)`.
+// Click-to-open card (v1.0.1; the ONLY trigger as of v1.0.2). A StateField holds at most one Tooltip
+// and feeds it to `showTooltip`; a `click` domEventHandler (see the `plugin()` body) hit-tests the
+// diagnostic ranges at the click position and dispatches `setClickCard` with a tooltip whose body is
+// built by `diagnostic.renderMessage()` (renderCard). The stock @codemirror/lint hover tooltip that
+// used to open the identical card is fully suppressed in v1.0.2 (see the linter() tooltipFilter), so
+// this click path is now the sole way the card opens. The field self-closes on any document edit
+// (map-through is unnecessary because the card is transient); Escape, an outside click, and every
+// in-card action dispatch `setClickCard.of(null)`.
 const setClickCard = StateEffect.define<Tooltip | null>();
 const clickCardField = StateField.define<Tooltip | null>({
 	create: () => null,
@@ -346,9 +351,9 @@ function closeCard(container: HTMLElement, view: EditorView): void {
 	const tooltip = container.closest('.cm-tooltip') as HTMLElement | null;
 	if (tooltip) tooltip.style.display = 'none';
 	else container.style.display = 'none';
-	// If this card was opened via click-to-open, clear the StateField too so the tooltip is fully
-	// torn down (not merely hidden). Harmless when the card came from the hover tooltip (the field is
-	// already null). Guarded because `view` may be mid-teardown.
+	// The card is opened via click-to-open, so clear the StateField too so the tooltip is fully
+	// torn down (not merely hidden). The `field(...false)` guard also keeps this a no-op if the field
+	// is somehow absent. Guarded because `view` may be mid-teardown.
 	try {
 		if (view.state.field(clickCardField, false)) {
 			view.dispatch({ effects: setClickCard.of(null) });
@@ -545,22 +550,23 @@ function toDiagnostic(
 		message: lint.message,
 		// Per-kind underline: Joplin's bundled @codemirror/lint applies markClass to the range mark.
 		markClass: `harper-lintRange-${lint.kind} harper-squiggly-style`,
-		// The whole Harper card. No stock `actions` — the card carries every affordance itself.
+		// The whole Harper card. No stock `actions` — the card carries every affordance itself. This
+		// builder is invoked only by the CLICK path (buildClickTooltip); the hover tooltip that would
+		// otherwise also call it is suppressed via linter()'s tooltipFilter (v1.0.2).
 		renderMessage: (view: EditorView) => renderCard(context, view, docText, lint, relint),
 	};
 }
 
 /**
  * Build the `showTooltip` Tooltip for a click-opened card. Anchors to the diagnostic span [from,to)
- * and renders the card via `diagnostic.renderMessage(view)` — the exact same builder the hover
- * tooltip uses, so the card DOM is identical.
+ * and renders the card via `diagnostic.renderMessage(view)` — the single card builder in this file
+ * (renderCard), so the card DOM is exactly what the diagnostic describes.
  *
  * CM6 adds the `cm-tooltip` class DIRECTLY to the TooltipView's `dom` (it does not interpose its own
  * wrapper). If we returned the `.harper-container` as `dom`, CM's `.cm-tooltip` base-theme chrome
  * would land on the card itself and fight its own border/background/padding. So we return a thin
- * WRAPPER div (which becomes `.cm-tooltip.harper-click-tooltip`, neutralized by CARD_CSS exactly like
- * the hover card's `.cm-tooltip-lint` wrapper) and nest the real card inside it — mirroring the hover
- * DOM: `.cm-tooltip.harper-click-tooltip > .harper-container`.
+ * WRAPPER div (which becomes `.cm-tooltip.harper-click-tooltip`, neutralized by CARD_CSS) and nest
+ * the real card inside it: `.cm-tooltip.harper-click-tooltip > .harper-container`.
  */
 function buildClickTooltip(from: number, to: number, diagnostic: Diagnostic): Tooltip {
 	return {
@@ -682,7 +688,22 @@ export default (context: ContentScriptContext) => {
 				ensureStyles();
 
 				// linter delay 0: our `debouncedLint` owns the idle-delay against the mutable value.
-				editorControl.addExtension(linter(debouncedLint, { delay: 0 }));
+				// tooltipFilter: () => null FULLY SUPPRESSES the stock hover tooltip (v1.0.2). The
+				// bundled @codemirror/lint hover source (lintTooltip) applies this filter to the
+				// diagnostics found under the pointer and then does `if (!found) return null`, so a null
+				// return makes the hover-tooltip source return null and CM6 never creates the
+				// `.cm-tooltip-lint` DOM node — the card can only ever be opened by CLICK (clickExtension
+				// above). The DiagnosticFilter type declares a Diagnostic[] return, but the runtime
+				// honors the null return; we cast to satisfy the type without lying at runtime. Verified
+				// against Joplin's bundled build (6.8-era: exposes tooltipFilter / needsRefresh / hideOn)
+				// and the devDep @codemirror/lint 6.9.7 — both share the exact
+				// `if (found && filter) found = filter(...); if (!found) return null` hover source.
+				const suppressHoverTooltip = (() => null) as unknown as (
+					diagnostics: readonly Diagnostic[],
+				) => Diagnostic[];
+				editorControl.addExtension(
+					linter(debouncedLint, { delay: 0, tooltipFilter: suppressHoverTooltip }),
+				);
 
 				// Register the command the plugin main process pokes after settings/dictionary changes.
 				// We read `editorControl.editor` freshly on each invocation so a note switch (new view)

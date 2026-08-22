@@ -8,7 +8,7 @@ import {
   editorIsPresent,
   setEditorBody,
   lintRangeCountForWord,
-  openHarperCard,
+  openHarperCardByClick,
   underlineColorForWord,
   screenshotCard,
 } from './helpers';
@@ -87,8 +87,8 @@ test.describe('Harper UI conformance (dark theme)', () => {
 
     // --- card structure (open on the Spelling lint "beleive") --------------------------------
     // Assertions run FIRST, while the freshly-opened card is guaranteed open; the screenshot (whose
-    // settle wait can let the hover tooltip close) is taken LAST so it can't invalidate assertions.
-    const card = await openHarperCard(win, 'beleive');
+    // settle wait manipulates the card DOM) is taken LAST so it can't invalidate assertions.
+    const card = await openHarperCardByClick(win, 'beleive');
 
     // dark detection actually fired.
     await expect(card).toHaveClass(/harper-dark/);
@@ -114,7 +114,7 @@ test.describe('Harper UI conformance (dark theme)', () => {
     await expect(card.locator('.harper-disable-btn')).toHaveCount(1);
 
     // Dark-theme card screenshot for the manager (re-open in case the assertions' timing closed it).
-    const cardForShot = await openHarperCard(win, 'beleive');
+    const cardForShot = await openHarperCardByClick(win, 'beleive');
     await screenshotCard(win, cardForShot, path.join(SHOTS_DIR, 'card-dark.png'));
   });
 });

@@ -8,17 +8,17 @@ import {
   getEditorBody,
   lintRangeCount,
   lintRangeCountForWord,
-  openHarperCard,
+  openHarperCardByClick,
   clickFirstSuggestionPill,
 } from './helpers';
 
 /**
  * E2E (b) — APPLY SUGGESTION (the Phase-0 gap).
  *
- * Types a misspelling into the real CM6 editor, waits for Harper's underline, opens the stock
- * @codemirror/lint hover tooltip, clicks the first suggestion action, and asserts the document text
- * was corrected AND the underline for the old word disappeared. This exercises the full apply path:
- * suggestion -> CM transaction -> re-lint.
+ * Types a misspelling into the real CM6 editor, waits for Harper's underline, opens the suggestion
+ * card by CLICKING the underline (the only trigger as of v1.0.2), clicks the first suggestion action,
+ * and asserts the document text was corrected AND the underline for the old word disappeared. This
+ * exercises the full apply path: suggestion -> CM transaction -> re-lint.
  */
 test.describe('Harper apply-suggestion', () => {
   let joplin: JoplinInstance;
@@ -46,7 +46,7 @@ test.describe('Harper apply-suggestion', () => {
       .poll(() => lintRangeCountForWord(win, 'beleive'), { timeout: 60_000 })
       .toBeGreaterThan(0);
 
-    const card = await openHarperCard(win, 'beleive');
+    const card = await openHarperCardByClick(win, 'beleive');
     const label = await clickFirstSuggestionPill(win, card);
     // eslint-disable-next-line no-console
     console.log(`[harper-e2e] applied suggestion pill: "${label}"`);

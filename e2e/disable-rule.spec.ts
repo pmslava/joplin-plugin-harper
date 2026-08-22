@@ -8,7 +8,7 @@ import {
   editorIsPresent,
   setEditorBody,
   lintRangeCountForWord,
-  openHarperCard,
+  openHarperCardByClick,
   clickDisableRule,
 } from './helpers';
 
@@ -48,7 +48,7 @@ test.describe('Harper disable-rule (card)', () => {
       .poll(() => lintRangeCountForWord(win, 'beleive'), { timeout: 60_000 })
       .toBeGreaterThan(0);
 
-    const card = await openHarperCard(win, 'should of');
+    const card = await openHarperCardByClick(win, 'should of');
     await clickDisableRule(win, card);
 
     // The disabled rule's underline clears...

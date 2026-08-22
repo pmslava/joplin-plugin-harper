@@ -114,52 +114,42 @@ export async function lintRangeCountForWord(win: Page, word: string): Promise<nu
     .evaluateAll((els, w) => els.filter((el) => (el as HTMLElement).textContent === w).length, word);
 }
 
-/**
- * Open the Harper suggestion CARD (Phase 2) for the lint mark underlining `word` and return the
- * `.harper-container` locator. The plugin renders the card via the @codemirror/lint hover tooltip's
- * `renderMessage`, so we hover the `.cm-lintRange` and wait for `.harper-container` to appear. The
- * tooltip stays open while the pointer moves into it, which is what lets a follow-up click land on a
- * pill/icon.
- */
-export async function openHarperCard(win: Page, word: string) {
-  const range = win
-    .locator('.cm-lintRange')
-    .filter({ hasText: word })
-    .first();
-  await range.scrollIntoViewIfNeeded();
-  const card = win.locator('.harper-container');
-  for (let attempt = 0; attempt < 6; attempt++) {
-    await range.hover({ force: true });
-    await win.waitForTimeout(500);
-    if (await card.count()) return card.first();
-  }
-  throw new Error(`Harper card for "${word}" never appeared`);
+/** How many Harper suggestion cards (`.harper-container`) are currently in the DOM. */
+export async function harperCardCount(win: Page): Promise<number> {
+  return win.locator('.harper-container').count();
 }
 
-/** Back-compat alias: openLintTooltip now returns the Harper card container. */
-export const openLintTooltip = openHarperCard;
+/**
+ * Move the real pointer over the lint underline for `word` and dwell there (generous wait). Used by
+ * the interaction spec to PROVE that hovering opens NO card (v1.0.2 suppressed the stock hover
+ * tooltip). Does not assert — the caller inspects `harperCardCount`.
+ */
+export async function hoverLintRange(win: Page, word: string): Promise<void> {
+  const range = win.locator('.cm-lintRange').filter({ hasText: word }).first();
+  await range.scrollIntoViewIfNeeded();
+  await range.hover({ force: true });
+  // Well past the old hover-tooltip open latency (bundled default 300–750 ms): if a hover tooltip
+  // were still wired, the card would have appeared within this window.
+  await win.waitForTimeout(1200);
+}
 
 /**
- * Open the Harper card by CLICKING the lint underline for `word` (v1.0.1 click-to-open) — NOT via the
- * hover helper. We click the `.cm-lintRange`, then move the pointer to a neutral corner and wait: a
- * hover tooltip would close once the pointer leaves, so a card that SURVIVES the pointer-away proves
- * it was opened by the click path. Returns the click-tooltip's `.harper-container` locator.
+ * Open the Harper card by CLICKING the lint underline for `word` (click-to-open; the ONLY trigger as
+ * of v1.0.2). Returns the click-tooltip's `.harper-container` locator.
  *
- * (Playwright's `.click()` necessarily moves the mouse onto the element to click it; the pointer-away
- * step afterwards is what isolates the click path from the hover path.)
+ * Since v1.0.2 fully suppresses the stock hover tooltip, no pointer-parking gymnastics are needed to
+ * distinguish the click path — a card can only come from this click. We click the `.cm-lintRange` and
+ * wait for the click tooltip's card, retrying the click a few times to absorb the debounced re-lint.
  */
 export async function openHarperCardByClick(win: Page, word: string) {
   const range = win.locator('.cm-lintRange').filter({ hasText: word }).first();
   await range.scrollIntoViewIfNeeded();
   await range.click({ force: true });
-  // Park the pointer far from any underline so the hover tooltip cannot be what we then observe.
-  await win.mouse.move(4, 4);
   await win.waitForTimeout(400);
   const card = win.locator('.cm-tooltip.harper-click-tooltip .harper-container');
   for (let attempt = 0; attempt < 6; attempt++) {
     if (await card.count()) return card.first();
     await range.click({ force: true });
-    await win.mouse.move(4, 4);
     await win.waitForTimeout(400);
   }
   throw new Error(`Harper click-to-open card for "${word}" never appeared`);
