@@ -18,6 +18,7 @@ import { slimBinaryInlined } from 'harper.js/slimBinaryInlined';
 const RESULTS_TITLE = 'Harper Mobile Spike Results';
 const SPIKE_FOLDER = 'Spike';
 const CONTENT_SCRIPT_ID = 'harperSpikeCm';
+const SPIKE_VERSION = '0.0.2';
 
 // ---------------------------------------------------------------------------
 // Tiny instrumentation helpers (all guarded — every primitive here is non-standard on some runtime).
@@ -96,7 +97,7 @@ async function ensureResultsNote(): Promise<void> {
 }
 
 /** Append one line to the results note. Re-reads the body every time (never cached across stages). */
-async function appendLine(line: string): Promise<void> {
+async function appendLineRaw(line: string): Promise<void> {
 	if (!resultsNoteId) return;
 	try {
 		const note = await joplin.data.get(['notes', resultsNoteId], { fields: ['body'] });
@@ -108,6 +109,18 @@ async function appendLine(line: string): Promise<void> {
 		// eslint-disable-next-line no-console
 		console.error(`[harper-spike] appendLine failed for "${line}":`, error);
 	}
+}
+
+// Serialize every append through one promise chain. S5 now emits MANY messages that can arrive
+// concurrently with the probe's own appends; without serialization two read-modify-write cycles could
+// interleave and lose a line. Each caller still `await`s and gets its line committed in order.
+let appendChain: Promise<void> = Promise.resolve();
+function appendLine(line: string): Promise<void> {
+	const next = appendChain.then(() => appendLineRaw(line));
+	appendChain = next.catch(() => {
+		/* keep the chain alive even if one append rejects */
+	});
+	return next;
 }
 
 function short(stack: unknown): string {
@@ -133,7 +146,7 @@ function buildDoc(targetBytes: number): string {
 // ---------------------------------------------------------------------------
 async function runProbe(): Promise<void> {
 	await ensureResultsNote();
-	await appendLine(`===== SPIKE RUN ${new Date().toISOString()} =====`);
+	await appendLine(`===== SPIKE RUN v${SPIKE_VERSION} ${new Date().toISOString()} =====`);
 
 	// --- S0 ENV --------------------------------------------------------------
 	await appendLine('S0 START env...');
@@ -268,9 +281,16 @@ joplin.plugins.register({
 			'./contentScript.js',
 		);
 		await joplin.contentScripts.onMessage(CONTENT_SCRIPT_ID, async (message: unknown) => {
-			const msg = message as { type?: string } | null;
+			const msg = message as { type?: string; line?: string } | null;
+			// v0.0.2 staged report: forward the content script's line verbatim, prefixed with a timestamp
+			// so a crash between stages is placeable in time (the line already carries a per-load id).
+			if (msg && msg.type === 's5' && typeof msg.line === 'string') {
+				await appendLine(`[${new Date().toISOString()}] ${msg.line}`);
+				return { ok: true };
+			}
+			// Backward-compatible with the old single-line signal.
 			if (msg && msg.type === 's5log') {
-				await appendLine('S5 content script loaded in editor');
+				await appendLine(`[${new Date().toISOString()}] S5 content script loaded in editor`);
 				return { ok: true };
 			}
 			return null;

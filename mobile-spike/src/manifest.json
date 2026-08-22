@@ -7,7 +7,7 @@
 		"desktop",
 		"mobile"
 	],
-	"version": "0.0.1",
+	"version": "0.0.2",
 	"name": "Harper Mobile Spike",
 	"description": "Instrumented on-device spike measuring whether harper.js WASM instantiates and performs inside the Joplin mobile plugin WebView. Writes staged results to a note. Not for publication.",
 	"author": "pmslava",

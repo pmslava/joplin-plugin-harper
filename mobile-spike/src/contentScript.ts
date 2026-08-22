@@ -1,18 +1,46 @@
-// Harper Mobile Spike — CM6 content script (S5).
+// Harper Mobile Spike v0.0.2 — SELF-DIAGNOSING CM6 content script (S5, staged activation).
 //
-// Independent of the WASM probe. Proves, on-device, that: a Joplin content script LOADS in the mobile
-// editor, the Joplin-provided @codemirror/* modules resolve (they are webpack externals), a decoration
-// PAINTS, and a tap/click card OPENS. It flags every literal occurrence of the word 'spiketest' with a
-// diagnostic (markClass 'spike-underline' + injected red squiggle CSS) and opens a one-button dummy
-// card on click. On registration it posts an 'S5 content script loaded in editor' line to the results
-// note (the plugin main process forwards it via contentScripts.onMessage).
+// WHY THIS EXISTS. On the Android device the ENGINE side (S0-S4, WASM in the plugin background
+// WebView) succeeded completely, but the EDITOR side died: opening a note to edit "immediately closes
+// the keyboard and switches to the viewer", and the results note showed 'S5 content script loaded'
+// appended once per attempt. From the Joplin source (dev @ 94911a8):
+//   - @codemirror/lint / view / state ARE bundled into the mobile editor (they are statically imported
+//     into the shared @joplin/editor codeMirrorRequire whitelist), and since the old content script
+//     posted its 's5log' AFTER addExtension AND that line appeared, module resolution + addExtension
+//     already work on-device. So the killer is something the script does AFTER load.
+//   - A plain JS exception in the content script is NOT fatal: the mobile MarkdownEditor webview installs
+//     its own window.onerror / onunhandledrejection (MarkdownEditor.tsx:137-147) that just postMessage →
+//     logs (onMessage :165-168). The ONLY automatic teardown that drops the keyboard and reloads the
+//     content script is a RENDERER-PROCESS crash → ExtendedWebView.refreshWebViewAfterCrash
+//     (index.tsx:92-100,144-145), which remounts the editor WebView. That reload is the user-visible
+//     "keyboard closes / back to viewer" and the repeated 'S5 loaded' lines.
 //
-// The click-to-open mechanism (showTooltip StateField + mousedown hit-test) is the thin version of the
-// parent plugin's card trigger, stripped to a single dummy card.
+// STRATEGY. Instead of doing everything at once, we activate the old content script's machinery in TIMED
+// SUB-STAGES (~3 s apart), each individually try/caught and reported to the results note via
+// context.postMessage (the plugin main process forwards it, prefixing a timestamp). If a stage's report
+// never arrives — or an error handler fires — the note's last S5x line fingers the killer.
+//   S5a  each @codemirror module resolved (view / lint / state), reported individually
+//   S5b  a no-op ViewPlugin added via addExtension            (proves addExtension alone is safe)
+//   S5c  the stock linter() added, source returns ZERO diagnostics (proves lint plumbing alone is safe)
+//   S5d  the linter source starts emitting the 'spiketest' diagnostic + markClass (proves decorations)
+//   S5e  the squiggle CSS injected                            (proves style injection)
+//   S5f  the mousedown + showTooltip tap card armed           (proves the card machinery)
+// FIRST THING (before any of the above) we install ADDITIVE global error handlers in the editor webview
+// — addEventListener, NOT window.onerror=, so we do not clobber Joplin's own handlers — reporting
+// 'S5 EDITOR ERROR: <msg> | <stack>' so a caught throw still yields a stack.
+//
+// Every report line carries a per-LOAD random 4-char id (e.g. 'S5a[k3f9] ...') so interleaved loads
+// (mobile reloads the content script per editor open) are distinguishable in the note.
 
-import { linter, forEachDiagnostic, Diagnostic } from '@codemirror/lint';
-import { EditorView, showTooltip, Tooltip } from '@codemirror/view';
-import { StateField, StateEffect } from '@codemirror/state';
+import type { EditorView as EditorViewT, Tooltip as TooltipT } from '@codemirror/view';
+
+// These namespace imports compile (via webpack `externals`) to require('@codemirror/...') against
+// Joplin's OWN injected copies — the SAME modules the editor uses, so there is no duplicate CodeMirror
+// (duplicate copies break extensions on mobile: laurent22/joplin#9473). On mobile these are provided by
+// @joplin/editor's codeMirrorRequire whitelist, which includes lint / view / state.
+import * as viewMod from '@codemirror/view';
+import * as lintMod from '@codemirror/lint';
+import * as stateMod from '@codemirror/state';
 
 interface ContentScriptContext {
 	postMessage: (message: unknown) => Promise<unknown>;
@@ -22,31 +50,150 @@ interface ContentScriptContext {
 
 interface CodeMirrorControl {
 	cm6?: unknown;
-	editor?: EditorView;
+	editor?: EditorViewT;
 	addExtension: (extension: unknown | unknown[]) => void;
 }
 
 const SPIKE_WORD = 'spiketest';
 const STYLE_ELEMENT_ID = 'harper-spike-styles';
+const STAGE_GAP_MS = 3000; // ~3 s between stages: a crash between reports is attributable to one stage.
 
-// --- click-to-open card (thin showTooltip StateField) -----------------------
-const setClickCard = StateEffect.define<Tooltip | null>();
-const clickCardField = StateField.define<Tooltip | null>({
-	create: () => null,
-	update(value, tr) {
-		if (tr.docChanged) return null; // self-close on any edit
-		for (const e of tr.effects) if (e.is(setClickCard)) value = e.value;
-		return value;
-	},
-	provide: (f) => showTooltip.from(f),
-});
+/** 4-char base36 id, distinguishes interleaved content-script loads (mobile reloads it per editor open). */
+function rid(): string {
+	return (Math.random().toString(36) + '0000').slice(2, 6);
+}
 
-function ensureStyles(): void {
-	if (typeof document === 'undefined') return;
-	if (document.getElementById(STYLE_ELEMENT_ID)) return;
-	const style = document.createElement('style');
-	style.id = STYLE_ELEMENT_ID;
-	style.textContent = `
+/** Trim + single-line a message/stack so a report line stays compact in the note. */
+function short(v: unknown): string {
+	const s = typeof v === 'string' ? v : String((v as { stack?: unknown })?.stack ?? v ?? '');
+	return s.slice(0, 300).replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * FIRST THING: additive error handlers in the EDITOR webview. Guarded so only the first content-script
+ * load per webview installs them (a renderer crash-reload creates a fresh window and installs anew).
+ */
+function installEditorErrorHandlers(post: (line: string) => void, id: string): void {
+	const w = (typeof window !== 'undefined' ? window : typeof self !== 'undefined' ? self : null) as
+		| (Window & { __harperSpikeErr?: boolean })
+		| null;
+	if (!w || typeof w.addEventListener !== 'function') return;
+	if (w.__harperSpikeErr) return;
+	w.__harperSpikeErr = true;
+	w.addEventListener('error', (e: unknown) => {
+		const ev = e as { message?: string; error?: { message?: string; stack?: unknown }; filename?: string; lineno?: number };
+		const msg = ev.message ?? ev.error?.message ?? String(e);
+		post(`S5 EDITOR ERROR[${id}]: ${short(msg)} @ ${ev.filename ?? '?'}:${ev.lineno ?? '?'} | ${short(ev.error?.stack)}`);
+	});
+	w.addEventListener('unhandledrejection', (e: unknown) => {
+		const reason = (e as { reason?: unknown })?.reason;
+		const msg = reason instanceof Error ? reason.message : String(reason);
+		const stack = reason instanceof Error ? reason.stack : '';
+		post(`S5 EDITOR ERROR[${id}] (unhandledrejection): ${short(msg)} | ${short(stack)}`);
+	});
+}
+
+export default (context: ContentScriptContext) => {
+	const post = (line: string): void => {
+		try {
+			void context.postMessage({ type: 's5', line });
+		} catch {
+			/* the reporting channel itself may be gone mid-teardown */
+		}
+	};
+
+	return {
+		plugin: (editorControl: CodeMirrorControl) => {
+			const id = rid();
+
+			// (0) Error handlers BEFORE anything else touches CodeMirror.
+			installEditorErrorHandlers(post, id);
+			post(`S5[${id}] content script loaded in editor`); // parity with the old single line
+
+			if (!editorControl.cm6) {
+				post(`S5[${id}] no cm6 on editorControl — not a CM6 editor, bailing`);
+				return;
+			}
+			const view = editorControl.editor ?? null;
+
+			// --- S5a: module resolution, reported one by one ---------------------------------------
+			// The namespace imports above already ran require('@codemirror/...') at module-eval; here we
+			// confirm each resolved to a usable object and report individually. (If a require had thrown,
+			// the whole script would have failed to load and NO S5 line would appear — itself diagnostic.)
+			try {
+				const okView = typeof (viewMod as { EditorView?: unknown }).EditorView === 'function';
+				const okLint = typeof (lintMod as { linter?: unknown }).linter === 'function';
+				const okState = typeof (stateMod as { StateField?: unknown }).StateField === 'function';
+				post(`S5a[${id}] require @codemirror/view ${okView ? 'ok' : 'FAIL'}`);
+				post(`S5a[${id}] require @codemirror/lint ${okLint ? 'ok' : 'FAIL'}`);
+				post(`S5a[${id}] require @codemirror/state ${okState ? 'ok' : 'FAIL'}`);
+			} catch (e) {
+				post(`S5a[${id}] FAIL ${short(e)}`);
+			}
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic CM6 surfaces
+			const { EditorView, showTooltip, ViewPlugin } = viewMod as any;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const { linter, forceLinting, forEachDiagnostic } = lintMod as any;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const { StateField, StateEffect } = stateMod as any;
+
+			// 0 = source returns [] (S5c); 1 = source emits the spiketest diagnostic + markClass (S5d).
+			let lintMode = 0;
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const spikeLintSource = (v: any): any[] => {
+				if (lintMode === 0) return [];
+				const text: string = v.state.doc.toString();
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				const out: any[] = [];
+				let idx = text.indexOf(SPIKE_WORD);
+				while (idx !== -1) {
+					out.push({
+						from: idx,
+						to: idx + SPIKE_WORD.length,
+						severity: 'warning',
+						source: 'HarperSpike',
+						message: 'spiketest (spike decoration)',
+						markClass: 'spike-underline',
+					});
+					idx = text.indexOf(SPIKE_WORD, idx + SPIKE_WORD.length);
+				}
+				// Fallback: paint ONE decoration even on a note lacking the literal word (real device notes
+				// won't contain 'spiketest'), so S5d genuinely exercises the markClass render path on-device.
+				if (out.length === 0 && text.length > 0) {
+					out.push({
+						from: 0,
+						to: Math.min(8, text.length),
+						severity: 'warning',
+						source: 'HarperSpike',
+						message: 'spiketest-fallback (spike decoration)',
+						markClass: 'spike-underline',
+					});
+				}
+				return out;
+			};
+
+			// --- click-to-open card (thin showTooltip StateField), armed only at S5f ----------------
+			const setClickCard = StateEffect.define();
+			const clickCardField = StateField.define({
+				create: () => null,
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				update(value: TooltipT | null, tr: any) {
+					if (tr.docChanged) return null; // self-close on any edit
+					for (const e of tr.effects) if (e.is(setClickCard)) value = e.value;
+					return value;
+				},
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				provide: (f: any) => showTooltip.from(f),
+			});
+
+			function ensureStyles(): void {
+				if (typeof document === 'undefined') return;
+				if (document.getElementById(STYLE_ELEMENT_ID)) return;
+				const style = document.createElement('style');
+				style.id = STYLE_ELEMENT_ID;
+				style.textContent = `
 .cm-lintRange.spike-underline{
   text-decoration: underline wavy #e11d48;
   text-decoration-skip-ink: none;
@@ -58,98 +205,134 @@ function ensureStyles(): void {
 .spike-card .spike-title{font-weight:600;margin-bottom:8px;}
 .spike-card button{cursor:pointer;border:none;border-radius:6px;padding:4px 10px;font-size:13px;font-weight:600;background:#2563eb;color:#fff;}
 `;
-	(document.head || document.documentElement).appendChild(style);
-}
+				(document.head || document.documentElement).appendChild(style);
+			}
 
-/** Build the dummy card: title 'Spike card' + one 'It works' button that closes it. */
-function buildCard(view: EditorView): HTMLElement {
-	ensureStyles();
-	const card = document.createElement('div');
-	card.className = 'spike-card';
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			function buildCard(v: any): HTMLElement {
+				ensureStyles();
+				const card = document.createElement('div');
+				card.className = 'spike-card';
+				const title = document.createElement('div');
+				title.className = 'spike-title';
+				title.textContent = 'Spike card';
+				card.appendChild(title);
+				const btn = document.createElement('button');
+				btn.type = 'button';
+				btn.textContent = 'It works';
+				btn.addEventListener('click', () => {
+					try {
+						v.dispatch({ effects: setClickCard.of(null) });
+					} catch {
+						/* view may be mid-teardown */
+					}
+				});
+				card.appendChild(btn);
+				return card;
+			}
 
-	const title = document.createElement('div');
-	title.className = 'spike-title';
-	title.textContent = 'Spike card';
-	card.appendChild(title);
-
-	const btn = document.createElement('button');
-	btn.type = 'button';
-	btn.textContent = 'It works';
-	btn.addEventListener('click', () => {
-		try {
-			view.dispatch({ effects: setClickCard.of(null) });
-		} catch {
-			/* view may be mid-teardown */
-		}
-	});
-	card.appendChild(btn);
-	return card;
-}
-
-function buildClickTooltip(from: number, to: number): Tooltip {
-	return {
-		pos: from,
-		end: to,
-		above: false,
-		create: (view: EditorView) => {
-			const dom = document.createElement('div');
-			dom.className = 'spike-click-tooltip';
-			dom.appendChild(buildCard(view));
-			return { dom };
-		},
-	};
-}
-
-/** Flag every literal occurrence of SPIKE_WORD in the document. */
-function spikeLintSource(view: EditorView): Diagnostic[] {
-	const text = view.state.doc.toString();
-	const out: Diagnostic[] = [];
-	let idx = text.indexOf(SPIKE_WORD);
-	while (idx !== -1) {
-		out.push({
-			from: idx,
-			to: idx + SPIKE_WORD.length,
-			severity: 'warning',
-			source: 'HarperSpike',
-			message: 'spiketest (spike decoration)',
-			markClass: 'spike-underline',
-		});
-		idx = text.indexOf(SPIKE_WORD, idx + SPIKE_WORD.length);
-	}
-	return out;
-}
-
-export default (context: ContentScriptContext) => {
-	return {
-		plugin: (editorControl: CodeMirrorControl) => {
-			if (!editorControl.cm6) return;
-			ensureStyles();
-
-			editorControl.addExtension([
-				linter(spikeLintSource, { delay: 100 }),
-				clickCardField,
-				EditorView.domEventHandlers({
-					mousedown: (event: MouseEvent, view: EditorView): boolean => {
-						if (event.button !== 0) return false;
-						const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
-						if (pos == null) return false;
-						let hit: { from: number; to: number } | null = null;
-						forEachDiagnostic(view.state, (_d, from, to) => {
-							if (!hit && from <= pos && pos <= to) hit = { from, to };
-						});
-						if (hit) {
-							const h = hit as { from: number; to: number };
-							view.dispatch({ effects: setClickCard.of(buildClickTooltip(h.from, h.to)) });
-						} else if (view.state.field(clickCardField, false)) {
-							view.dispatch({ effects: setClickCard.of(null) });
-						}
-						return false;
+			function buildClickTooltip(from: number, to: number): TooltipT {
+				return {
+					pos: from,
+					end: to,
+					above: false,
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					create: (v: any) => {
+						const dom = document.createElement('div');
+						dom.className = 'spike-click-tooltip';
+						dom.appendChild(buildCard(v));
+						return { dom };
 					},
-				}),
-			]);
+				} as unknown as TooltipT;
+			}
 
-			// Report that the content script loaded in a real editor (proves module resolution + load).
-			void context.postMessage({ type: 's5log' });
+			// --- the staged timeline ----------------------------------------------------------------
+			const stages: Array<{ name: string; desc: string; run: () => void }> = [
+				{
+					name: 'S5b',
+					desc: 'addExtension no-op ViewPlugin',
+					run: () => {
+						const noop = ViewPlugin.fromClass(
+							class {
+								public update() {
+									/* no-op */
+								}
+							},
+						);
+						editorControl.addExtension(noop);
+					},
+				},
+				{
+					name: 'S5c',
+					desc: 'addExtension linter() returning ZERO diagnostics',
+					run: () => {
+						editorControl.addExtension(linter(spikeLintSource, { delay: 100 }));
+					},
+				},
+				{
+					name: 'S5d',
+					desc: 'linter now emits spiketest diagnostic + markClass (forceLinting)',
+					run: () => {
+						lintMode = 1;
+						if (view && typeof forceLinting === 'function') forceLinting(view);
+					},
+				},
+				{
+					name: 'S5e',
+					desc: 'inject squiggle CSS',
+					run: () => {
+						ensureStyles();
+					},
+				},
+				{
+					name: 'S5f',
+					desc: 'arm mousedown + showTooltip tap card',
+					run: () => {
+						editorControl.addExtension([
+							clickCardField,
+							EditorView.domEventHandlers({
+								// eslint-disable-next-line @typescript-eslint/no-explicit-any
+								mousedown: (event: MouseEvent, v: any): boolean => {
+									if (event.button !== 0) return false;
+									const pos = v.posAtCoords({ x: event.clientX, y: event.clientY });
+									if (pos == null) return false;
+									let hit: { from: number; to: number } | null = null;
+									forEachDiagnostic(v.state, (_d: unknown, from: number, to: number) => {
+										if (!hit && from <= pos && pos <= to) hit = { from, to };
+									});
+									if (hit) {
+										const h = hit as { from: number; to: number };
+										v.dispatch({ effects: setClickCard.of(buildClickTooltip(h.from, h.to)) });
+									} else if (v.state.field(clickCardField, false)) {
+										v.dispatch({ effects: setClickCard.of(null) });
+									}
+									return false;
+								},
+							}),
+						]);
+					},
+				},
+			];
+
+			let i = 0;
+			const runNext = (): void => {
+				if (i >= stages.length) {
+					post(`S5 DONE[${id}] all stages reported`);
+					return;
+				}
+				const stage = stages[i++];
+				post(`${stage.name}[${id}] START ${stage.desc}`);
+				try {
+					stage.run();
+					post(`${stage.name}[${id}] OK`);
+				} catch (e) {
+					post(`${stage.name}[${id}] FAIL ${short(e)}`);
+				}
+				setTimeout(runNext, STAGE_GAP_MS);
+			};
+
+			// Kick the chain after one beat so the S5a lines land before S5b starts.
+			setTimeout(runNext, STAGE_GAP_MS);
 		},
 	};
 };
