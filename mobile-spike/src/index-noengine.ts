@@ -1,24 +1,43 @@
-// Harper Mobile Spike — instrumented staged probe (plugin main process / mobile background WebView).
+// Harper Mobile Spike v0.0.3 — NO-ENGINE ISOLATION BUILD (plugin main process / mobile background WebView).
 //
-// GOAL: measure, on-device, whether harper.js's WASM engine instantiates and performs inside the
-// Joplin mobile plugin background (a sandboxed WebView with NO Node). Everything below uses ONLY
-// plain browser + joplin.data APIs — no require('fs'), no joplin.require, no file paths, no Node
-// globals. The SAME code runs on desktop Joplin (Electron), which is what the pre-flight E2E drives.
+// WHY THIS EXISTS. v0.0.1/v0.0.2 proved the ENGINE side (S0-S4, ~130 MB Harper WASM in the plugin
+// background WebView) is flawless on-device, but the EDITOR side dies ~4 s after entering edit mode:
+// the keyboard closes, Joplin falls back to the viewer, and the content script reloads
+// (ExtendedWebView crash-recovery remount). v0.0.2 showed the S5 trail stops during the IDLE WAIT
+// between stages — the death is TIME-correlated, not action-correlated. Our CM6 code is not the trigger.
 //
-// OUTPUT DISCIPLINE: all output goes to a single note ('Harper Mobile Spike Results'). We ANNOUNCE
-// each stage (append a "Sx START" line) BEFORE running it, then append its result AFTER — so if the
-// WebView dies mid-stage the note tells us exactly where. Every append re-reads the note body from
-// joplin.data (never caches it across stages) so a crash can't lose earlier lines.
+// PRIME HYPOTHESIS. On Android an app's WebViews share ONE sandboxed renderer process. The plugin
+// background WebView holds the ~130 MB engine; when the editor WebView joins that same renderer it
+// pushes the process over budget -> renderer OOM-killed -> onRenderProcessGone remount -> keyboard
+// closes / viewer returns.
+//
+// THIS BUILD ISOLATES THE SINGLE VARIABLE "engine residency" by REMOVING HARPER ENTIRELY. There is NO
+// harper.js import anywhere reachable from this entry, so the emitted bundle is tiny (tens of KB, no
+// inlined WASM) and the plugin background WebView holds ~no engine memory. If the editor now SURVIVES
+// with the same content script (S5a-S5f + heartbeats), engine residency is confirmed as the killer.
+//
+// OUTPUT DISCIPLINE (identical to v0.0.2). All output goes to a single note ('Harper Mobile Spike
+// Results'). Every append re-reads the note body from joplin.data (never caches it across stages), and
+// all appends are serialized through one promise chain so concurrent editor-side (S5) messages and the
+// main-side heartbeat can never interleave a read-modify-write and lose a line. ISO timestamps prefix
+// every forwarded S5 line so a crash between stages is placeable in time.
 
 import joplin from 'api';
 import { ContentScriptType } from 'api/types';
-import { LocalLinter } from 'harper.js';
-import { slimBinaryInlined } from 'harper.js/slimBinaryInlined';
+
+// NOTE: intentionally NO `import ... from 'harper.js'` and NO './slimBinaryInlined' anywhere. Keeping
+// this entry harper-free is the whole point — the webpack build for this variant must emit a bundle
+// with NO 'data:application/wasm' string.
 
 const RESULTS_TITLE = 'Harper Mobile Spike Results';
 const SPIKE_FOLDER = 'Spike';
 const CONTENT_SCRIPT_ID = 'harperSpikeCm';
-const SPIKE_VERSION = '0.0.3'; // engine variant of v0.0.3 (built only with SPIKE_VARIANT=engine)
+const SPIKE_VERSION = '0.0.3';
+
+// Main-side heartbeat cadence: every 10 s for 3 minutes. This proves whether the PLUGIN background
+// WebView itself stays alive (independently of the editor WebView).
+const MAIN_HEARTBEAT_INTERVAL_MS = 10_000;
+const MAIN_HEARTBEAT_DURATION_MS = 3 * 60_000;
 
 // ---------------------------------------------------------------------------
 // Tiny instrumentation helpers (all guarded — every primitive here is non-standard on some runtime).
@@ -45,15 +64,9 @@ function memSnapshot(): string {
 	return 'n/a';
 }
 
-function fmt(ms: number): string {
-	return `${ms.toFixed(1)}ms`;
-}
-
-function median(nums: number[]): number {
-	if (!nums.length) return 0;
-	const s = [...nums].sort((a, b) => a - b);
-	const mid = Math.floor(s.length / 2);
-	return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+function short(stack: unknown): string {
+	const s = typeof stack === 'string' ? stack : String(stack ?? '');
+	return s.slice(0, 300).replace(/\n/g, ' ');
 }
 
 // ---------------------------------------------------------------------------
@@ -111,9 +124,9 @@ async function appendLineRaw(line: string): Promise<void> {
 	}
 }
 
-// Serialize every append through one promise chain. S5 now emits MANY messages that can arrive
-// concurrently with the probe's own appends; without serialization two read-modify-write cycles could
-// interleave and lose a line. Each caller still `await`s and gets its line committed in order.
+// Serialize every append through one promise chain. The heartbeat and the forwarded S5 messages arrive
+// concurrently with each other; without serialization two read-modify-write cycles could interleave and
+// lose a line. Each caller still `await`s and gets its line committed in order.
 let appendChain: Promise<void> = Promise.resolve();
 function appendLine(line: string): Promise<void> {
 	const next = appendChain.then(() => appendLineRaw(line));
@@ -123,30 +136,14 @@ function appendLine(line: string): Promise<void> {
 	return next;
 }
 
-function short(stack: unknown): string {
-	const s = typeof stack === 'string' ? stack : String(stack ?? '');
-	return s.slice(0, 300).replace(/\n/g, ' ');
-}
-
 // ---------------------------------------------------------------------------
-// Test documents.
-// ---------------------------------------------------------------------------
-function buildDoc(targetBytes: number): string {
-	// A sentence carrying the known errors the spec sanity-checks against.
-	const unit =
-		'I beleive teh feature works, but this is an test and we should of shipped it definately. ';
-	let doc = '# Spike sample\n\n';
-	while (doc.length < targetBytes) doc += unit;
-	return doc;
-}
-
-// ---------------------------------------------------------------------------
-// The staged probe. Each stage announces itself, runs in its own try/catch, and records timing +
-// memory. A failed S1 precludes S2/S3/S4 (no engine); everything else continues best-effort.
+// The no-engine probe: S0 env only, then 'NOENGINE READY'. There is deliberately NO WASM stage and no
+// 'SPIKE COMPLETE' — this variant measures editor survival with an empty (engine-free) plugin webview,
+// not engine behaviour.
 // ---------------------------------------------------------------------------
 async function runProbe(): Promise<void> {
 	await ensureResultsNote();
-	await appendLine(`===== SPIKE RUN v${SPIKE_VERSION} ${new Date().toISOString()} =====`);
+	await appendLine(`===== SPIKE RUN v${SPIKE_VERSION} (NO ENGINE) ${new Date().toISOString()} =====`);
 
 	// --- S0 ENV --------------------------------------------------------------
 	await appendLine('S0 START env...');
@@ -171,81 +168,25 @@ async function runProbe(): Promise<void> {
 		await appendLine(`S0 FAIL: ${short((error as Error).message)} | ${short((error as Error).stack)}`);
 	}
 
-	// --- S1 TRIVIAL WASM -----------------------------------------------------
-	let s1ok = false;
-	await appendLine('S1 START trivial wasm instantiate...');
-	try {
-		const t = nowMs();
-		// The 8-byte WASM header alone is a valid (empty) module.
-		await WebAssembly.instantiate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]));
-		s1ok = true;
-		await appendLine(`S1 OK ${fmt(nowMs() - t)}`);
-	} catch (error) {
-		await appendLine(`S1 FAIL: ${short((error as Error).message)} | ${short((error as Error).stack)}`);
-	}
+	// No engine is loaded. Announce readiness — the editor probe (S5, content script) carries the rest.
+	await appendLine('NOENGINE READY');
+}
 
-	if (!s1ok) {
-		await appendLine('S1 FAILED — precludes S2/S3/S4 (no WASM engine). Stopping.');
-		await appendLine('SPIKE COMPLETE');
-		return;
-	}
-
-	// --- S2 HARPER INIT ------------------------------------------------------
-	let linter: LocalLinter | null = null;
-	await appendLine('S2 START harper init (LocalLinter + slimBinaryInlined)...');
-	try {
-		const t = nowMs();
-		linter = new LocalLinter({ binary: slimBinaryInlined });
-		await linter.setup();
-		await appendLine(`S2 OK init ${fmt(nowMs() - t)} | mem ${memSnapshot()}`);
-	} catch (error) {
-		await appendLine(`S2 FAIL: ${short((error as Error).message)} | ${short((error as Error).stack)}`);
-	}
-
-	// --- S3 LINT (5x on a ~5 KB doc) ----------------------------------------
-	if (linter) {
-		await appendLine('S3 START lint x5 (~5 KB doc)...');
-		try {
-			const doc = buildDoc(5 * 1024);
-			const times: number[] = [];
-			let lastCount = -1;
-			for (let i = 0; i < 5; i++) {
-				const t = nowMs();
-				const lints = await linter.lint(doc, { language: 'markdown' });
-				times.push(nowMs() - t);
-				lastCount = lints.length;
-			}
-			const timesStr = times.map((x) => x.toFixed(1)).join(',');
-			await appendLine(
-				`S3 OK docBytes=${doc.length} times=[${timesStr}]ms median=${fmt(median(times))} ` +
-					`lastLintCount=${lastCount} | mem ${memSnapshot()}`,
-			);
-			if (lastCount <= 0) await appendLine('S3 WARN: lint count is not > 0 (expected known errors)');
-		} catch (error) {
-			await appendLine(
-				`S3 FAIL: ${short((error as Error).message)} | ${short((error as Error).stack)}`,
-			);
+// ---------------------------------------------------------------------------
+// MAIN-side heartbeat: every 10 s for 3 minutes, append 'MAIN HEARTBEAT t=<n>s mem=<...>'. If the PLUGIN
+// background WebView is itself killed (not just the editor), these lines stop — pinning the time of death
+// of the main process independently of the editor's S5 heartbeat.
+// ---------------------------------------------------------------------------
+function startMainHeartbeat(): void {
+	const startedAt = nowMs();
+	const timer = setInterval(() => {
+		const elapsedS = Math.round((nowMs() - startedAt) / 1000);
+		void appendLine(`MAIN HEARTBEAT t=${elapsedS}s mem=${memSnapshot()}`);
+		if (nowMs() - startedAt >= MAIN_HEARTBEAT_DURATION_MS) {
+			clearInterval(timer);
+			void appendLine(`MAIN HEARTBEAT DONE (${elapsedS}s elapsed)`);
 		}
-
-		// --- S4 SECOND DOC (~1 KB warm path) ---------------------------------
-		await appendLine('S4 START second doc (~1 KB warm path)...');
-		try {
-			const doc2 = buildDoc(1 * 1024);
-			const t = nowMs();
-			const lints2 = await linter.lint(doc2, { language: 'markdown' });
-			await appendLine(
-				`S4 OK docBytes=${doc2.length} ${fmt(nowMs() - t)} lints=${lints2.length} | final mem ${memSnapshot()}`,
-			);
-		} catch (error) {
-			await appendLine(
-				`S4 FAIL: ${short((error as Error).message)} | ${short((error as Error).stack)}`,
-			);
-		}
-	} else {
-		await appendLine('S3/S4 SKIPPED — S2 produced no linter.');
-	}
-
-	await appendLine('SPIKE COMPLETE');
+	}, MAIN_HEARTBEAT_INTERVAL_MS);
 }
 
 // ---------------------------------------------------------------------------
@@ -273,8 +214,7 @@ joplin.plugins.register({
 	onStart: async () => {
 		installGlobalErrorHandlers();
 
-		// Register the S5 content script FIRST so it can load (and report) as soon as an editor opens,
-		// independently of the WASM probe below.
+		// Register the S5 content script FIRST so it can load (and report) as soon as an editor opens.
 		await joplin.contentScripts.register(
 			ContentScriptType.CodeMirrorPlugin,
 			CONTENT_SCRIPT_ID,
@@ -282,8 +222,8 @@ joplin.plugins.register({
 		);
 		await joplin.contentScripts.onMessage(CONTENT_SCRIPT_ID, async (message: unknown) => {
 			const msg = message as { type?: string; line?: string } | null;
-			// v0.0.2 staged report: forward the content script's line verbatim, prefixed with a timestamp
-			// so a crash between stages is placeable in time (the line already carries a per-load id).
+			// Forward the content script's line verbatim, prefixed with a timestamp so a crash between
+			// stages is placeable in time (the line already carries a per-load id).
 			if (msg && msg.type === 's5' && typeof msg.line === 'string') {
 				await appendLine(`[${new Date().toISOString()}] ${msg.line}`);
 				return { ok: true };
@@ -296,7 +236,8 @@ joplin.plugins.register({
 			return null;
 		});
 
-		// Run the staged WASM probe. Guarded end-to-end so a failure still leaves the note diagnosable.
+		// Run the no-engine probe (S0 + NOENGINE READY), then start the main-side heartbeat. Guarded
+		// end-to-end so a failure still leaves the note diagnosable.
 		try {
 			await runProbe();
 		} catch (error) {
@@ -304,5 +245,6 @@ joplin.plugins.register({
 				`PROBE FATAL: ${short((error as Error).message)} | ${short((error as Error).stack)}`,
 			);
 		}
+		startMainHeartbeat();
 	},
 });

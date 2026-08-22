@@ -1,10 +1,11 @@
 {
   "name": "joplin-plugin-harper-mobile-spike",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": true,
   "description": "Instrumented on-device spike for a Harper mobile (Android) Joplin port. Not for publication.",
   "scripts": {
     "dist": "webpack --env joplin-plugin-config=buildMain && webpack --env joplin-plugin-config=buildExtraScripts && webpack --env joplin-plugin-config=createArchive",
+    "dist:engine": "SPIKE_VARIANT=engine npm run dist",
     "build": "npm run dist"
   },
   "license": "MIT",

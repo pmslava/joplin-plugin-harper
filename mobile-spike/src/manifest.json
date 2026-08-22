@@ -7,9 +7,9 @@
 		"desktop",
 		"mobile"
 	],
-	"version": "0.0.2",
+	"version": "0.0.3",
 	"name": "Harper Mobile Spike",
-	"description": "Instrumented on-device spike measuring whether harper.js WASM instantiates and performs inside the Joplin mobile plugin WebView. Writes staged results to a note. Not for publication.",
+	"description": "Instrumented on-device spike isolating engine residency: the default build removes harper.js entirely (no WASM) to test whether the Joplin mobile editor survives when the plugin WebView holds no engine. Writes staged results + heartbeats to a note. Not for publication.",
 	"author": "pmslava",
 	"homepage_url": "https://github.com/pmslava/joplin-plugin-harper",
 	"repository_url": "https://github.com/pmslava/joplin-plugin-harper",

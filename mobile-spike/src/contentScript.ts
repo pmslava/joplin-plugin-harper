@@ -1,4 +1,12 @@
-// Harper Mobile Spike v0.0.2 — SELF-DIAGNOSING CM6 content script (S5, staged activation).
+// Harper Mobile Spike v0.0.3 — SELF-DIAGNOSING CM6 content script (S5, staged activation + heartbeat).
+//
+// SHARED by both v0.0.3 variants (engine and no-engine) — this script never imports harper.js, so it
+// is byte-identical regardless of which main-process entry ships. v0.0.3 changes vs v0.0.2:
+//   - STAGE_GAP_MS tightened 3000 -> 2000 (stages land sooner; a crash between reports is still
+//     attributable to exactly one stage).
+//   - an EDITOR-SIDE HEARTBEAT: every 5 s for 2 minutes we post 'S5 HEARTBEAT[id] t=<n>s', so the
+//     results note time-stamps precisely WHEN the editor webview dies even BETWEEN stages (v0.0.2's
+//     device evidence showed the death happens during the idle wait, not inside a stage's action).
 //
 // WHY THIS EXISTS. On the Android device the ENGINE side (S0-S4, WASM in the plugin background
 // WebView) succeeded completely, but the EDITOR side died: opening a note to edit "immediately closes
@@ -56,7 +64,12 @@ interface CodeMirrorControl {
 
 const SPIKE_WORD = 'spiketest';
 const STYLE_ELEMENT_ID = 'harper-spike-styles';
-const STAGE_GAP_MS = 3000; // ~3 s between stages: a crash between reports is attributable to one stage.
+const STAGE_GAP_MS = 2000; // ~2 s between stages: a crash between reports is attributable to one stage.
+
+// Editor-side heartbeat: post 'S5 HEARTBEAT[id] t=<n>s' every 5 s for 2 minutes so the note pins the
+// exact time the editor webview dies, even during the idle waits between staged actions.
+const HEARTBEAT_INTERVAL_MS = 5000;
+const HEARTBEAT_DURATION_MS = 2 * 60_000;
 
 /** 4-char base36 id, distinguishes interleaved content-script loads (mobile reloads it per editor open). */
 function rid(): string {
@@ -109,6 +122,16 @@ export default (context: ContentScriptContext) => {
 			// (0) Error handlers BEFORE anything else touches CodeMirror.
 			installEditorErrorHandlers(post, id);
 			post(`S5[${id}] content script loaded in editor`); // parity with the old single line
+
+			// (0b) Editor-side heartbeat: independent of the staged timeline, it keeps posting until the
+			// editor webview is torn down. The last heartbeat's t=<n>s pins the death time; a gap in the
+			// heartbeat sequence between two stages localises the crash to that idle interval.
+			const heartbeatStart = Date.now();
+			const heartbeatTimer = setInterval(() => {
+				const t = Math.round((Date.now() - heartbeatStart) / 1000);
+				post(`S5 HEARTBEAT[${id}] t=${t}s`);
+				if (Date.now() - heartbeatStart >= HEARTBEAT_DURATION_MS) clearInterval(heartbeatTimer);
+			}, HEARTBEAT_INTERVAL_MS);
 
 			if (!editorControl.cm6) {
 				post(`S5[${id}] no cm6 on editorControl — not a CM6 editor, bailing`);

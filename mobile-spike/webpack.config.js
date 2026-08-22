@@ -1,11 +1,18 @@
 // Minimal, self-contained webpack build for the Harper mobile spike.
 //
 // Modelled on the parent plugin's generator webpack.config.js but trimmed to the essentials:
-//   buildMain          -> src/index.ts        -> dist/index.js   (the ~21 MB inlined-WASM bundle)
+//   buildMain          -> <variant entry>      -> dist/index.js   (see VARIANT below)
 //   buildExtraScripts  -> src/contentScript.ts -> dist/contentScript.js (CM6 script; @codemirror externals)
 //   createArchive      -> tar dist/**         -> publish/<id>.jpl
 //
 // A .jpl is simply a portable TAR of the dist/ tree — the same archive step the parent uses.
+//
+// VARIANT SELECTION (v0.0.3). The buildMain entry is chosen by the SPIKE_VARIANT env var:
+//   (unset) / 'noengine' -> src/index-noengine.ts  (DEFAULT — the tiny, harper-free artifact shipped
+//                                                     to the device for the engine-residency isolation)
+//   'engine'             -> src/index.ts           (the ~21 MB inlined-WASM engine probe; still buildable)
+// Both emit dist/index.js; only the SOURCE entry differs. Build the engine variant with:
+//   SPIKE_VARIANT=engine npm run dist        (or: npm run dist:engine)
 
 /* eslint-disable no-console */
 const path = require('path');
@@ -22,6 +29,14 @@ const apiDir = path.resolve(rootDir, '..', 'api'); // reuse the parent repo's Jo
 
 const manifest = JSON.parse(fs.readFileSync(path.join(srcDir, 'manifest.json'), 'utf8'));
 const pluginArchiveFilePath = path.resolve(publishDir, `${manifest.id}.jpl`);
+
+// v0.0.3 variant selection: default is the harper-free 'noengine' entry (the tiny artifact shipped to
+// the device). SPIKE_VARIANT=engine rebuilds the ~21 MB inlined-WASM engine probe from src/index.ts.
+const SPIKE_VARIANT = (process.env.SPIKE_VARIANT || 'noengine').toLowerCase();
+const VARIANT_ENTRY = SPIKE_VARIANT === 'engine' ? './src/index.ts' : './src/index-noengine.ts';
+if (SPIKE_VARIANT !== 'engine' && SPIKE_VARIANT !== 'noengine') {
+	throw new Error(`Unknown SPIKE_VARIANT='${SPIKE_VARIANT}' (expected 'noengine' or 'engine')`);
+}
 
 // Webpack5 doesn't polyfill node builtins; set them false so guarded require()/import('fs') inside
 // harper's glue (dead on mobile where `process` is undefined) doesn't drag in a polyfill.
@@ -50,7 +65,7 @@ const baseConfig = {
 
 const pluginConfig = {
 	...baseConfig,
-	entry: './src/index.ts',
+	entry: VARIANT_ENTRY,
 	resolve: {
 		alias: { api: apiDir },
 		fallback: moduleFallback,
@@ -127,6 +142,7 @@ module.exports = (env) => {
 	if (!configName) throw new Error('A config must be specified via --env joplin-plugin-config=');
 
 	if (configName === 'buildMain') {
+		console.log(`[spike] buildMain variant='${SPIKE_VARIANT}' entry='${VARIANT_ENTRY}'`);
 		fs.rmSync(distDir, { recursive: true, force: true });
 		fs.rmSync(publishDir, { recursive: true, force: true });
 		fs.mkdirSync(publishDir, { recursive: true });

@@ -10,18 +10,22 @@ import {
 } from '../../e2e/helpers';
 
 /**
- * DESKTOP pre-flight gate for the Harper mobile spike (v0.0.2, self-diagnosing staged S5).
+ * DESKTOP pre-flight gate for the Harper mobile spike v0.0.3 (NO-ENGINE isolation build).
  *
- * Runs the SAME spike plugin the user will sideload on Android, but inside a real desktop Joplin
- * (Electron) — it uses no Node APIs, so it behaves identically to the mobile background WebView for
- * the purposes of these assertions. Proves, before anyone touches a phone:
- *   - the plugin background runs (WASM probe host is alive),
- *   - the staged probe reaches 'SPIKE COMPLETE' and S3 reports a positive lint count (harper.js
- *     instantiated, initialised and linted end to end),
- *   - S5: the content script's STAGED activation (S5a require → S5b no-op ext → S5c linter(zero) →
- *     S5d linter emits spiketest+markClass → S5e CSS → S5f tap card) all report OK on desktop, the
- *     spiketest underline paints, and the tap card opens/closes. Any device failure is therefore
- *     device-specific, and the note's last S5x line will finger the stage that kills the mobile editor.
+ * v0.0.3 ships a harper-free plugin bundle (no WASM) to isolate the single variable "engine residency"
+ * as the suspected cause of the mobile-editor death (a shared-renderer OOM kill — see
+ * docs/research/mobile-plugin-runtime.md, Addendum v0.0.3). This desktop gate runs the SAME no-engine
+ * plugin the user will sideload on Android, inside a real desktop Joplin (Electron), and proves before
+ * anyone touches a phone:
+ *   - the plugin background runs (S5 host is alive),
+ *   - the no-engine probe reaches 'NOENGINE READY' (S0 env only; there is deliberately NO WASM stage
+ *     and NO 'SPIKE COMPLETE' — this build measures editor survival, not engine behaviour),
+ *   - the MAIN-side heartbeat ticks (the plugin background WebView stays alive),
+ *   - S5: the content script's STAGED activation (S5a require -> S5b no-op ext -> S5c linter(zero) ->
+ *     S5d linter emits spiketest+markClass -> S5e CSS -> S5f tap card) all report OK on desktop, the
+ *     spiketest underline paints, the tap card opens/closes, and the editor-side heartbeat posts at
+ *     least two ticks. Any device failure is therefore device-specific, and the note's last S5x /
+ *     heartbeat line will finger the moment the mobile editor dies.
  */
 
 const RESULTS_TITLE = 'Harper Mobile Spike Results';
@@ -44,7 +48,7 @@ async function readResultsNoteBody(win: Page): Promise<string> {
   return getEditorBody(win);
 }
 
-test.describe('Harper mobile spike — desktop pre-flight', () => {
+test.describe('Harper mobile spike v0.0.3 (no-engine) — desktop pre-flight', () => {
   let joplin: JoplinInstance;
 
   test.beforeAll(async () => {
@@ -65,43 +69,56 @@ test.describe('Harper mobile spike — desktop pre-flight', () => {
       .toBe(true);
   });
 
-  test('staged probe reaches SPIKE COMPLETE with a positive S3 lint count', async () => {
+  test('no-engine probe reaches NOENGINE READY (no WASM stages) and the main heartbeat ticks', async () => {
     const { win } = joplin;
 
-    // Poll the results note until the probe signals completion. The body is written incrementally by
-    // the plugin (append-per-stage), and each read re-selects the note to force a fresh DB load.
+    // Poll the results note until the no-engine probe signals readiness. The body is written
+    // incrementally by the plugin, and each read re-selects the note to force a fresh DB load.
     let body = '';
     await expect
       .poll(
         async () => {
           body = await readResultsNoteBody(win);
-          return body.includes('SPIKE COMPLETE');
+          return body.includes('NOENGINE READY');
         },
-        { timeout: 240_000, intervals: [3000] },
+        { timeout: 120_000, intervals: [2000] },
       )
       .toBe(true);
+
+    // Wait for the MAIN-side heartbeat to tick at least twice (every 10 s), proving the plugin
+    // background WebView stays alive with no engine resident.
+    await expect
+      .poll(
+        async () => {
+          body = await readResultsNoteBody(win);
+          return (body.match(/MAIN HEARTBEAT t=\d+s mem=/g) || []).length;
+        },
+        { timeout: 60_000, intervals: [3000] },
+      )
+      .toBeGreaterThanOrEqual(2);
 
     // Capture the full results-note body as evidence (this is what the report quotes verbatim).
     // eslint-disable-next-line no-console
     console.log(
-      `\n========== HARPER SPIKE RESULTS NOTE (desktop, after SPIKE COMPLETE) ==========\n${body}\n` +
-        `==============================================================================\n`,
+      `\n========== HARPER SPIKE v0.0.3 RESULTS NOTE (desktop, after NOENGINE READY) ==========\n${body}\n` +
+        `======================================================================================\n`,
     );
 
-    // Hard assertions.
-    expect(body).toContain('S1 OK');
-    expect(body).toContain('S2 OK');
-    expect(body).toContain('S3 OK');
-    expect(body).toMatch(/===== SPIKE RUN v0\.0\.2 /); // header carries the spike version
-    const m = body.match(/lastLintCount=(\d+)/);
-    expect(m, 'S3 must report a lastLintCount').not.toBeNull();
-    const lintCount = m ? parseInt(m[1], 10) : 0;
+    // Hard assertions: no-engine build, correct header, no WASM/engine stages, no SPIKE COMPLETE.
+    expect(body).toMatch(/===== SPIKE RUN v0\.0\.3 \(NO ENGINE\) /); // header carries the no-engine version
+    expect(body).toContain('S0 ENV');
+    expect(body).toContain('NOENGINE READY');
+    expect(body).not.toContain('SPIKE COMPLETE');
+    expect(body, 'no engine WASM stages must run in the no-engine build').not.toMatch(/\bS1 OK\b/);
+    expect(body).not.toMatch(/\bS2 OK\b/);
+    expect(body).not.toMatch(/\bS3 OK\b/);
+    const mainBeats = (body.match(/MAIN HEARTBEAT t=\d+s mem=/g) || []).length;
     // eslint-disable-next-line no-console
-    console.log(`[spike-e2e] S3 lastLintCount = ${lintCount}`);
-    expect(lintCount).toBeGreaterThan(0);
+    console.log(`[spike-e2e] MAIN HEARTBEAT count = ${mainBeats}`);
+    expect(mainBeats).toBeGreaterThanOrEqual(2);
   });
 
-  test('S5 staged: all stages report OK, the spiketest underline paints, and the tap card opens/closes', async () => {
+  test('S5 staged: all stages report OK, the underline paints, the tap card opens/closes, and the editor heartbeat ticks', async () => {
     const { win } = joplin;
 
     await createNotebook(win, 'Spike Editor NB');
@@ -109,12 +126,12 @@ test.describe('Harper mobile spike — desktop pre-flight', () => {
     await expect.poll(() => editorIsPresent(win), { timeout: 20_000 }).toBe(true);
 
     // Opening this editor starts the content script's staged timeline (S5a immediately, then S5b..S5f
-    // ~3 s apart → S5f arms at ~15 s). Seed the body with the trigger word up front.
+    // ~2 s apart -> S5f arms at ~10 s) plus the editor-side heartbeat (every 5 s). Seed the trigger word.
     await setEditorBody(win, 'A line with spiketest in it, and another spiketest too.');
 
-    // Give the timeline time to pass S5d (linter emits, ~9 s), S5e (CSS) and S5f (card, ~15 s), then
+    // Give the timeline time to pass S5d (linter emits, ~6 s), S5e (CSS) and S5f (card, ~10 s), then
     // nudge a fresh doc change so the linter (now in emit mode) definitely re-runs and paints marks.
-    await win.waitForTimeout(17_000);
+    await win.waitForTimeout(14_000);
     await setEditorBody(win, 'A line with spiketest in it, and yet another spiketest here.');
 
     // The spike underline decoration must paint (S5d flipped the linter into emit mode + markClass).
@@ -137,21 +154,22 @@ test.describe('Harper mobile spike — desktop pre-flight', () => {
     await itWorks.click({ force: true });
     await expect.poll(() => card.count(), { timeout: 10_000 }).toBe(0);
 
-    // Now assert the STAGED evidence landed in the results note: every stage reported OK on desktop.
-    // (These lines are produced by the probe-note editor's timeline while the results note itself is
-    // NOT the open editor, so they persist cleanly.)
+    // Now assert the STAGED evidence landed in the results note: every stage reported OK on desktop, and
+    // the editor-side heartbeat ticked at least twice (so on-device a gap/last-tick pins the death time).
     let body = '';
     await expect
       .poll(
         async () => {
           body = await readResultsNoteBody(win);
+          const beats = (body.match(/S5 HEARTBEAT\[\w+\] t=\d+s/g) || []).length;
           return (
             /S5a\[\w+\] require @codemirror\/lint ok/.test(body) &&
             /S5b\[\w+\] OK/.test(body) &&
             /S5c\[\w+\] OK/.test(body) &&
             /S5d\[\w+\] OK/.test(body) &&
             /S5e\[\w+\] OK/.test(body) &&
-            /S5f\[\w+\] OK/.test(body)
+            /S5f\[\w+\] OK/.test(body) &&
+            beats >= 2
           );
         },
         { timeout: 90_000, intervals: [3000] },
@@ -161,12 +179,12 @@ test.describe('Harper mobile spike — desktop pre-flight', () => {
     // Emit only the S5-related lines verbatim for the report.
     const s5Lines = body
       .split('\n')
-      .filter((l) => /\bS5[a-f]?\b/.test(l) || l.includes('EDITOR ERROR'))
+      .filter((l) => /\bS5[a-f]?\b/.test(l) || l.includes('HEARTBEAT') || l.includes('EDITOR ERROR'))
       .join('\n');
     // eslint-disable-next-line no-console
     console.log(
-      `\n========== HARPER SPIKE RESULTS NOTE — S5 STAGED LINES (desktop) ==========\n${s5Lines}\n` +
-        `==========================================================================\n`,
+      `\n========== HARPER SPIKE v0.0.3 RESULTS NOTE — S5 STAGED + HEARTBEAT LINES (desktop) ==========\n${s5Lines}\n` +
+        `=============================================================================================\n`,
     );
 
     // Individual hard assertions (redundant with the poll, but explicit per stage).
@@ -178,6 +196,10 @@ test.describe('Harper mobile spike — desktop pre-flight', () => {
     expect(body, 'S5d').toMatch(/S5d\[\w+\] OK/);
     expect(body, 'S5e').toMatch(/S5e\[\w+\] OK/);
     expect(body, 'S5f').toMatch(/S5f\[\w+\] OK/);
+    const editorBeats = (body.match(/S5 HEARTBEAT\[\w+\] t=\d+s/g) || []).length;
+    // eslint-disable-next-line no-console
+    console.log(`[spike-e2e] editor S5 HEARTBEAT count = ${editorBeats}`);
+    expect(editorBeats, 'at least 2 editor heartbeats').toBeGreaterThanOrEqual(2);
     // No stage crashed the desktop editor.
     expect(body, 'no EDITOR ERROR on desktop').not.toContain('EDITOR ERROR');
   });
