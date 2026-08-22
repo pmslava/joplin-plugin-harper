@@ -25,12 +25,16 @@ const REPO_ROOT = path.resolve(__dirname, '..');
 const CACHE_DIR = path.join(REPO_ROOT, '.e2e-cache');
 const EXTRACT_DIR = path.join(CACHE_DIR, 'squashfs-root');
 const JOPLIN_BINARY = path.join(EXTRACT_DIR, 'joplin');
-const PLUGIN_DIST = path.join(REPO_ROOT, 'dist');
+// Which built plugin to load as a dev plugin. Defaults to this repo's ./dist so ALL existing parent
+// specs stay byte-identical; the mobile spike's own Playwright run overrides it via
+// JOPLIN_E2E_PLUGIN_DIST (pointing at mobile-spike/dist) without touching any parent spec.
+const PLUGIN_DIST = process.env.JOPLIN_E2E_PLUGIN_DIST ?? path.join(REPO_ROOT, 'dist');
 
 // The plugin id this fork ships under (see src/manifest.json). Joplin embeds it in the panel/
 // background webview URLs (?pluginId=...) and in the panel iframe's element id, so the harness must
-// use the current id rather than the upstream Agenda one it was forked from.
-export const PLUGIN_ID = 'io.github.pmslava.harper';
+// use the current id rather than the upstream Agenda one it was forked from. Overridable via
+// JOPLIN_E2E_PLUGIN_ID for the mobile spike (io.github.pmslava.harperspike); defaults to the real id.
+export const PLUGIN_ID = process.env.JOPLIN_E2E_PLUGIN_ID ?? 'io.github.pmslava.harper';
 
 export interface JoplinInstance {
   browser: Browser;
