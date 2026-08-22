@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as http from 'http';
 import * as net from 'net';
+import { trackInstance, untrackInstance } from './guard';
 
 /**
  * Helpers for launching a real Joplin desktop (Electron) instance with this plugin loaded as a
@@ -193,6 +194,9 @@ async function startInstance(profileDir: string): Promise<JoplinInstance> {
         }`,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
+      // Own process group (setsid), so a fatal signal can reap the whole Joplin tree
+      // (renderers/GPU/zygote) via `process.kill(-pid)`. We keep a reference (no unref) and track it.
+      detached: true,
     }
   );
 
@@ -203,8 +207,16 @@ async function startInstance(profileDir: string): Promise<JoplinInstance> {
     const win = await findMainWindow(browser, 60_000);
     await waitForJoplinReady(win);
 
+    // Track only a fully-started instance so a crash/signal reaps its group + profile.
+    trackInstance(child, profileDir);
     return { browser, child, win, profileDir, port };
   } catch (error) {
+    // Kill the whole group (child is detached) so a half-started launch cannot orphan renderers.
+    try {
+      if (typeof child.pid === 'number') process.kill(-child.pid, 'SIGKILL');
+    } catch {
+      /* ignore */
+    }
     try {
       child.kill('SIGKILL');
     } catch {
@@ -264,6 +276,9 @@ export async function closeJoplin(
   // Joplin only releases its profile lock once the process is really gone, so wait for it rather
   // than guessing at a delay: the profile may be about to be reused by another launch.
   await waitForExit(instance.child, 15_000);
+  // Process is confirmed gone: stop tracking it so the fatal handler can neither target a reused pid
+  // nor delete a profile a `keepProfile` restart is about to reuse.
+  untrackInstance(instance.child);
   await new Promise((r) => setTimeout(r, 2000));
   if (opts.keepProfile) return;
   try {
