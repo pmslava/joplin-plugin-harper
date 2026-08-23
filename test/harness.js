@@ -7,14 +7,29 @@
 // calls are recorded and the onMessage handler is captured so a test can drive a lint round-trip.
 
 const path = require('path')
+const fs = require('fs')
 
 const bundlePath = path.resolve(__dirname, '../dist/index.js')
+
+// Plugin id from the manifest. Real Joplin namespaces every setting key as `plugin-<id>.<key>` and
+// THROWS `Unknown key: plugin-<id>.<key>` the instant a plugin reads (value/values) a key it never
+// registered — which is exactly how v1.1.0 died on mobile (dictionaryPath is registered on desktop
+// only, but was read unconditionally). The old stub returned `undefined` for unknown keys, hiding
+// that class of bug. The strict settings stub below (see makeJoplin) mirrors real Joplin instead.
+const PLUGIN_ID = JSON.parse(
+    fs.readFileSync(path.resolve(__dirname, '../src/manifest.json'), 'utf8'),
+).id
 
 function makeJoplin(options) {
     const settings = Object.assign({}, options.initialSettings)
     const state = {
         settings,
         registeredSettings: null,
+        // STRICT settings fidelity: the exact set of keys the plugin registered via
+        // settings.registerSettings THIS run. settings.value()/values() throw 'Unknown key' for any
+        // key not in here, mirroring real Joplin (a key registered on desktop only — dictionaryPath —
+        // must never be read on mobile). Reset per run because makeJoplin builds fresh state each time.
+        registeredKeys: new Set(),
         panels: [],
         dialogs: [],
         panelHtml: {},
@@ -118,10 +133,30 @@ function makeJoplin(options) {
             registerSettings: async (defs) => {
                 state.registeredSettings = defs
                 for (const key of Object.keys(defs)) {
+                    state.registeredKeys.add(key)
                     if (!(key in settings)) settings[key] = defs[key].value
                 }
             },
-            value: async (key) => settings[key],
+            // STRICT: real Joplin throws for any key the plugin did not register (namespaced as
+            // plugin-<id>.<key>). This is what makes reading an unregistered setting a HARD failure in
+            // the harness — the fidelity gap that let the mobile dictionaryPath read pass silently.
+            value: async (key) => {
+                if (!state.registeredKeys.has(key)) {
+                    throw new Error(`Unknown key: plugin-${PLUGIN_ID}.${key} (Calling api.joplin.settings.value)`)
+                }
+                return settings[key]
+            },
+            values: async (keys) => {
+                const requested = Array.isArray(keys) ? keys : [...state.registeredKeys]
+                const out = {}
+                for (const key of requested) {
+                    if (!state.registeredKeys.has(key)) {
+                        throw new Error(`Unknown key: plugin-${PLUGIN_ID}.${key} (Calling api.joplin.settings.values)`)
+                    }
+                    out[key] = settings[key]
+                }
+                return out
+            },
             setValue: async (key, value) => {
                 state.settingWrites.push({ key, value })
                 settings[key] = value

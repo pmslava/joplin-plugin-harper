@@ -112,8 +112,11 @@ async function loadSettings(): Promise<void> {
 	cfg.enabled = await read('enabled', true);
 	cfg.dialect = await read('dialect', 'American');
 	cfg.debounceMs = await read('debounceMs', 500);
-	// externalDictionaryPath is registered on desktop only; value() returns undefined on mobile -> ''.
-	cfg.dictionaryPath = await read('dictionaryPath', '');
+	// dictionaryPath is registered on DESKTOP ONLY (its FilePath UX + fs read are desktop-only; see
+	// registerSettings). Reading an UNREGISTERED key throws 'Unknown key' in real Joplin, so on mobile we
+	// must never call value('dictionaryPath') — skip the read entirely and default to ''. (The old
+	// unconditional read escaped onStart on mobile and killed the whole plugin.)
+	cfg.dictionaryPath = isMobile() ? '' : await read('dictionaryPath', '');
 	cfg.dictionaryNoteId = await read('dictionaryNoteId', '');
 	cfg.ruleOverrides = await read('ruleOverrides', '');
 }
