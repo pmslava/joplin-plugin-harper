@@ -7,7 +7,7 @@
 		"desktop",
 		"mobile"
 	],
-	"version": "1.1.1",
+	"version": "1.2.0",
 	"name": "Harper",
 	"description": "Fast, offline, private grammar and spelling checking for the Joplin Markdown editor on desktop and mobile, powered by Harper. Per-kind coloured underlines, a suggestion card with one-click fixes, add-to-dictionary, ignore and disable-rule, plus American, British, Australian and Canadian dialects. The dictionary can live in a synced Joplin note so words follow you across devices.",
 	"author": "pmslava",

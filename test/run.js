@@ -124,11 +124,60 @@ async function main() {
 		assert.strictEqual(defs.ruleOverrides.advanced, true, 'ruleOverrides is advanced');
 	});
 
+	// ---- underlineStyle registration (v1.2.0) --------------------------------
+	// Harper issue #1710 ("Prefer solid line to squiggly"). The setting is a public enum on BOTH
+	// platforms (the mobile half is asserted inside the mobile run below), defaulting to the squiggle
+	// so every existing install keeps the look it has.
+	await test("setting 'underlineStyle' is a public enum in section harper, default 'squiggly', with both options", () => {
+		const def = state.registeredSettings.underlineStyle;
+		assert.ok(def, 'underlineStyle is registered');
+		assert.strictEqual(def.value, 'squiggly', "underlineStyle default is 'squiggly'");
+		// Same SettingItemType as the other String enum (dialect) — compared by reference rather than a
+		// magic number so the assertion can't drift from Joplin's enum.
+		assert.strictEqual(def.type, state.registeredSettings.dialect.type, 'underlineStyle is a String setting');
+		assert.strictEqual(def.public, true, 'underlineStyle is public');
+		assert.strictEqual(def.isEnum, true, 'underlineStyle isEnum');
+		assert.strictEqual(def.section, 'harper', 'underlineStyle in section harper');
+		assert.deepStrictEqual(
+			Object.keys(def.options).sort(),
+			['solid', 'squiggly'],
+			'underlineStyle exposes exactly the squiggly + solid options',
+		);
+		assert.ok(/squiggly/i.test(def.options.squiggly), 'the squiggly option has a squiggly label');
+		assert.ok(/solid/i.test(def.options.solid), 'the solid option has a solid label');
+	});
+
 	// ---- config handshake ---------------------------------------------------
 	const handler = state.contentScriptMessageHandlers['harperCm'];
-	await test('getConfig returns {enabled, debounceMs, platform} for the content script', async () => {
+	await test('getConfig returns {enabled, debounceMs, underlineStyle, platform} for the content script', async () => {
 		const config = await handler({ type: 'getConfig' });
-		assert.deepStrictEqual(config, { enabled: true, debounceMs: 500, platform: 'desktop' });
+		assert.deepStrictEqual(config, {
+			enabled: true,
+			debounceMs: 500,
+			underlineStyle: 'squiggly',
+			platform: 'desktop',
+		});
+	});
+
+	// ---- live underline-style apply (v1.2.0) --------------------------------
+	// Same shape as the live-debounce test below: the content script re-queries getConfig when the main
+	// process pokes `harper.forceLint` after a settings change, and (v1.2.0) relints INSIDE that reply,
+	// so the new markClass repaints without reopening the note. The class-swap itself lives in the CM6
+	// content script; the two halves the harness can observe are (a) the change is a poke, and (b)
+	// getConfig immediately serves the new value.
+	await test('changing underlineStyle pokes harper.forceLint and getConfig serves the new style live', async () => {
+		const before = state.commandExecutions.length;
+		await state.setSetting('underlineStyle', 'solid');
+		const pokes = state.commandExecutions
+			.slice(before)
+			.filter((e) => e.name === 'editor.execCommand' && e.args[0] && e.args[0].name === 'harper.forceLint');
+		assert.ok(pokes.length >= 1, 'an underlineStyle change pokes editor.execCommand{harper.forceLint}');
+		const config = await handler({ type: 'getConfig' });
+		assert.strictEqual(config.underlineStyle, 'solid', 'getConfig returns the just-changed style (live, no reopen)');
+		// And back again — the round-trip must work in both directions.
+		await state.setSetting('underlineStyle', 'squiggly');
+		const back = await handler({ type: 'getConfig' });
+		assert.strictEqual(back.underlineStyle, 'squiggly', 'switching back to squiggly is served live too');
 	});
 
 	// ---- live debounce apply (v1.0.1) ---------------------------------------
@@ -425,6 +474,35 @@ async function main() {
 			assert.strictEqual(c.platform, 'mobile', 'platform is mobile');
 		});
 
+		// v1.2.0: the underline style is a pure CSS-class choice, so unlike dictionaryPath it IS
+		// registered on mobile — with the same default and the same two options as on desktop.
+		await test("mobile: underlineStyle IS registered (default 'squiggly', both options) and getConfig carries it", async () => {
+			const def = mstate.registeredSettings.underlineStyle;
+			assert.ok(def, 'underlineStyle registered on the mobile run too');
+			assert.strictEqual(def.value, 'squiggly', "mobile default is 'squiggly'");
+			assert.strictEqual(def.public, true, 'public on mobile');
+			assert.strictEqual(def.isEnum, true, 'isEnum on mobile');
+			assert.deepStrictEqual(
+				Object.keys(def.options).sort(),
+				['solid', 'squiggly'],
+				'both options offered on mobile',
+			);
+			const c = await mh({ type: 'getConfig' });
+			assert.strictEqual(c.underlineStyle, 'squiggly', 'mobile getConfig carries underlineStyle');
+			assert.strictEqual(mobileFsCalls.length, 0, 'reading underlineStyle touched no filesystem');
+		});
+
+		await test('mobile: switching to solid is served live by getConfig (no note write, no fs)', async () => {
+			const putsBefore = mstate.notePuts.length;
+			await mstate.setSetting('underlineStyle', 'solid');
+			const c = await mh({ type: 'getConfig' });
+			assert.strictEqual(c.underlineStyle, 'solid', 'mobile getConfig serves the new style live');
+			// L3: a settings change must never trigger a note write while the editor is open.
+			assert.strictEqual(mstate.notePuts.length, putsBefore, 'an underlineStyle change writes NO note');
+			assert.strictEqual(mobileFsCalls.length, 0, 'still zero filesystem access on mobile');
+			await mstate.setSetting('underlineStyle', 'squiggly'); // restore for the later mobile tests
+		});
+
 		await test('mobile: externalDictionaryPath is NOT registered; dictionaryNoteId + pendingWords ARE', () => {
 			assert.ok(!mstate.registeredSettings.dictionaryPath, 'dictionaryPath absent on mobile');
 			assert.ok(mstate.registeredSettings.dictionaryNoteId, 'dictionaryNoteId present on mobile');
@@ -645,12 +723,12 @@ async function main() {
 	// The four version fields (package.json, src/manifest.json, and BOTH package-lock fields) must
 	// stay pinned together; a stale lockfile drifted them once in the sibling project. Bump all four
 	// on every release, or the harness (and thus the publish gate) fails.
-	await test('version: package.json, manifest, and both package-lock fields are all 1.1.1', () => {
+	await test('version: package.json, manifest, and both package-lock fields are all 1.2.0', () => {
 		const readJSON = (...rel) => JSON.parse(fs.readFileSync(path.join(REPO_ROOT, ...rel), 'utf8'));
 		const pkg = readJSON('package.json');
 		const manifest = readJSON('src', 'manifest.json');
 		const lock = readJSON('package-lock.json');
-		const expected = '1.1.1';
+		const expected = '1.2.0';
 		assert.strictEqual(pkg.version, expected, 'package.json version');
 		assert.strictEqual(manifest.version, expected, 'src/manifest.json version');
 		assert.strictEqual(lock.version, expected, 'package-lock.json top-level version');

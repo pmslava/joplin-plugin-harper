@@ -220,6 +220,61 @@ export async function underlineColorForWord(win: Page, word: string): Promise<st
     });
 }
 
+/** The computed underline paint of the lint mark underlining `word` (v1.2.0 underline-style spec). */
+export interface UnderlinePaint {
+  /** The `harper-squiggly-style` / `harper-web-style` class actually on the decoration, or null. */
+  styleClass: string | null;
+  /** Raw computed `background-image` — `none` when the squiggle data-URI is not painted. */
+  backgroundImage: string;
+  /** Raw computed `background-color` — the solid style's ~13% tint, or a transparent value. */
+  backgroundColor: string;
+  borderBottomWidth: string;
+  borderBottomStyle: string;
+  /** `border-bottom-color` normalised to an uppercase `#RRGGBB`, or null if not parseable. */
+  borderBottomColorHex: string | null;
+}
+
+/**
+ * Read the full computed underline paint for `word`.
+ *
+ * Companion to `underlineColorForWord` (which pulls the kind color out of the SQUIGGLE SVG's
+ * `stroke=`): under the solid style there is no SVG at all — the kind color lives in
+ * `border-bottom-color` — so this returns both channels plus the style class, letting a spec assert
+ * that exactly one of the two styles is painted.
+ */
+export async function underlinePaintForWord(win: Page, word: string): Promise<UnderlinePaint> {
+  return win
+    .locator('.cm-lintRange')
+    .filter({ hasText: word })
+    .first()
+    .evaluate((el) => {
+      const cs = getComputedStyle(el as HTMLElement);
+      const toHex = (color: string): string | null => {
+        const m = color.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+        if (!m) return null;
+        return (
+          '#' +
+          [m[1], m[2], m[3]]
+            .map((n) => Number(n).toString(16).padStart(2, '0'))
+            .join('')
+            .toUpperCase()
+        );
+      };
+      const styleClass =
+        Array.from((el as HTMLElement).classList).find(
+          (c) => c === 'harper-squiggly-style' || c === 'harper-web-style',
+        ) ?? null;
+      return {
+        styleClass,
+        backgroundImage: cs.backgroundImage,
+        backgroundColor: cs.backgroundColor,
+        borderBottomWidth: cs.borderBottomWidth,
+        borderBottomStyle: cs.borderBottomStyle,
+        borderBottomColorHex: toHex(cs.borderBottomColor),
+      };
+    });
+}
+
 /**
  * Screenshot an open Harper card to `filePath`. Uses a bounding-box-clipped PAGE screenshot (not an
  * element screenshot): the card is a hover tooltip with a `fade-in` opacity/scale animation, and an

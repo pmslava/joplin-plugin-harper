@@ -26,6 +26,9 @@ suggestion:
   lint kinds — Spelling, Grammar, Punctuation, Word Choice, Repetition, Redundancy, Style, and more
   (21 in all) — and each kind gets its own squiggle colour, so you can tell a misspelling from a
   style nudge at a glance. The colours are Harper's own and work in both light and dark themes.
+- **Solid or squiggly underlines — your choice.** Prefer a straight line to a wavy one? Switch
+  **Underline style** to *Solid line* for a clean 2 px underline with a light tint, in the same
+  per-kind colour. The change applies straight away, no restart or note reopen.
 - **A suggestion card.** Click an underline to open a card that shows the issue
   type, Harper's explanation with the flagged word highlighted, and the available fixes.
 - **Apply a fix in one click.** Each suggestion is a pill; clicking it rewrites the text (replace,
@@ -65,6 +68,7 @@ Open **Tools → Options → Harper** (desktop).
 | **Enable Harper grammar checking** | On | Master switch. When off, no underlines are shown. |
 | **English dialect** | American | Which English variety Harper checks against: American, British, Australian, or Canadian. |
 | **Lint debounce (ms)** | `500` | How long the editor waits after you stop typing before re-checking, in milliseconds (0–10000). Changes apply immediately. |
+| **Underline style** | Squiggly | How findings are underlined: *Squiggly (default)* for Harper's wavy underline, or *Solid line* for a straight 2 px line with a light tint. Either way the colour is the issue type's. Changes apply immediately. |
 | **External dictionary file** | *(empty)* | Absolute path to a plain-text dictionary (one word per line). Empty means the plugin uses its own private word list. See [External dictionary](#external-dictionary). |
 | **Rule overrides (JSON)** | *(empty)* | *Advanced.* A JSON object of `{"RuleName": true \| false}` applied on top of the defaults, e.g. `{"SpelledNumbers": false}`. Invalid JSON is ignored. |
 

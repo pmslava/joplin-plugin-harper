@@ -80,6 +80,8 @@ interface HarperConfig {
 	enabled: boolean;
 	dialect: string;
 	debounceMs: number;
+	/** 'squiggly' (Harper's default wavy SVG underline) | 'solid' (straight line + tint). */
+	underlineStyle: string;
 	dictionaryPath: string;
 	dictionaryNoteId: string;
 	ruleOverrides: string;
@@ -88,6 +90,7 @@ const cfg: HarperConfig = {
 	enabled: true,
 	dialect: 'American',
 	debounceMs: 500,
+	underlineStyle: 'squiggly',
 	dictionaryPath: '',
 	dictionaryNoteId: '',
 	ruleOverrides: '',
@@ -112,6 +115,8 @@ async function loadSettings(): Promise<void> {
 	cfg.enabled = await read('enabled', true);
 	cfg.dialect = await read('dialect', 'American');
 	cfg.debounceMs = await read('debounceMs', 500);
+	// Registered on BOTH platforms (pure CSS class choice in the content script — no fs, no note write).
+	cfg.underlineStyle = await read('underlineStyle', 'squiggly');
 	// dictionaryPath is registered on DESKTOP ONLY (its FilePath UX + fs read are desktop-only; see
 	// registerSettings). Reading an UNREGISTERED key throws 'Unknown key' in real Joplin, so on mobile we
 	// must never call value('dictionaryPath') — skip the read entirely and default to ''. (The old
@@ -771,9 +776,14 @@ async function handleMessage(message: IncomingMessage | unknown): Promise<unknow
 			editorOpen = true;
 			const enabled = await joplin.settings.value('enabled');
 			const debounceMs = await joplin.settings.value('debounceMs');
+			// Read live (not from `cfg`) exactly like the other two, so the value the content script
+			// gets after a `harper.forceLint` poke is always the just-saved one — this is what makes
+			// an underline-style change apply without reopening the note.
+			const underlineStyle = await joplin.settings.value('underlineStyle');
 			return {
 				enabled: enabled !== false,
 				debounceMs: typeof debounceMs === 'number' ? debounceMs : 500,
+				underlineStyle: underlineStyle === 'solid' ? 'solid' : 'squiggly',
 				// The content script sizes its tap targets off this (>=44 px on mobile).
 				platform: isMobile() ? 'mobile' : 'desktop',
 			};
@@ -841,6 +851,24 @@ async function registerSettings(): Promise<void> {
 			step: 50,
 			label: 'Lint debounce (ms)',
 			description: 'Idle delay after typing before re-linting. Changes apply immediately.',
+			storage: SettingStorage.File,
+		},
+		// BOTH platforms: this only selects which CSS class the content script puts on each lint
+		// decoration, so there is nothing desktop-specific about it (no fs, no note write — mobile-safe).
+		underlineStyle: {
+			value: 'squiggly',
+			type: SettingItemType.String,
+			public: true,
+			isEnum: true,
+			section: SECTION,
+			label: 'Underline style',
+			description:
+				'How findings are underlined: Harper\'s wavy squiggle, or a straight solid line with a ' +
+				'light tint. Changes apply immediately.',
+			options: {
+				squiggly: 'Squiggly (default)',
+				solid: 'Solid line',
+			},
 			storage: SettingStorage.File,
 		},
 		dictionaryNoteId: {

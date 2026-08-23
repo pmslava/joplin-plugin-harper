@@ -11,9 +11,11 @@
 // MECHANISM (Phase 2): we keep Joplin's stock `linter()` + `setDiagnostics` relint pipeline from
 // Phase 1 (forceLinting() is a no-op in Joplin — never rely on it) and layer the card on top of it:
 //   - per-kind underline: each Diagnostic carries `markClass = "harper-lintRange-<Kind>
-//     harper-squiggly-style"`. Joplin's bundled @codemirror/lint applies markClass to the range
-//     decoration (verified: the bundle builds `class:"cm-lintRange cm-lintRange-<sev> <markClass>"`),
-//     and our injected stylesheet paints the per-kind squiggle for that class.
+//     <harper-squiggly-style|harper-web-style>"`. Joplin's bundled @codemirror/lint applies markClass
+//     to the range decoration (verified: the bundle builds
+//     `class:"cm-lintRange cm-lintRange-<sev> <markClass>"`), and our injected stylesheet paints the
+//     per-kind underline for that class. WHICH of the two style classes is used comes from the
+//     `underlineStyle` setting via the getConfig handshake (v1.2.0) — see `underlineStyleClass`.
 //   - the card: each Diagnostic sets `renderMessage(view)` to a hand-built Harper card. The card is
 //     built by that same `renderMessage`/renderCard path on the CLICK trigger below.
 //   - CLICK is the ONLY trigger (v1.0.2): a `click` on a lint underline opens the card via our own
@@ -114,6 +116,22 @@ function ensureMobileStyles(): void {
 let isMobilePlatform = false;
 
 // -----------------------------------------------------------------------------
+// UNDERLINE STYLE (v1.2.0 — Harper issue #1710 "Prefer solid line to squiggly").
+// Both rule-sets are ALWAYS in the injected stylesheet (buildKindCss below); this mutable value only
+// decides which of the two classes each diagnostic's markClass carries, so switching styles is a pure
+// re-decoration on the next relint. Refreshed live from getConfig at activation and on every
+// `harper.forceLint` poke (which the plugin main process fires after any settings change).
+// -----------------------------------------------------------------------------
+const SQUIGGLY_STYLE_CLASS = 'harper-squiggly-style';
+const WEB_STYLE_CLASS = 'harper-web-style';
+let underlineStyleClass: string = SQUIGGLY_STYLE_CLASS;
+
+/** Map a getConfig `underlineStyle` value onto the decoration class. Unknown values => squiggly. */
+function applyUnderlineStyle(style: unknown): void {
+	underlineStyleClass = style === 'solid' ? WEB_STYLE_CLASS : SQUIGGLY_STYLE_CLASS;
+}
+
+// -----------------------------------------------------------------------------
 // Click-to-open card (v1.0.1; the ONLY trigger as of v1.0.2). A StateField holds at most one Tooltip
 // and feeds it to `showTooltip`; a `click` domEventHandler (see the `plugin()` body) hit-tests the
 // diagnostic ranges at the click position and dispatches `setClickCard` with a tooltip whose body is
@@ -194,12 +212,25 @@ function underline(color: string): string {
 
 const STYLE_ELEMENT_ID = 'harper-plugin-styles';
 
-/** Build the per-kind underline + code-chip rules from the color map (both underline styles). */
+/**
+ * Build the per-kind underline + code-chip rules from the color map (BOTH underline styles).
+ *
+ * Both rule-sets are always emitted; `underlineStyleClass` picks which one a given decoration opts
+ * into (see toDiagnostic). Selector specificity is 0,3,0 — above Joplin's bundled @codemirror/lint
+ * base theme (`.cm-lintRange-error` etc., 0,1,0), so ours wins for every declaration it makes.
+ */
 function buildKindCss(): string {
 	let css = '';
 	for (const [kind, color] of Object.entries(LINT_KIND_COLORS)) {
 		// Straight ("web") style: solid 2px border + ~13% alpha fill (hex 0x22). lint.ts:532-541.
-		css += `.cm-lintRange.harper-lintRange-${kind}.harper-web-style{border-bottom:2px solid ${color};background-color:${color}22;}\n`;
+		//
+		// `background-image:none` is OUR addition, not Harper's. Harper's Obsidian fork replaces the
+		// whole @codemirror/lint module, so nothing else paints a squiggle there. We ride on JOPLIN's
+		// BUNDLED @codemirror/lint, whose base theme sets an UNCONDITIONAL severity squiggle
+		// (`.cm-lintRange-error{background-image:underline("#f11")}`, dist/index.js:678-681). Without
+		// this reset that red/orange squiggle would still paint underneath the solid line, so "solid"
+		// would in fact be "solid + squiggle". Everything else is the spec's exact values.
+		css += `.cm-lintRange.harper-lintRange-${kind}.harper-web-style{border-bottom:2px solid ${color};background-color:${color}22;background-image:none;}\n`;
 		// Squiggly style (Harper/Obsidian default). lint.ts:543-552.
 		css += `.cm-lintRange.harper-lintRange-${kind}.harper-squiggly-style{background-image:${underline(
 			color,
@@ -603,7 +634,9 @@ function toDiagnostic(
 		source: 'Harper',
 		message: lint.message,
 		// Per-kind underline: Joplin's bundled @codemirror/lint applies markClass to the range mark.
-		markClass: `harper-lintRange-${lint.kind} harper-squiggly-style`,
+		// The style half is read at DIAGNOSTIC-BUILD time, so the next relint after a settings change
+		// repaints every range in the newly chosen style (v1.2.0).
+		markClass: `harper-lintRange-${lint.kind} ${underlineStyleClass}`,
 		// The whole Harper card. No stock `actions` — the card carries every affordance itself. This
 		// builder is invoked only by the CLICK path (buildClickTooltip); the hover tooltip that would
 		// otherwise also call it is suppressed via linter()'s tooltipFilter (v1.0.2).
@@ -735,9 +768,10 @@ export default (context: ContentScriptContext) => {
 			void (async () => {
 				try {
 					const config = (await context.postMessage({ type: 'getConfig' })) as
-						| { enabled: boolean; debounceMs: number; platform?: string }
+						| { enabled: boolean; debounceMs: number; underlineStyle?: string; platform?: string }
 						| null;
 					if (config && typeof config.debounceMs === 'number') currentDelay = config.debounceMs;
+					if (config) applyUnderlineStyle(config.underlineStyle);
 					if (config && config.platform === 'mobile') {
 						isMobilePlatform = true;
 						ensureMobileStyles();
@@ -771,20 +805,33 @@ export default (context: ContentScriptContext) => {
 				// We read `editorControl.editor` freshly on each invocation so a note switch (new view)
 				// is handled, and re-lint via `relint` (setDiagnostics) rather than the no-op
 				// `forceLinting`. `harper.forceLint` therefore genuinely refreshes the underlines AND
-				// re-reads debounceMs (via getConfig) so a debounce change applies live — no note reopen.
+				// re-reads debounceMs + underlineStyle (via getConfig), so both apply live — no reopen.
+				//
+				// ORDERING (v1.2.0): the relint now runs INSIDE the getConfig continuation. debounceMs
+				// only affects the NEXT typing burst, so the old code could fire it in parallel; the
+				// underline style is baked into each Diagnostic's markClass by `toDiagnostic`, so a
+				// relint that races ahead of the config reply would repaint in the OLD style and the
+				// user would see no change until they typed again. Awaiting the config first makes the
+				// poke itself the repaint. The rejection path still relints (with the current values),
+				// so a failed handshake can never leave the underlines stale.
 				try {
 					editorControl.registerCommand('harper.forceLint', () => {
+						const relintNow = (): void => {
+							const current = editorControl.editor;
+							if (current) relint(current);
+						};
 						void context.postMessage({ type: 'getConfig' }).then(
 							(config) => {
-								const c = config as { debounceMs?: number } | null;
+								const c = config as { debounceMs?: number; underlineStyle?: string } | null;
 								if (c && typeof c.debounceMs === 'number') currentDelay = c.debounceMs;
+								if (c) applyUnderlineStyle(c.underlineStyle);
+								relintNow();
 							},
 							() => {
-								/* keep the current delay */
+								/* handshake failed — keep the current delay/style, but still refresh */
+								relintNow();
 							},
 						);
-						const current = editorControl.editor;
-						if (current) relint(current);
 					});
 				} catch {
 					/* registerCommand unavailable — main's poke will simply no-op */
