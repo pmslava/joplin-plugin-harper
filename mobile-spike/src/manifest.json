@@ -7,9 +7,9 @@
 		"desktop",
 		"mobile"
 	],
-	"version": "0.0.5",
+	"version": "0.0.6",
 	"name": "Harper Mobile Spike",
-	"description": "Instrumented on-device spike measuring whether joplin.settings.setValue is safe during mobile editing. Engine-free (no WASM); the content script buffers its whole trail silently, then flushes it to a settings value at t=45s and t=90s (settings writes) and only at t=135s triggers the one known-lethal data.put note-write. If the editor survives both settings writes but dies at the note write, settings are proven safe for the mobile v1 design. Not for publication.",
+	"description": "Instrumented on-device spike. Engine-free (no WASM). Retains the v0.0.5 settings-vs-note write-eviction protocol (settings writes at t=45s/90s, one known-lethal note write at t=135s) and ADDS a v0.0.6 startup structural probe: whether the .wasm could ship as a SEPARATE .jpl file loaded at runtime from the plugin iframe (XMLHttpRequest and fetch of a file:// URL under installationDir(), plus IndexedDB availability), which would cut the 21 MB inlined bundle back to ~150 KB. Not for publication.",
 	"author": "pmslava",
 	"homepage_url": "https://github.com/pmslava/joplin-plugin-harper",
 	"repository_url": "https://github.com/pmslava/joplin-plugin-harper",

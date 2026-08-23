@@ -10,7 +10,7 @@ import {
 } from '../../e2e/helpers';
 
 /**
- * DESKTOP pre-flight gate for the Harper mobile spike v0.0.5 (NO-ENGINE, SETTINGS-PROBE build).
+ * DESKTOP pre-flight gate for the Harper mobile spike v0.0.6 (NO-ENGINE, SETTINGS-PROBE build).
  *
  * ESTABLISHED LAW (on device): a plugin BACKGROUND joplin.data.put note-write while the mobile editor is
  * open evicts the editor within seconds, via a LOCAL (sync-independent) mechanism. The whole editor stack
@@ -115,7 +115,7 @@ async function readResultsNoteBodyFull(win: Page): Promise<string> {
   });
 }
 
-test.describe('Harper mobile spike v0.0.5 (no-engine, SETTINGS PROBE) — desktop pre-flight', () => {
+test.describe('Harper mobile spike v0.0.6 (no-engine, SETTINGS PROBE) — desktop pre-flight', () => {
   let joplin: JoplinInstance;
 
   test.beforeAll(async () => {
@@ -156,13 +156,26 @@ test.describe('Harper mobile spike v0.0.5 (no-engine, SETTINGS PROBE) — deskto
     // Capture the probe body as evidence (this is what the report quotes verbatim).
     // eslint-disable-next-line no-console
     console.log(
-      `\n========== HARPER SPIKE v0.0.5 RESULTS NOTE (desktop, after SETTINGS PROBE READY) ==========\n${body}\n` +
+      `\n========== HARPER SPIKE v0.0.6 RESULTS NOTE (desktop, after SETTINGS PROBE READY) ==========\n${body}\n` +
         `============================================================================================\n`,
     );
 
     // Hard assertions: no-engine SETTINGS-PROBE build, correct header, no WASM/engine stages, no heartbeat.
-    expect(body).toMatch(/===== SPIKE RUN v0\.0\.5 \(SETTINGS PROBE\) /); // header carries the version + mode
+    expect(body).toMatch(/===== SPIKE RUN v0\.0\.6 \(SETTINGS PROBE\) /); // header carries the version + mode
     expect(body).toContain('S0 ENV');
+
+    // v0.0.6 STRUCTURAL PROBE lines must all appear (the on-device run reads its file:// XHR/fetch/IDB
+    // numbers off these same lines). We assert the lines are PRESENT and well-formed, not that any given
+    // mechanism succeeded — desktop and Android WebView differ, and that difference is the whole point.
+    expect(body, 'probe reports installationDir').toMatch(/S0 PROBE installationDir=/);
+    expect(body, 'probe (i): XMLHttpRequest of a file:// URL reported').toMatch(
+      /S0 XHR file:\/\/ (status=-?\d+ len=\d+|skipped)/,
+    );
+    expect(body, 'probe (ii): fetch of a file:// URL reported (ok/failed/skipped)').toMatch(
+      /S0 FETCH file:\/\/ (ok status=\d+ len=\d+|failed|skipped)/,
+    );
+    expect(body, 'probe (iii): IndexedDB availability reported').toMatch(/S0 IDB typeof indexedDB=/);
+
     expect(body).toContain('SETTINGS PROBE READY');
     expect(body).not.toContain('SPIKE COMPLETE');
     expect(body, 'no engine WASM stages must run in the no-engine build').not.toMatch(/\bS1 OK\b/);
@@ -264,7 +277,7 @@ test.describe('Harper mobile spike v0.0.5 (no-engine, SETTINGS PROBE) — deskto
       .join('\n');
     // eslint-disable-next-line no-console
     console.log(
-      `\n========== HARPER SPIKE v0.0.5 RESULTS NOTE — NOTE-FLUSH TRAIL (desktop) ==========\n${s5Lines}\n` +
+      `\n========== HARPER SPIKE v0.0.6 RESULTS NOTE — NOTE-FLUSH TRAIL (desktop) ==========\n${s5Lines}\n` +
         `===================================================================================\n`,
     );
 

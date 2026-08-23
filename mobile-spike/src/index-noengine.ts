@@ -1,4 +1,9 @@
-// Harper Mobile Spike v0.0.5 — NO-ENGINE + SETTINGS-PROBE background (plugin main process / mobile bg).
+// Harper Mobile Spike v0.0.6 — NO-ENGINE + SETTINGS-PROBE background (plugin main process / mobile bg).
+//
+// v0.0.6 ADDS a startup STRUCTURAL PROBE (see probeRuntimeFileAccess): can a future v1.2 ship the .wasm as
+// a SEPARATE file in the .jpl and read its bytes at runtime from the plugin iframe (XHR/fetch of a file://
+// URL under installationDir(), or an IndexedDB cache) — the win that would cut the 21 MB inlined bundle
+// back to ~150 KB. Reported at startup to the results note (desktop AND device). Everything below is v0.0.5.
 //
 // ESTABLISHED LAW (device: Android 10, Joplin mobile 3.7.2, proven through v0.0.4 + user controls): a
 // plugin BACKGROUND joplin.data.put NOTE-write while the mobile editor is open evicts the editor within
@@ -40,7 +45,7 @@ import { ContentScriptType, SettingItemType, SettingStorage } from 'api/types';
 const RESULTS_TITLE = 'Harper Mobile Spike Results';
 const SPIKE_FOLDER = 'Spike';
 const CONTENT_SCRIPT_ID = 'harperSpikeCm';
-const SPIKE_VERSION = '0.0.5';
+const SPIKE_VERSION = '0.0.6';
 // The internal (non-public) String setting the content script's flushes are staged into. The whole point
 // of v0.0.5 is that flush #1/#2 write HERE (settings) and only flush #3 writes to a note.
 const TRAIL_BUFFER_KEY = 'trailBuffer';
@@ -207,8 +212,83 @@ function recoverStrandedBuffer(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// The no-engine SETTINGS-PROBE startup: S0 env, then 'SETTINGS PROBE READY', written as ONE batched put
-// at startup (before any editor is open). NO WASM stage, NO 'SPIKE COMPLETE', NO main-side heartbeat.
+// v0.0.6 STRUCTURAL PROBE — can a future v1.2 ship the .wasm as a SEPARATE file in the .jpl and load its
+// bytes AT RUNTIME from the plugin iframe (cutting the 21 MB inlined bundle back to ~150 KB — the
+// structural parse win, since the WASM would no longer be base64-embedded and JS-parsed on every start)?
+// That needs a way to read a plugin-dir file's bytes from the background iframe. Probe three candidate
+// mechanisms at startup and report each verbatim to the results note (works on desktop AND on device):
+//   (i)   XMLHttpRequest of a file:// URL under installationDir()  — the leading candidate
+//   (ii)  fetch() of the same URL                                  — expected to FAIL on Android WebView
+//   (iii) typeof indexedDB                                         — fallback: ship bytes once, cache in IDB
+// Every primitive is guarded (each may be absent or throw on some runtime); we report the outcome, never
+// throw. Success is NOT required for the desktop e2e — it asserts the probe LINES appear, so the on-device
+// run's numbers can be read off the same note.
+// ---------------------------------------------------------------------------
+async function probeRuntimeFileAccess(out: string[]): Promise<void> {
+	let installDir = 'n/a';
+	let manifestUrl = '';
+	try {
+		installDir = await joplin.plugins.installationDir();
+		manifestUrl = `file://${installDir}/manifest.json`;
+	} catch (e) {
+		out.push(`S0 PROBE installationDir() threw: ${short((e as Error).message)}`);
+	}
+	out.push(`S0 PROBE installationDir=${installDir}`);
+
+	// (i) XMLHttpRequest of the file:// URL (responseType text). file:// XHR often reports status 0 with a
+	// populated responseText, so we report BOTH status and length — length>0 means the bytes were readable.
+	if (manifestUrl && typeof XMLHttpRequest !== 'undefined') {
+		const r = await new Promise<{ status: number; length: number; error?: string }>((resolve) => {
+			try {
+				const xhr = new XMLHttpRequest();
+				xhr.open('GET', manifestUrl, true);
+				try {
+					xhr.responseType = 'text';
+				} catch {
+					/* some engines reject setting responseType on a file:// request — ignore, read responseText */
+				}
+				xhr.onload = () => resolve({ status: xhr.status, length: (xhr.responseText || '').length });
+				xhr.onerror = () => resolve({ status: xhr.status, length: 0, error: 'onerror' });
+				xhr.send();
+			} catch (e) {
+				resolve({ status: -1, length: 0, error: short((e as Error).message) });
+			}
+		});
+		out.push(`S0 XHR file:// status=${r.status} len=${r.length}${r.error ? ` error=${r.error}` : ''}`);
+	} else {
+		out.push(
+			`S0 XHR file:// skipped (XMLHttpRequest=${typeof XMLHttpRequest}, url=${manifestUrl ? 'set' : 'unset'})`,
+		);
+	}
+
+	// (ii) fetch() of the same URL. On Android WebView file:// is not a fetchable scheme, so this is
+	// expected to throw/reject — we record that outcome so the note documents the failure mode explicitly.
+	if (manifestUrl && typeof fetch !== 'undefined') {
+		try {
+			const resp = await fetch(manifestUrl);
+			const text = await resp.text();
+			out.push(`S0 FETCH file:// ok status=${resp.status} len=${text.length}`);
+		} catch (e) {
+			out.push(`S0 FETCH file:// failed (expected on Android WebView): ${short((e as Error).message)}`);
+		}
+	} else {
+		out.push(`S0 FETCH file:// skipped (fetch=${typeof fetch}, url=${manifestUrl ? 'set' : 'unset'})`);
+	}
+
+	// (iii) IndexedDB availability — the fallback path (ship the bytes once, cache them in IDB thereafter).
+	let idb = 'n/a';
+	try {
+		idb = typeof indexedDB;
+	} catch (e) {
+		idb = `threw: ${short((e as Error).message)}`;
+	}
+	out.push(`S0 IDB typeof indexedDB=${idb}`);
+}
+
+// ---------------------------------------------------------------------------
+// The no-engine SETTINGS-PROBE startup: S0 env, the v0.0.6 structural probe, then 'SETTINGS PROBE READY',
+// written as ONE batched put at startup (before any editor is open). NO WASM stage, NO 'SPIKE COMPLETE',
+// NO main-side heartbeat.
 // ---------------------------------------------------------------------------
 async function runProbe(): Promise<void> {
 	await ensureResultsNote();
@@ -235,6 +315,13 @@ async function runProbe(): Promise<void> {
 		out.push(`S0 CAPS ${caps} | mem ${memSnapshot()}`);
 	} catch (error) {
 		out.push(`S0 FAIL: ${short((error as Error).message)} | ${short((error as Error).stack)}`);
+	}
+
+	// v0.0.6: the separate-.wasm runtime-load feasibility probe (XHR / fetch / IndexedDB).
+	try {
+		await probeRuntimeFileAccess(out);
+	} catch (error) {
+		out.push(`S0 PROBE FAIL: ${short((error as Error).message)} | ${short((error as Error).stack)}`);
 	}
 
 	// No engine, no heartbeat. Announce settings-probe readiness — the editor probe (S5, content script)

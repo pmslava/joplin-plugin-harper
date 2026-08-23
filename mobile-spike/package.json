@@ -1,6 +1,6 @@
 {
   "name": "joplin-plugin-harper-mobile-spike",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "private": true,
   "description": "Instrumented on-device spike for a Harper mobile (Android) Joplin port. Not for publication.",
   "scripts": {
