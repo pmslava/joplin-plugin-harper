@@ -216,17 +216,11 @@ const pluginConfig = { ...baseConfig, entry: './src/index.ts',
 						],
 					},
 				},
-				// HARPER: ship the WASM binary inside dist/ so it is tarred into the .jpl. The plugin
-				// main process reads these bytes at runtime (Node `fs` via __non_webpack_require__),
-				// base64-encodes them into a `data:` URL and hands that to createBinaryModuleFromUrl.
-				// We deliberately do NOT use a file:// URL: harper.js's file:// path does a native
-				// `import('fs')` that the Electron renderer's Blink module loader cannot resolve.
-				// (Deviation from the stock generator config; see docs/research/phase0-spike-*.md.)
-				{
-					from: 'harper_wasm_bg.wasm',
-					context: path.resolve(__dirname, 'node_modules/harper.js/dist'),
-					to: path.resolve(__dirname, 'dist'),
-				},
+				// HARPER v1.1.0: the WASM binary is NO LONGER shipped as a separate dist file. Both
+				// desktop and mobile now import `harper.js/slimBinaryInlined`, which embeds the WASM as a
+				// `data:application/wasm;base64,` module INSIDE index.js (no fs read on either platform —
+				// the mobile plugin iframe has no Node). So there is no CopyPlugin rule for the .wasm; the
+				// .jpl grows to ~21 MB from the inlined base64. (See src/index.ts buildLinter + L1.)
 			],
 		}),
 	] };

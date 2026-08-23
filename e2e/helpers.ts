@@ -265,6 +265,110 @@ export async function underlineKindForWord(win: Page, word: string): Promise<str
     });
 }
 
+/**
+ * Open Joplin's "Goto Anything" dialog (Ctrl+P) and return its text input. The dialog is the same
+ * component used for both note-jump and the command palette (verified against the 3.6 bundle: wrapper
+ * `.go-to-anything-dialog`, a single autofocused `input[type=text]`; typing `:` switches it to command
+ * search — the app's own help text says "type : to search for commands").
+ */
+/** Dismiss the Goto Anything dialog if it is open (Escape), and wait for it to detach. */
+async function closeGotoAnything(win: Page): Promise<void> {
+  const dialog = win.locator('.go-to-anything-dialog');
+  if (await dialog.count()) {
+    await win.keyboard.press('Escape');
+    await dialog.first().waitFor({ state: 'detached', timeout: 3000 }).catch(() => {
+      /* leave it; the next open() closes it anyway */
+    });
+  }
+}
+
+async function openGotoAnything(win: Page) {
+  await closeGotoAnything(win); // never reuse a stale/half-open dialog across helper calls
+  const input = win.locator('.go-to-anything-dialog input[type="text"]');
+  // Joplin's KeymapService suppresses app shortcuts while a text <input> (e.g. the note title field,
+  // focused right after "New note") holds focus. Move focus into the CodeMirror body first — Goto
+  // Anything is meant to work mid-edit, so the editor does not suppress it. Then press Ctrl+P. A `:`
+  // prefix on the query later switches the (note-mode) dialog to command search.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    if (await input.count()) return input.first();
+    // Only click into the editor when no modal is up, so we never fight the dialog overlay.
+    if ((await win.locator('.go-to-anything-dialog').count()) === 0) {
+      try {
+        await win.locator('.cm-content').first().click({ timeout: 2000 });
+      } catch {
+        /* editor not clickable this attempt */
+      }
+    }
+    await win.keyboard.press('Control+p');
+    try {
+      await input.waitFor({ state: 'visible', timeout: 3000 });
+      return input.first();
+    } catch {
+      /* not open yet — retry */
+    }
+  }
+  throw new Error('Goto Anything dialog did not open (Ctrl+P)');
+}
+
+/** Type `text` into Goto Anything, run the top result (Enter), and wait for the dialog to close. */
+async function submitGotoAnything(win: Page, text: string): Promise<void> {
+  const input = await openGotoAnything(win);
+  await input.fill(text);
+  await win.waitForTimeout(1200); // let the result list populate + rank
+  await win.keyboard.press('Enter');
+  await win
+    .locator('.go-to-anything-dialog')
+    .first()
+    .waitFor({ state: 'detached', timeout: 5000 })
+    .catch(() => closeGotoAnything(win));
+  await win.waitForTimeout(1000);
+}
+
+/**
+ * Run a Joplin command by fuzzy-matching its label in the command palette (Goto Anything, `:` mode).
+ * Used to invoke the plugin command `harper.createDictionaryNote` (label "Harper: Create dictionary
+ * note") the way a user would.
+ */
+export async function runCommand(win: Page, labelQuery: string): Promise<void> {
+  await submitGotoAnything(win, `:${labelQuery}`);
+}
+
+/**
+ * Jump to (open) a note by title via Goto Anything. Opening a different note fires
+ * `workspace.onNoteSelectionChange`, the plugin's deferred-flush trigger, so this doubles as "leave the
+ * current note so its buffered dictionary words flush".
+ */
+export async function gotoNote(win: Page, titleQuery: string): Promise<void> {
+  await submitGotoAnything(win, titleQuery);
+}
+
+/**
+ * Open a note by clicking its row in the note list (middle panel). More reliable than Goto Anything
+ * for a JUST-created note, whose title may not be in Joplin's async search index yet — the note list
+ * renders straight from the notebook's notes. Selecting a different note fires
+ * `workspace.onNoteSelectionChange` (the plugin's deferred-flush trigger).
+ */
+export async function openNoteFromList(win: Page, title: string): Promise<void> {
+  const item = win
+    .locator('.note-list-item-wrapper, .note-list-item')
+    .filter({ hasText: title })
+    .first();
+  await item.waitFor({ state: 'visible', timeout: 15_000 });
+  await item.click();
+  await win.waitForTimeout(1200);
+}
+
+/**
+ * Read a note's CURRENT saved body by opening it fresh: click away to `viaTitle`, then back to
+ * `title`, so the editor reloads the note from the database rather than showing a stale in-editor copy
+ * (a plugin `data.put` to an already-open note does not necessarily live-refresh the desktop editor).
+ */
+export async function readNoteBodyFresh(win: Page, title: string, viaTitle: string): Promise<string> {
+  await openNoteFromList(win, viaTitle);
+  await openNoteFromList(win, title);
+  return getEditorBody(win);
+}
+
 /** True if the plugin's hidden background page is running (its URL carries ?pluginId=<id>). */
 export function pluginBackgroundPageRunning(win: Page): boolean {
   const urls: string[] = [];

@@ -64,6 +64,56 @@ interface CodeMirrorControl {
 const DEFAULT_DELAY_MS = 500;
 
 // -----------------------------------------------------------------------------
+// L5 IDEMPOTENCY GUARD. Joplin mobile double-mounts content scripts (joplin#12891): the same editor's
+// `plugin()` gets called twice, which without a guard doubles the linter extension + click handler
+// (the v0.0.4 device symptom: two squiggles, two cards). We record activated editors in a registry
+// kept on `window` (SHARED across both content-script module evaluations in the same editor WebView —
+// a module-level set would NOT be, since a re-mount re-evaluates the module) keyed by the EditorView
+// instance, and make the second activation on the same editor a no-op.
+function alreadyActivated(view: unknown | undefined): boolean {
+	// Only dedupe when we have a concrete editor instance to key on. If the view is somehow absent we
+	// proceed (a false "already activated" would wrongly leave a real second editor with no linter).
+	if (!view || typeof view !== 'object') return false;
+	try {
+		const w = window as unknown as { __harperActivatedEditors?: WeakSet<object> };
+		if (!w.__harperActivatedEditors) w.__harperActivatedEditors = new WeakSet<object>();
+		const key = view as object;
+		if (w.__harperActivatedEditors.has(key)) return true;
+		w.__harperActivatedEditors.add(key);
+		return false;
+	} catch {
+		return false; // no window (non-browser harness) — activation proceeds
+	}
+}
+
+// Mobile tap-target CSS (Material ~48 dp / Apple HIG ~44 pt). Injected only when the platform handshake
+// reports 'mobile'; it bumps every card button to >=44 px min-height with roomier spacing so pills,
+// add-to-dictionary and dismiss are comfortable to tap (mobile-product-design.md §2). Desktop is
+// untouched — the class is never added there.
+const MOBILE_STYLE_ELEMENT_ID = 'harper-plugin-mobile-styles';
+const MOBILE_CSS = `
+.harper-container.harper-mobile{max-width:92vw;padding:12px;}
+.harper-container.harper-mobile .harper-btn{min-height:44px;padding:8px 14px;font-size:15px;}
+.harper-container.harper-mobile .harper-footer{gap:12px;padding:6px;}
+.harper-container.harper-mobile .harper-child-cont{gap:12px;}
+.harper-container.harper-mobile .harper-close-btn{min-width:44px;min-height:44px;font-size:24px;}
+.harper-container.harper-mobile .harper-disable-btn{min-width:44px;min-height:44px;}
+.harper-container.harper-mobile .harper-dict-btn{min-width:44px;min-height:44px;}
+`;
+function ensureMobileStyles(): void {
+	if (typeof document === 'undefined') return;
+	if (document.getElementById(MOBILE_STYLE_ELEMENT_ID)) return;
+	const style = document.createElement('style');
+	style.id = MOBILE_STYLE_ELEMENT_ID;
+	style.textContent = MOBILE_CSS;
+	(document.head || document.documentElement).appendChild(style);
+}
+
+// Platform reported by the plugin main process via the getConfig handshake; 'mobile' enlarges tap
+// targets. Set before the first card can open (the handshake runs at activation).
+let isMobilePlatform = false;
+
+// -----------------------------------------------------------------------------
 // Click-to-open card (v1.0.1; the ONLY trigger as of v1.0.2). A StateField holds at most one Tooltip
 // and feeds it to `showTooltip`; a `click` domEventHandler (see the `plugin()` body) hit-tests the
 // diagnostic ranges at the click position and dispatches `setClickCard` with a tooltip whose body is
@@ -387,6 +437,10 @@ function renderCard(
 	container.className = 'harper-container fade-in';
 	container.style.setProperty('--harper-kind-color', color);
 	if (isDarkEditor(view)) container.classList.add('harper-dark');
+	if (isMobilePlatform) {
+		ensureMobileStyles();
+		container.classList.add('harper-mobile');
+	}
 
 	// --- header: kind title (colored underline) + controls (disable-rule, close) ----------------
 	const header = document.createElement('div');
@@ -591,6 +645,10 @@ export default (context: ContentScriptContext) => {
 			// Only wire up on CodeMirror 6; the legacy CM5 emulation lacks `cm6`/addExtension.
 			if (!editorControl.cm6) return;
 
+			// L5: make a second activation on the SAME editor a no-op (mobile double-mounts content
+			// scripts — joplin#12891). Without this the linter extension + click handler double up.
+			if (alreadyActivated(editorControl.editor)) return;
+
 			// Query the plugin main process for lints of the current document and map them to
 			// @codemirror/lint diagnostics. Used both as the `linter()` source (debounced, on
 			// docChanged) and by `relint` (immediate, after a card action / main-process poke).
@@ -677,9 +735,13 @@ export default (context: ContentScriptContext) => {
 			void (async () => {
 				try {
 					const config = (await context.postMessage({ type: 'getConfig' })) as
-						| { enabled: boolean; debounceMs: number }
+						| { enabled: boolean; debounceMs: number; platform?: string }
 						| null;
 					if (config && typeof config.debounceMs === 'number') currentDelay = config.debounceMs;
+					if (config && config.platform === 'mobile') {
+						isMobilePlatform = true;
+						ensureMobileStyles();
+					}
 				} catch {
 					/* keep the default */
 				}

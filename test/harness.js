@@ -170,6 +170,11 @@ function makeJoplin(options) {
             onSyncStart: async (h) => { state.workspaceEvents.push('onSyncStart'); state.syncStartHandler = withTimerCapture(h) },
             onSyncComplete: async (h) => { state.workspaceEvents.push('onSyncComplete'); state.syncCompleteHandler = withTimerCapture(h) },
             onNoteAlarmTrigger: async (h) => { state.workspaceEvents.push('onNoteAlarmTrigger'); state.noteAlarmHandler = withTimerCapture(h) },
+            // HARPER v1.1.0: the deferred-flush trigger. A test invokes state.noteSelectionChangeHandler()
+            // to simulate the user leaving a note (which marks the editor closed and flushes pending words).
+            onNoteSelectionChange: async (h) => { state.workspaceEvents.push('onNoteSelectionChange'); state.noteSelectionChangeHandler = h },
+            selectedFolder: async () => options.selectedFolder || null,
+            selectedNote: async () => options.selectedNote || null,
         },
         data: {
             get: async (pathParts, query) => {

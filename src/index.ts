@@ -2,15 +2,28 @@ import joplin from 'api';
 import { ContentScriptType, SettingItemType, SettingStorage } from 'api/types';
 import {
 	LocalLinter,
-	createBinaryModuleFromUrl,
 	Dialect,
 	Lint,
 	LintConfig,
 	SuggestionKind,
 } from 'harper.js';
+// UNIFIED WASM LOADER (v1.1.0): both desktop and mobile now use the SAME inlined-binary path. The WASM
+// is base64-embedded in this bundle (harper.js/slimBinaryInlined ships a `data:application/wasm;base64,`
+// module), so there is NO filesystem read and NO separate dist .wasm to ship. This replaces desktop's
+// old fs-read + createBinaryModuleFromUrl(data:) loader — it is the identical runtime path minus the fs
+// read, which is exactly why it works unchanged inside the mobile plugin iframe (no Node there). The
+// .jpl grows to ~21 MB. Device-proven in mobile-spike/ (init ~1.5 s, lint ~37 ms). See L1/L2 + verdict.
+import { slimBinaryInlined } from 'harper.js/slimBinaryInlined';
+import { resolvePlatform, isMobile } from './platform';
 
 const CONTENT_SCRIPT_ID = 'harperCm';
 const SECTION = 'harper';
+const DICTIONARY_NOTE_TITLE = 'Harper Dictionary';
+// Canonical dictionary-note header. Lines starting with '# ' (hash + space) are comments and are
+// skipped on parse; every other non-blank line is one word. Written verbatim as the first body line.
+const DICTIONARY_NOTE_HEADER =
+	'# Harper Dictionary — one word per line. Lines starting with "# " are comments. ' +
+	'Managed by the Harper Joplin plugin; edits here sync to every device.';
 
 /**
  * The plain-JSON shape sent back to the content script. WASM `Lint`/`Suggestion`
@@ -56,7 +69,8 @@ type IncomingMessage =
 
 // webpack rewrites bare `require(...)` inside the bundle; __non_webpack_require__ emits a raw
 // runtime `require` resolved by Node/Electron instead. The plugin main process runs with Node
-// integration, so this gives us the real `fs`/`os`/`path` on desktop.
+// integration ON DESKTOP ONLY, so this gives us the real `fs`/`os`/`path` there. NEVER called on
+// mobile (every use is behind an isMobile() guard) — the mobile iframe has no Node and it throws.
 declare const __non_webpack_require__: (id: string) => any;
 
 // -----------------------------------------------------------------------------
@@ -67,6 +81,7 @@ interface HarperConfig {
 	dialect: string;
 	debounceMs: number;
 	dictionaryPath: string;
+	dictionaryNoteId: string;
 	ruleOverrides: string;
 }
 const cfg: HarperConfig = {
@@ -74,6 +89,7 @@ const cfg: HarperConfig = {
 	dialect: 'American',
 	debounceMs: 500,
 	dictionaryPath: '',
+	dictionaryNoteId: '',
 	ruleOverrides: '',
 };
 
@@ -96,15 +112,34 @@ async function loadSettings(): Promise<void> {
 	cfg.enabled = await read('enabled', true);
 	cfg.dialect = await read('dialect', 'American');
 	cfg.debounceMs = await read('debounceMs', 500);
+	// externalDictionaryPath is registered on desktop only; value() returns undefined on mobile -> ''.
 	cfg.dictionaryPath = await read('dictionaryPath', '');
+	cfg.dictionaryNoteId = await read('dictionaryNoteId', '');
 	cfg.ruleOverrides = await read('ruleOverrides', '');
 }
 
+// =============================================================================
+// EDITOR-OPEN TRACKING (the L3 flush guard).
+// =============================================================================
+// L3: a plugin `joplin.data.put` note-write while ANY editor is open EVICTS the mobile editor. So the
+// dictionary-note write (the ONLY note-write this plugin ever does) must never land during an active
+// editing session. We track `editorOpen`:
+//   - set TRUE by the content script's `getConfig` handshake — a CM6 content script only loads when a
+//     markdown editor is mounted, so a handshake means "an editor is now open".
+//   - set FALSE by `workspace.onNoteSelectionChange` — the previously-open editor is being torn down /
+//     navigated away; the newly-selected note (if any) has no in-progress edits yet.
+// The note-write flush issues its data.put ONLY when `editorOpen === false`. Selection-change sets the
+// flag false and THEN flushes, so words persist to the note the instant the user leaves a note; start
+// flushes before any editor mounts. A flush requested while an editor is open (e.g. the dictionaryNoteId
+// setting changed mid-edit) is deferred to the next selection-change. This makes it structurally
+// impossible for our note-write to reload an active editing session — the mobile eviction (L3) can't
+// fire, and desktop's open editor is likewise never disturbed (documented by the eviction-safety E2E).
+let editorOpen = false;
+
 // -----------------------------------------------------------------------------
-// Filesystem helpers. Dictionary/ignore-state IO goes through the sanctioned
-// `joplin.require('fs-extra')` bridge (works in the plugin main process, and is
-// stubbable by the harness). Home-dir/path helpers use the raw Node modules
-// (desktop-only, same constraint as the WASM loader).
+// Filesystem helpers (DESKTOP ONLY). Every function here is called behind an isMobile() guard; on
+// mobile the plugin iframe has no Node, so touching these would throw. The harness fs stub FAILS the
+// mobile run if any of them is reached, proving the guards hold.
 // -----------------------------------------------------------------------------
 function getFs(): any {
 	return joplin.require('fs-extra');
@@ -145,15 +180,30 @@ function parseWords(content: string): string[] {
 	return content
 		.split('\n')
 		.map((line) => line.replace(/\r$/, '').trim())
-		.filter((line) => line.length > 0);
+		// Skip blank lines and '# ' comment lines (the dictionary-note header format).
+		.filter((line) => line.length > 0 && !line.startsWith('# '));
+}
+
+/** Canonical dictionary body: header, blank line, then the words deduped + deterministically sorted. */
+function canonicalDictionaryBody(words: Iterable<string>): string {
+	const set = new Set<string>();
+	for (const w of words) {
+		const t = (w || '').trim();
+		if (t) set.add(t);
+	}
+	// Code-unit sort (not locale-aware) so two devices produce byte-identical bodies from the same set
+	// — the design's ping-pong / conflict mitigation (mobile-product-design.md §1b).
+	const sorted = [...set].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+	return `${DICTIONARY_NOTE_HEADER}\n\n${sorted.join('\n')}\n`;
 }
 
 // Last-seen mtime of the external dictionary; the 60s poll compares against it and
-// only re-reads when it changes (so an unchanged file costs ZERO reads).
+// only re-reads when it changes (so an unchanged file costs ZERO reads). Desktop only.
 let lastExternalMtimeMs: number | null = null;
 let warnedMissingDict = false;
 
 function readExternalWords(): string[] {
+	if (isMobile()) return [];
 	const p = expandTilde(cfg.dictionaryPath);
 	if (!p) return [];
 	const fs = getFs();
@@ -173,10 +223,12 @@ function readExternalWords(): string[] {
 	}
 }
 
+let cachedLocalWordsPath = '';
+
 function readLocalWords(): string[] {
+	if (isMobile()) return [];
 	const fs = getFs();
 	try {
-		// localWordsPath is async; read it eagerly via a cached value set in applyConfiguration.
 		if (!cachedLocalWordsPath) return [];
 		const content = fs.readFileSync(cachedLocalWordsPath, 'utf8');
 		return parseWords(content);
@@ -185,12 +237,65 @@ function readLocalWords(): string[] {
 	}
 }
 
-let cachedLocalWordsPath = '';
+// =============================================================================
+// DICTIONARY NOTE (both platforms) — the synced source of truth for the word list.
+// =============================================================================
+// Words come from up to three sources merged into the linter's in-memory set:
+//   1. external FILE   — desktop only (unchanged), read via fs.
+//   2. dictionary NOTE — both platforms (new), read via joplin.data (READS are always safe, L3).
+//   3. pendingWords    — both platforms (new), a settings buffer of add-to-dictionary words not yet
+//                        flushed to the note (settings writes are safe mid-edit, L4).
+let lastNoteUpdatedTime: number | null = null;
+// Words we know are already in the dictionary note body (parsed on the last read). Used by the desktop
+// mirror to compute "new note words" without re-reading, and to avoid redundant note writes.
+let knownNoteWords = new Set<string>();
 
-function collectDictionaryWords(): string[] {
+/** Read the dictionary note body's words (both platforms). Empty when unset/unreadable. */
+async function readDictionaryNoteWords(): Promise<string[]> {
+	if (!cfg.dictionaryNoteId) return [];
+	try {
+		const note = await joplin.data.get(['notes', cfg.dictionaryNoteId], {
+			fields: ['body', 'updated_time'],
+		});
+		const body: string = (note && note.body) || '';
+		lastNoteUpdatedTime = (note && note.updated_time) || null;
+		const words = parseWords(body);
+		knownNoteWords = new Set(words);
+		return words;
+	} catch {
+		// Note deleted or not yet synced — treat as empty; the id stays set so it recovers on sync.
+		return [];
+	}
+}
+
+/** The pendingWords settings buffer (words added but not yet flushed to the note). Both platforms. */
+async function readPendingWords(): Promise<string[]> {
+	try {
+		const v = await joplin.settings.value('pendingWords');
+		if (Array.isArray(v)) return v.filter((w) => typeof w === 'string' && w.trim().length > 0);
+	} catch {
+		/* unreadable — treat as empty */
+	}
+	return [];
+}
+
+async function addPendingWord(word: string): Promise<void> {
+	const current = await readPendingWords();
+	if (current.includes(word)) return;
+	current.push(word);
+	// L4: settings writes are safe mid-edit on mobile (device-proven). This never touches a note.
+	await joplin.settings.setValue('pendingWords', current);
+}
+
+// -----------------------------------------------------------------------------
+// The merged in-memory word set that feeds importWords().
+// -----------------------------------------------------------------------------
+async function collectDictionaryWords(): Promise<string[]> {
 	const words = new Set<string>();
-	for (const w of readExternalWords()) words.add(w);
-	for (const w of readLocalWords()) words.add(w);
+	for (const w of readExternalWords()) words.add(w); // desktop file
+	for (const w of readLocalWords()) words.add(w); // desktop plugin-local list
+	for (const w of await readDictionaryNoteWords()) words.add(w); // dictionary note (both)
+	for (const w of await readPendingWords()) words.add(w); // settings buffer (both)
 	return [...words];
 }
 
@@ -217,49 +322,73 @@ function parseRuleOverrides(): LintConfig {
 }
 
 // -----------------------------------------------------------------------------
+// Ignored-lint persistence. Desktop: a JSON file in dataDir (unchanged). Mobile: a private settings
+// value (no fs; L4-safe). harper filters ignored lints internally on every subsequent lint.
+// -----------------------------------------------------------------------------
+async function loadIgnoredLintsJson(): Promise<string> {
+	if (isMobile()) {
+		try {
+			const v = await joplin.settings.value('ignoredLints');
+			return typeof v === 'string' ? v : '';
+		} catch {
+			return '';
+		}
+	}
+	try {
+		return getFs().readFileSync(await ignoredLintsPath(), 'utf8');
+	} catch {
+		return '';
+	}
+}
+
+async function saveIgnoredLintsJson(json: string): Promise<void> {
+	if (isMobile()) {
+		await joplin.settings.setValue('ignoredLints', json);
+		return;
+	}
+	try {
+		getFs().writeFileSync(await ignoredLintsPath(), json, 'utf8');
+	} catch {
+		// eslint-disable-next-line no-console
+		console.warn('[harper] could not persist ignored lints');
+	}
+}
+
+// -----------------------------------------------------------------------------
 // Linter lifecycle.
 // -----------------------------------------------------------------------------
 let linterPromise: Promise<LocalLinter> | null = null;
 
 async function buildLinter(): Promise<LocalLinter> {
-	// We ship the .wasm inside dist/ (webpack CopyPlugin). We do NOT hand harper.js a file://
-	// URL: its file:// code path does a native `import('fs')`, which the Electron editor/plugin
-	// renderer's Blink module loader cannot resolve. Instead we read the bytes ourselves via
-	// Node's `require('fs')` and hand harper a data: URL, which `fetch()` supports in both Node
-	// (undici) and the Electron renderer. See docs/research/phase0-spike-*.md.
-	const installDir = await joplin.plugins.installationDir();
-	const sep = installDir.endsWith('/') ? '' : '/';
-	const wasmPath = `${installDir}${sep}harper_wasm_bg.wasm`;
-	const fs = __non_webpack_require__('fs');
-	const bytes: Buffer = fs.readFileSync(wasmPath);
-	const dataUrl = `data:application/wasm;base64,${bytes.toString('base64')}`;
-	const binary = createBinaryModuleFromUrl(dataUrl, 'full');
-	const linter = new LocalLinter({ binary, dialect: dialectEnum() });
+	// Unified inlined-binary loader (see the top-of-file import note). Identical on desktop and mobile:
+	// no fs read, no data-URL construction, no separate .wasm — the binary rides inside the bundle.
+	const linter = new LocalLinter({ binary: slimBinaryInlined, dialect: dialectEnum() });
 	await linter.setup();
 	return linter;
 }
 
 /** (Re)apply dictionary words, rule overrides and ignored lints to a linter instance. */
 async function applyConfiguration(linter: LocalLinter): Promise<void> {
-	cachedLocalWordsPath = await localWordsPath();
+	if (!isMobile()) cachedLocalWordsPath = await localWordsPath();
 
-	// Dictionary: clear-then-import handles deletions from the synced file.
+	// Dictionary: clear-then-import handles deletions from the synced sources.
 	await linter.clearWords();
-	const words = collectDictionaryWords();
+	const words = await collectDictionaryWords();
 	if (words.length) await linter.importWords(words);
 
 	// Rule overrides on top of defaults.
 	await linter.setLintConfig(parseRuleOverrides());
 
-	// Ignored lints (persisted between sessions in dataDir). harper filters these internally on
-	// every subsequent lint once imported, so no host-side filtering is needed.
+	// Ignored lints (persisted between sessions). harper filters these internally on every subsequent
+	// lint once imported, so no host-side filtering is needed.
 	await linter.clearIgnoredLints();
-	try {
-		const fs = getFs();
-		const ignored = fs.readFileSync(await ignoredLintsPath(), 'utf8');
-		if (ignored && ignored.trim()) await linter.importIgnoredLints(ignored);
-	} catch {
-		/* no persisted ignore-state yet */
+	const ignored = await loadIgnoredLintsJson();
+	if (ignored && ignored.trim()) {
+		try {
+			await linter.importIgnoredLints(ignored);
+		} catch {
+			/* corrupt persisted ignore-state — skip */
+		}
 	}
 }
 
@@ -282,6 +411,100 @@ async function pokeForceLint(): Promise<void> {
 		await joplin.commands.execute('editor.execCommand', { name: 'harper.forceLint' });
 	} catch {
 		// No editor open (or the command is not registered yet) is fine.
+	}
+}
+
+// =============================================================================
+// DEFERRED NOTE FLUSH + DESKTOP NOTE<->FILE MIRROR (L3-compliant write discipline).
+// =============================================================================
+// The ONLY note-write path. It runs `read note -> merge (note words + pendingWords + desktop file
+// words) -> dedupe -> sort -> write canonical body` and clears the flushed pendingWords, but ONLY when
+// `editorOpen === false`. Writing the note is skipped entirely (no data.put) when an editor is open or
+// when there is nothing new to persist — so on mobile a data.put can never race an active edit (L3),
+// and repeated triggers converge without churn.
+let flushInFlight = false;
+
+async function flushDictionaryNote(reason: string): Promise<void> {
+	if (!cfg.dictionaryNoteId) return; // no note configured yet
+	if (editorOpen) return; // L3 guard: never write a note while an editor is open
+	if (flushInFlight) return; // serialize; a concurrent trigger will re-run if needed
+	flushInFlight = true;
+	try {
+		const noteWords = await readDictionaryNoteWords(); // also refreshes knownNoteWords + updated_time
+		const pending = await readPendingWords();
+		const fileWords = readExternalWords(); // desktop-only mirror source (mobile returns [])
+
+		const union = new Set<string>(noteWords);
+		let changed = false;
+		for (const w of pending) if (!union.has(w)) { union.add(w); changed = true; }
+		for (const w of fileWords) if (!union.has(w)) { union.add(w); changed = true; }
+
+		// Only write when the note is actually missing words — this is what makes the mirror converge
+		// (once the note holds the union, `changed` stays false and no data.put fires: no ping-pong).
+		if (changed) {
+			const body = canonicalDictionaryBody(union);
+			await joplin.data.put(['notes', cfg.dictionaryNoteId], null, { body });
+			knownNoteWords = new Set(union);
+			try {
+				const after = await joplin.data.get(['notes', cfg.dictionaryNoteId], {
+					fields: ['updated_time'],
+				});
+				lastNoteUpdatedTime = (after && after.updated_time) || lastNoteUpdatedTime;
+			} catch {
+				/* best-effort mtime refresh */
+			}
+		}
+
+		// The pending buffer has now been folded into the note (or was already present) — clear it so
+		// it isn't re-flushed forever. Settings write is L4-safe.
+		if (pending.length) await joplin.settings.setValue('pendingWords', []);
+
+		// DESKTOP MIRROR (note -> file): append any note/pending words the file is missing. File writes
+		// are always safe (they never route through Joplin's note-reload dispatch). Dedupe against the
+		// file's current words so repeated polls don't re-append (convergence, no ping-pong).
+		if (!isMobile() && cfg.dictionaryNoteId && expandTilde(cfg.dictionaryPath)) {
+			mirrorUnionToFile(union);
+		}
+	} catch (error) {
+		// eslint-disable-next-line no-console
+		console.warn(`[harper] dictionary-note flush (${reason}) failed:`, error);
+	} finally {
+		flushInFlight = false;
+	}
+}
+
+/** DESKTOP: append to the external file any words in `union` it does not already contain. */
+function mirrorUnionToFile(union: Set<string>): void {
+	if (isMobile()) return;
+	const p = expandTilde(cfg.dictionaryPath);
+	if (!p) return;
+	const fs = getFs();
+	let existing: Set<string>;
+	try {
+		existing = new Set(parseWords(fs.readFileSync(p, 'utf8')));
+	} catch {
+		existing = new Set();
+	}
+	const missing = [...union].filter((w) => !existing.has(w));
+	if (!missing.length) return;
+	try {
+		// Append-only keeps the user's own file ordering/comments intact; the note is the canonical form.
+		let prefix = '';
+		try {
+			const cur = fs.readFileSync(p, 'utf8');
+			prefix = cur.length && !cur.endsWith('\n') ? '\n' : '';
+		} catch {
+			prefix = '';
+		}
+		fs.appendFileSync(p, `${prefix}${missing.join('\n')}\n`);
+		try {
+			lastExternalMtimeMs = fs.statSync(p).mtimeMs;
+		} catch {
+			/* ignore */
+		}
+	} catch {
+		// eslint-disable-next-line no-console
+		console.warn(`[harper] could not mirror words to external dictionary file: ${p}`);
 	}
 }
 
@@ -337,31 +560,43 @@ async function lintText(text: string): Promise<PlainLint[]> {
 async function addWord(rawWord: string): Promise<void> {
 	const word = (rawWord || '').trim();
 	if (!word) return;
-	const fs = getFs();
-	const external = expandTilde(cfg.dictionaryPath);
-	if (external) {
-		try {
-			fs.appendFileSync(external, `${word}\n`);
-			// Record our own write so the poll doesn't treat it as an external change.
-			try {
-				lastExternalMtimeMs = fs.statSync(external).mtimeMs;
-			} catch {
-				/* ignore */
-			}
-		} catch {
-			// eslint-disable-next-line no-console
-			console.warn(`[harper] could not append to external dictionary: ${external}`);
-		}
-	} else {
-		try {
-			fs.appendFileSync(await localWordsPath(), `${word}\n`);
-		} catch {
-			// eslint-disable-next-line no-console
-			console.warn('[harper] could not write plugin-local userWords.txt');
-		}
-	}
+
+	// 1) Immediate UX (both platforms): into the in-memory set now, so the underline clears at once.
 	const linter = await getLinter();
 	await linter.importWords([word]);
+
+	// 2) Settings buffer (both platforms): the deferred flush folds this into the dictionary note when
+	//    no editor is open (L4-safe settings write; never a note write here).
+	await addPendingWord(word);
+
+	// 3) Desktop keeps its existing external-file / plugin-local append (unchanged, always safe).
+	if (!isMobile()) {
+		const fs = getFs();
+		const external = expandTilde(cfg.dictionaryPath);
+		if (external) {
+			try {
+				fs.appendFileSync(external, `${word}\n`);
+				try {
+					lastExternalMtimeMs = fs.statSync(external).mtimeMs;
+				} catch {
+					/* ignore */
+				}
+			} catch {
+				// eslint-disable-next-line no-console
+				console.warn(`[harper] could not append to external dictionary: ${external}`);
+			}
+		} else if (!cfg.dictionaryNoteId) {
+			// No external file AND no dictionary note: fall back to the plugin-local list so the word
+			// still persists across desktop sessions.
+			try {
+				fs.appendFileSync(await localWordsPath(), `${word}\n`);
+			} catch {
+				// eslint-disable-next-line no-console
+				console.warn('[harper] could not write plugin-local userWords.txt');
+			}
+		}
+	}
+
 	await pokeForceLint();
 }
 
@@ -373,14 +608,9 @@ async function ignoreFinding(
 ): Promise<void> {
 	const linter = await getLinter();
 	// harper stores an ignored lint by a context hash and filters it out of every SUBSEQUENT lint
-	// itself — so we do not filter host-side. BUT: harper de-duplicates overlapping findings and
-	// surfaces them one at a time (e.g. once the "The" typo lint on "teh" is ignored, a SpellCheck
-	// lint on the exact same span appears). Ignoring the single clicked finding would therefore
-	// leave the underline in place, just from a different rule. To make "Ignore" actually clear the
-	// span the user pointed at, we ignore every finding on that exact span, re-linting after each
-	// until the span is clear (bounded so a pathological doc can't spin forever). Tradeoff: two
-	// genuinely distinct findings that share an identical span get ignored together — acceptable and
-	// matches user intent ("make this underline go away").
+	// itself. It surfaces overlapping findings one at a time, so to make "Ignore" actually clear the
+	// span the user pointed at we ignore every finding on that exact span, re-linting after each until
+	// the span is clear (bounded so a pathological doc can't spin forever).
 	const matchSpan = (lint: Lint) => {
 		const s = lint.span();
 		return s.start === start && s.end === end;
@@ -388,7 +618,6 @@ async function ignoreFinding(
 	let ignoredAny = false;
 	for (let i = 0; i < 20; i++) {
 		const organized = await linter.organizedLints(text, { language: 'markdown' });
-		// Prefer the rule the user actually clicked, then any other rule on the same span.
 		let target: Lint | undefined = (organized[ruleName] || []).find(matchSpan);
 		if (!target) {
 			for (const lints of Object.values(organized)) {
@@ -406,7 +635,7 @@ async function ignoreFinding(
 	if (ignoredAny) {
 		try {
 			const json = await linter.exportIgnoredLints();
-			getFs().writeFileSync(await ignoredLintsPath(), json, 'utf8');
+			await saveIgnoredLintsJson(json);
 		} catch {
 			// eslint-disable-next-line no-console
 			console.warn('[harper] could not persist ignored lints');
@@ -428,26 +657,103 @@ async function disableRule(ruleName: string): Promise<void> {
 }
 
 // -----------------------------------------------------------------------------
-// Dictionary polling (60s): stat mtime; re-import only when it changed.
+// Create-dictionary-note command (both platforms).
+// -----------------------------------------------------------------------------
+async function createDictionaryNote(): Promise<void> {
+	// Reuse an existing configured note if it is still readable, so the command is idempotent.
+	if (cfg.dictionaryNoteId) {
+		try {
+			await joplin.data.get(['notes', cfg.dictionaryNoteId], { fields: ['id'] });
+			return; // already have a live dictionary note
+		} catch {
+			/* stale id — fall through and create a fresh one */
+		}
+	}
+	// Place it in the currently selected folder if we can, else the first folder, else create one.
+	let folderId = '';
+	try {
+		const selected = await joplin.workspace.selectedFolder();
+		if (selected && selected.id) folderId = selected.id;
+	} catch {
+		/* no selected folder */
+	}
+	if (!folderId) {
+		try {
+			const folders = await joplin.data.get(['folders']);
+			const items: Array<{ id: string }> = (folders && folders.items) || [];
+			if (items.length) folderId = items[0].id;
+		} catch {
+			/* ignore */
+		}
+	}
+	if (!folderId) {
+		const folder = await joplin.data.post(['folders'], null, { title: 'Harper' });
+		folderId = folder.id;
+	}
+	// Seed with any words already known to the linter session (pending buffer) so nothing is lost.
+	const seed = await readPendingWords();
+	const body = canonicalDictionaryBody(seed);
+	const note = await joplin.data.post(['notes'], null, {
+		title: DICTIONARY_NOTE_TITLE,
+		body,
+		parent_id: folderId,
+	});
+	// Persist the id (settings write — safe). onChange reacts: re-reads the note + flush.
+	await joplin.settings.setValue('dictionaryNoteId', note.id);
+}
+
+// -----------------------------------------------------------------------------
+// Dictionary polling (60s): desktop file mtime + dictionary-note updated_time.
 // -----------------------------------------------------------------------------
 function pollDictionaryTick(): void {
-	const p = expandTilde(cfg.dictionaryPath);
-	if (!p) return;
-	let st: any;
-	try {
-		st = getFs().statSync(p);
-	} catch {
-		// Still missing — keep polling; it may appear later (first rclone sync).
-		return;
+	// FILE poll (desktop only): stat mtime; re-import only when it changed.
+	if (!isMobile()) {
+		const p = expandTilde(cfg.dictionaryPath);
+		if (p) {
+			let st: any;
+			try {
+				st = getFs().statSync(p);
+			} catch {
+				st = null;
+			}
+			if (st && (lastExternalMtimeMs === null || st.mtimeMs !== lastExternalMtimeMs)) {
+				void (async () => {
+					if (!linterPromise) return;
+					const linter = await linterPromise;
+					await applyConfiguration(linter);
+					await pokeForceLint();
+					// MIRROR (file -> note): fold new file words into the note, deferred per L3 discipline
+					// (only when no editor is open). flushDictionaryNote handles the editorOpen guard.
+					await flushDictionaryNote('file-poll');
+				})();
+			}
+		}
 	}
-	if (lastExternalMtimeMs !== null && st.mtimeMs === lastExternalMtimeMs) return; // ZERO reads
-	// Changed (or first observation): re-import and force a re-lint.
-	void (async () => {
-		if (!linterPromise) return;
-		const linter = await linterPromise;
-		await applyConfiguration(linter);
-		await pokeForceLint();
-	})();
+
+	// NOTE poll (both platforms): re-read on updated_time change (READS are always safe, L3).
+	if (cfg.dictionaryNoteId) {
+		void (async () => {
+			let changed = false;
+			try {
+				const note = await joplin.data.get(['notes', cfg.dictionaryNoteId], {
+					fields: ['updated_time'],
+				});
+				const ut = (note && note.updated_time) || null;
+				changed = lastNoteUpdatedTime === null || ut !== lastNoteUpdatedTime;
+			} catch {
+				return; // note unreadable this tick
+			}
+			if (!changed) return; // ZERO extra work when the note is unchanged
+			if (!linterPromise) return;
+			const linter = await linterPromise;
+			await applyConfiguration(linter); // re-reads note words into the linter
+			await pokeForceLint();
+			// MIRROR (note -> file): append new note words to the desktop file (file writes always safe).
+			if (!isMobile() && expandTilde(cfg.dictionaryPath)) {
+				mirrorUnionToFile(new Set(await collectDictionaryWords()));
+			}
+		})();
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -458,11 +764,15 @@ async function handleMessage(message: IncomingMessage | unknown): Promise<unknow
 	const msg = message as IncomingMessage;
 	switch (msg.type) {
 		case 'getConfig': {
+			// A content-script handshake means an editor is open (L3 tracking).
+			editorOpen = true;
 			const enabled = await joplin.settings.value('enabled');
 			const debounceMs = await joplin.settings.value('debounceMs');
 			return {
 				enabled: enabled !== false,
 				debounceMs: typeof debounceMs === 'number' ? debounceMs : 500,
+				// The content script sizes its tap targets off this (>=44 px on mobile).
+				platform: isMobile() ? 'mobile' : 'desktop',
 			};
 		}
 		case 'lint':
@@ -482,7 +792,8 @@ async function handleMessage(message: IncomingMessage | unknown): Promise<unknow
 }
 
 // -----------------------------------------------------------------------------
-// Settings registration.
+// Settings registration. Platform is resolved BEFORE this runs, so externalDictionaryPath (a
+// FilePath-style setting unsupported on mobile) is registered on DESKTOP ONLY; everything else on both.
 // -----------------------------------------------------------------------------
 async function registerSettings(): Promise<void> {
 	await joplin.settings.registerSection(SECTION, {
@@ -490,7 +801,8 @@ async function registerSettings(): Promise<void> {
 		description: 'Harper grammar checker settings.',
 		iconName: 'fas fa-spell-check',
 	});
-	await joplin.settings.registerSettings({
+
+	const defs: Record<string, any> = {
 		enabled: {
 			value: true,
 			type: SettingItemType.Bool,
@@ -528,16 +840,16 @@ async function registerSettings(): Promise<void> {
 			description: 'Idle delay after typing before re-linting. Changes apply immediately.',
 			storage: SettingStorage.File,
 		},
-		dictionaryPath: {
+		dictionaryNoteId: {
 			value: '',
 			type: SettingItemType.String,
 			public: true,
 			section: SECTION,
-			label: 'External dictionary file',
+			label: 'Dictionary note id',
 			description:
-				'Absolute path to a plain-text dictionary (one word per line), e.g. ' +
-				'~/.local/share/harper-dictionary/dictionary.txt. Leave empty to use the plugin-local list. ' +
-				'Words added via "Add to dictionary" are appended here when set. Re-read every 60s.',
+				'The id of a Joplin note used as your Harper dictionary (one word per line). It syncs ' +
+				'across all your devices. Use the "Harper: Create dictionary note" command to make one, ' +
+				'or paste an existing note id here. Leave empty to disable the dictionary note.',
 			storage: SettingStorage.File,
 		},
 		ruleOverrides: {
@@ -552,11 +864,53 @@ async function registerSettings(): Promise<void> {
 				'{"SpelledNumbers": false}. Invalid JSON is ignored.',
 			storage: SettingStorage.File,
 		},
-	});
+		// Private (public:false) buffers — invisible in the settings UI on both platforms.
+		pendingWords: {
+			value: [],
+			type: SettingItemType.Array,
+			public: false,
+			section: SECTION,
+			label: 'Pending dictionary words (internal)',
+			storage: SettingStorage.File,
+		},
+		ignoredLints: {
+			value: '',
+			type: SettingItemType.String,
+			public: false,
+			section: SECTION,
+			label: 'Ignored lints (internal)',
+			storage: SettingStorage.File,
+		},
+	};
+
+	// DESKTOP ONLY: the external dictionary file. Its path relies on a real filesystem (fs read + the
+	// FilePath UX), neither of which exists on mobile — so we do not register it there at all. Platform
+	// is already resolved when this runs, so this conditional is decided correctly on both apps.
+	if (!isMobile()) {
+		defs.dictionaryPath = {
+			value: '',
+			type: SettingItemType.String,
+			public: true,
+			section: SECTION,
+			label: 'External dictionary file (desktop)',
+			description:
+				'Absolute path to a plain-text dictionary (one word per line), e.g. ' +
+				'~/.local/share/harper-dictionary/dictionary.txt. Leave empty to use the plugin-local list ' +
+				'or the dictionary note. Words added via "Add to dictionary" are appended here when set. ' +
+				'Re-read every 60s. When a dictionary note is ALSO set, the file and note mirror each other.',
+			storage: SettingStorage.File,
+		};
+	}
+
+	await joplin.settings.registerSettings(defs);
 }
 
 joplin.plugins.register({
 	onStart: async () => {
+		// Resolve platform FIRST — every branch below (settings registration, fs guards, flush
+		// discipline) keys off it, and it must be known before registerSettings runs.
+		await resolvePlatform();
+
 		await registerSettings();
 		await loadSettings();
 
@@ -567,14 +921,29 @@ joplin.plugins.register({
 		);
 		await joplin.contentScripts.onMessage(CONTENT_SCRIPT_ID, handleMessage);
 
+		// Command to create the dictionary note (both platforms; appears in the command palette).
+		await joplin.commands.register({
+			name: 'harper.createDictionaryNote',
+			label: 'Harper: Create dictionary note',
+			execute: async () => {
+				await createDictionaryNote();
+			},
+		});
+
 		// Reconfigure + re-lint whenever settings change.
 		await joplin.settings.onChange(async ({ keys }) => {
 			const before = cfg.dialect;
+			const noteIdBefore = cfg.dictionaryNoteId;
 			await loadSettings();
-			if (cfg.dictionaryPath === '' || keys.includes('dictionaryPath')) {
+			if (!isMobile() && (cfg.dictionaryPath === '' || keys.includes('dictionaryPath'))) {
 				// A changed path invalidates the cached mtime / missing-file warning.
 				lastExternalMtimeMs = null;
 				warnedMissingDict = false;
+			}
+			if (keys.includes('dictionaryNoteId') && cfg.dictionaryNoteId !== noteIdBefore) {
+				// New/changed dictionary note: force a fresh read next time.
+				lastNoteUpdatedTime = null;
+				knownNoteWords = new Set();
 			}
 			if (linterPromise) {
 				const linter = await linterPromise;
@@ -584,9 +953,30 @@ joplin.plugins.register({
 				await applyConfiguration(linter);
 			}
 			await pokeForceLint();
+			// A dictionaryNoteId change is a flush trigger (guarded by editorOpen — deferred if an
+			// editor is open, which is why on mobile this cannot evict; see flushDictionaryNote).
+			if (keys.includes('dictionaryNoteId') && cfg.dictionaryNoteId !== noteIdBefore) {
+				await flushDictionaryNote('dictionaryNoteId-change');
+			}
 		});
 
-		// Poll the external dictionary for out-of-band (rclone) changes.
+		// EDITOR-OPEN tracking + deferred flush trigger. A note-selection change means the previously
+		// open editor was torn down; mark the editor closed and flush pending words to the note (L3-safe
+		// because editorOpen is now false and the newly-selected note has no in-progress edits yet).
+		try {
+			await joplin.workspace.onNoteSelectionChange(async () => {
+				editorOpen = false;
+				await flushDictionaryNote('note-selection-change');
+			});
+		} catch {
+			// Older API without onNoteSelectionChange — the start flush + poll still persist words.
+		}
+
+		// Poll for out-of-band dictionary changes (desktop file via rclone; the note via sync).
 		setInterval(pollDictionaryTick, 60_000);
+
+		// START flush: before any editor mounts, persist any words left buffered from a previous session
+		// (e.g. added on mobile just before the app was closed). editorOpen is still false here.
+		await flushDictionaryNote('plugin-start');
 	},
 });

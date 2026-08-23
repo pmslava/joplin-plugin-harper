@@ -74,9 +74,6 @@ async function main() {
 	if (!fs.existsSync(path.join(DIST_DIR, 'index.js'))) {
 		throw new Error('dist/index.js not found — run `npm run dist` first (npm test does this).');
 	}
-	if (!fs.existsSync(path.join(DIST_DIR, 'harper_wasm_bg.wasm'))) {
-		throw new Error('dist/harper_wasm_bg.wasm not found — the WASM copy step did not run.');
-	}
 
 	// A throwaway per-run data dir so the plugin can write userWords.txt / ignoredLints.json.
 	const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-test-data-'));
@@ -129,9 +126,9 @@ async function main() {
 
 	// ---- config handshake ---------------------------------------------------
 	const handler = state.contentScriptMessageHandlers['harperCm'];
-	await test('getConfig returns {enabled, debounceMs} for the content script', async () => {
+	await test('getConfig returns {enabled, debounceMs, platform} for the content script', async () => {
 		const config = await handler({ type: 'getConfig' });
-		assert.deepStrictEqual(config, { enabled: true, debounceMs: 500 });
+		assert.deepStrictEqual(config, { enabled: true, debounceMs: 500, platform: 'desktop' });
 	});
 
 	// ---- live debounce apply (v1.0.1) ---------------------------------------
@@ -357,16 +354,225 @@ async function main() {
 		assert.ok(Array.isArray(r) && r.length >= 1, 'array with >=1 lint for the sample doc');
 	});
 
+	// =========================================================================
+	// v1.1.0 MOBILE + UNIFIED DICTIONARY
+	// =========================================================================
+
+	// A tiny "wait until" helper: the dictionary polls kick off async work without returning a promise,
+	// so tests drive the timer then wait for the observable effect (a note put / file write) to land.
+	const drain = () => new Promise((r) => setTimeout(r, 30));
+	async function waitFor(cond, timeoutMs = 4000) {
+		const t0 = Date.now();
+		while (Date.now() - t0 < timeoutMs) {
+			if (await cond()) return true;
+			await drain();
+		}
+		return false;
+	}
+
+	// ---- loader: inlined WASM, no separate .wasm ----------------------------
+	await test('loader: dist/index.js embeds the inlined WASM (data:application/wasm) and dist ships no separate .wasm', () => {
+		const idx = fs.readFileSync(path.join(DIST_DIR, 'index.js'), 'utf8');
+		assert.ok(idx.includes('data:application/wasm'), 'index.js contains the inlined base64 WASM data URL');
+		const wasmFiles = fs.readdirSync(DIST_DIR).filter((f) => f.endsWith('.wasm'));
+		assert.strictEqual(wasmFiles.length, 0, `no separate .wasm in dist, found: ${JSON.stringify(wasmFiles)}`);
+	});
+
+	// ---- manifest platform declaration --------------------------------------
+	await test('manifest declares platforms [desktop, mobile] + app_min_version_mobile 3.3', () => {
+		const manifest = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'src', 'manifest.json'), 'utf8'));
+		assert.deepStrictEqual(manifest.platforms, ['desktop', 'mobile'], 'platforms declares both');
+		assert.strictEqual(manifest.app_min_version_mobile, '3.3', 'app_min_version_mobile is 3.3');
+	});
+
+	// ---- MOBILE run: zero fs, zero data.put while editor open ---------------
+	// Drives the SAME compiled bundle with versionInfo.platform='mobile' and a require() stub that FAILS
+	// on any call — proving the mobile path never touches the filesystem (L1: no Node on mobile) — and a
+	// note store, proving no data.put lands while the editor-open flag is set (L3: a note write mid-edit
+	// evicts the mobile editor). The editor-open flag is driven exactly as the real content script does:
+	// a getConfig handshake opens it; a note-selection change closes it (and flushes).
+	{
+		const mobileFsCalls = [];
+		const mobileRequire = (name) => {
+			mobileFsCalls.push(name);
+			throw new Error(`[mobile] joplin.require(${name}) must NEVER run on the mobile path (no Node)`);
+		};
+		const mobileDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-mobile-'));
+		const mnotes = {
+			'dict-note-1': {
+				id: 'dict-note-1',
+				title: 'Harper Dictionary',
+				body: `${'# Harper Dictionary — comment'}\n\nAlpha\n`,
+				updated_time: 1000,
+			},
+		};
+		const mstate = await run({
+			dataDir: mobileDataDir,
+			installationDir: DIST_DIR,
+			require: mobileRequire,
+			versionInfo: { version: '3.7.2', platform: 'mobile' },
+			// Start WITHOUT a dictionary note so the test can set it mid-edit (a flush trigger) and prove
+			// the write is deferred while the editor is open.
+			initialSettings: {},
+			notes: mnotes,
+			folders: [{ id: 'f1', title: 'Notes' }],
+			selectedFolder: { id: 'f1' },
+		});
+		const mh = mstate.contentScriptMessageHandlers['harperCm'];
+
+		await test('mobile: getConfig reports platform "mobile"', async () => {
+			const c = await mh({ type: 'getConfig' }); // also opens the editor-open flag
+			assert.strictEqual(c.platform, 'mobile', 'platform is mobile');
+		});
+
+		await test('mobile: externalDictionaryPath is NOT registered; dictionaryNoteId + pendingWords ARE', () => {
+			assert.ok(!mstate.registeredSettings.dictionaryPath, 'dictionaryPath absent on mobile');
+			assert.ok(mstate.registeredSettings.dictionaryNoteId, 'dictionaryNoteId present on mobile');
+			assert.ok(mstate.registeredSettings.pendingWords, 'pendingWords buffer present on mobile');
+		});
+
+		await test('mobile: a lint round-trip works and touches ZERO filesystem (no joplin.require)', async () => {
+			const r = await mh({ type: 'lint', text: 'This is an test with beleive.' });
+			assert.ok(Array.isArray(r) && r.length >= 1, 'mobile lint returns issues');
+			assert.strictEqual(mobileFsCalls.length, 0, `no joplin.require on mobile, saw: ${JSON.stringify(mobileFsCalls)}`);
+		});
+
+		await test('mobile: add-to-dictionary buffers into pendingWords and writes NO note (deferred, editor open)', async () => {
+			const putsBefore = mstate.notePuts.length;
+			await mh({ type: 'addWord', word: 'Zzblort' });
+			assert.deepStrictEqual(mstate.settings.pendingWords, ['Zzblort'], 'pendingWords buffered the word');
+			assert.strictEqual(mstate.notePuts.length, putsBefore, 'addWord itself writes no note');
+			// Setting the dictionary note id mid-edit is a flush TRIGGER, but the editor is open, so the
+			// L3 guard must defer it: still ZERO note puts.
+			await mstate.setSetting('dictionaryNoteId', 'dict-note-1');
+			assert.strictEqual(mstate.notePuts.length, putsBefore, 'flush deferred while editor-open flag is set — ZERO data.put');
+			assert.strictEqual(mobileFsCalls.length, 0, 'still no fs access on the mobile path');
+		});
+
+		await test('mobile: leaving the note (selection change) closes the editor and flushes pendingWords to the note', async () => {
+			const putsBefore = mstate.notePuts.length;
+			assert.ok(typeof mstate.noteSelectionChangeHandler === 'function', 'onNoteSelectionChange was registered');
+			await mstate.noteSelectionChangeHandler();
+			const ok = await waitFor(() => mstate.notePuts.length > putsBefore);
+			assert.ok(ok, 'a single note write happened after the editor closed');
+			const put = mstate.notePuts[mstate.notePuts.length - 1];
+			assert.strictEqual(put.id, 'dict-note-1', 'wrote the dictionary note');
+			assert.ok(/(^|\n)Alpha(\n|$)/.test(put.body), 'note keeps existing word Alpha');
+			assert.ok(/(^|\n)Zzblort(\n|$)/.test(put.body), 'note now contains the added word Zzblort');
+			assert.ok(put.body.startsWith('# '), 'note body starts with the canonical "# " header line');
+			assert.deepStrictEqual(mstate.settings.pendingWords, [], 'pendingWords cleared after a successful flush');
+			assert.strictEqual(mobileFsCalls.length, 0, 'the whole mobile flow touched ZERO filesystem');
+		});
+	}
+
+	// ---- dictionary-note PARSE: header + blank lines skipped ----------------
+	{
+		const pnotes = {
+			'parse-note': {
+				id: 'parse-note',
+				title: 'Harper Dictionary',
+				// A '# ' comment line carrying a made-up word (must be skipped, so it stays flagged) and a
+				// blank line, then a real body word (must be imported, so it stops being flagged).
+				body: '# Qxheaderword — this entire comment line must be skipped\n\n\nZmorblexx\n\n',
+				updated_time: 42,
+			},
+		};
+		const pstate = await run({
+			dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'harper-parse-')),
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryNoteId: 'parse-note' },
+			notes: pnotes,
+		});
+		const ph = pstate.contentScriptMessageHandlers['harperCm'];
+		await test('dictionary note parse: body words import; blank + "# " comment lines are skipped', async () => {
+			const r = await ph({ type: 'lint', text: 'Zorbxyz and Zmorblexx and Qxheaderword end.' });
+			const spelled = r.filter((l) => l.kind === 'Spelling').map((l) => l.problemText);
+			assert.ok(!spelled.includes('Zmorblexx'), '"Zmorblexx" (a body word) is imported → not flagged');
+			assert.ok(spelled.includes('Zorbxyz'), '"Zorbxyz" (not in note) IS flagged');
+			assert.ok(spelled.includes('Qxheaderword'), '"Qxheaderword" (inside a "# " comment line) is NOT imported → still flagged');
+		});
+	}
+
+	// ---- pendingWords buffer + dedup ----------------------------------------
+	{
+		const dnotes = { 'd2': { id: 'd2', body: '# h\n\n', updated_time: 7 } };
+		const dstate = await run({
+			dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'harper-pending-')),
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryNoteId: 'd2' },
+			notes: dnotes,
+		});
+		const dh = dstate.contentScriptMessageHandlers['harperCm'];
+		await test('pendingWords: repeated add-to-dictionary of the same word dedups in the buffer', async () => {
+			await dh({ type: 'getConfig' }); // open the editor so the buffer is not flushed away
+			await dh({ type: 'addWord', word: 'Wibblet' });
+			await dh({ type: 'addWord', word: 'Wibblet' });
+			await dh({ type: 'addWord', word: 'Grobnar' });
+			assert.deepStrictEqual(
+				dstate.settings.pendingWords,
+				['Wibblet', 'Grobnar'],
+				'buffer holds each word once, in insertion order',
+			);
+		});
+	}
+
+	// ---- desktop NOTE<->FILE MIRROR convergence, no ping-pong ----------------
+	{
+		const mirrorDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-mirror-'));
+		const mirrorFile = path.join(mirrorDataDir, 'dict.txt');
+		fs.writeFileSync(mirrorFile, 'Zqxfile\n', 'utf8');
+		const nnotes = { 'mnote': { id: 'mnote', body: '# h\n\nZqxnote\n', updated_time: 500 } };
+		const nstate = await run({
+			dataDir: mirrorDataDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			// Both a file AND a note configured => the desktop mirror is active. Editor stays closed
+			// (no getConfig), so the start flush + polls may write freely.
+			initialSettings: { dictionaryPath: mirrorFile, dictionaryNoteId: 'mnote' },
+			notes: nnotes,
+		});
+
+		await test('mirror: file word lands in the note and note word lands in the file (both directions)', async () => {
+			// The plugin-start flush already runs file->note; wait for the note to carry both words.
+			const converged = await waitFor(() => {
+				const b = nstate.notes['mnote'].body;
+				return b.includes('Zqxfile') && b.includes('Zqxnote');
+			});
+			assert.ok(converged, 'the note body contains BOTH the file word and the note word');
+			const fileText = fs.readFileSync(mirrorFile, 'utf8');
+			assert.ok(fileText.includes('Zqxfile'), 'file still has its own word');
+			assert.ok(fileText.includes('Zqxnote'), 'the note word was mirrored into the file');
+		});
+
+		await test('mirror: repeated polls after convergence do NOT ping-pong (no further note writes / file growth)', async () => {
+			const putsBefore = nstate.notePuts.length;
+			const fileBefore = fs.readFileSync(mirrorFile, 'utf8');
+			const pollTimer = nstate.intervals.find((i) => i.ms === 60000 && !i.cleared);
+			assert.ok(pollTimer, 'a 60s dictionary poll interval was armed');
+			pollTimer.fn();
+			await drain();
+			pollTimer.fn();
+			await waitFor(() => false, 200); // let any async poll work settle
+			assert.strictEqual(nstate.notePuts.length, putsBefore, 'no extra note writes after convergence');
+			assert.strictEqual(fs.readFileSync(mirrorFile, 'utf8'), fileBefore, 'file unchanged after convergence');
+		});
+	}
+
 	// ---- version quadruple --------------------------------------------------
 	// The four version fields (package.json, src/manifest.json, and BOTH package-lock fields) must
 	// stay pinned together; a stale lockfile drifted them once in the sibling project. Bump all four
 	// on every release, or the harness (and thus the publish gate) fails.
-	await test('version: package.json, manifest, and both package-lock fields are all 1.0.2', () => {
+	await test('version: package.json, manifest, and both package-lock fields are all 1.1.0', () => {
 		const readJSON = (...rel) => JSON.parse(fs.readFileSync(path.join(REPO_ROOT, ...rel), 'utf8'));
 		const pkg = readJSON('package.json');
 		const manifest = readJSON('src', 'manifest.json');
 		const lock = readJSON('package-lock.json');
-		const expected = '1.0.2';
+		const expected = '1.1.0';
 		assert.strictEqual(pkg.version, expected, 'package.json version');
 		assert.strictEqual(manifest.version, expected, 'src/manifest.json version');
 		assert.strictEqual(lock.version, expected, 'package-lock.json top-level version');
