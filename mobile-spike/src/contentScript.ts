@@ -1,27 +1,46 @@
-// Harper Mobile Spike v0.0.4 — SILENT-MODE CM6 content script (S5, staged activation + heartbeat,
-// but ZERO postMessage traffic until a single batched flush).
+// Harper Mobile Spike v0.0.5 — SETTINGS-PROBE CM6 content script (S5, staged activation + heartbeat,
+// silent buffering EXACTLY as v0.0.4, but a THREE-FLUSH protocol that separates settings-writes from
+// the note-write to measure whether joplin.settings.setValue is safe mid-edit).
 //
-// WHY THIS EXISTS (v0.0.4 pivot). v0.0.1/v0.0.2/v0.0.3 all reached the SAME wall on-device: the moment
-// the content script loads it posts its trail (S5 loaded + S5a x3) back to the plugin background, the
-// background appends those lines to the results note via joplin.data.put, and within ~1 s of that
-// batch of note-writes the mobile Markdown editor is evicted (keyboard drops, viewer returns) — BEFORE
-// S5b (+2 s) ever runs. The plugin background stayed healthy throughout (its heartbeats kept ticking).
-// The refined hypothesis is therefore NOT "our CM6 code is the killer" and NOT "engine residency" — it
-// is that the BACKGROUND data-API note-writes THEMSELVES (each `put` schedules a sync / emits a
-// note-change the mobile Note screen reacts to) tear down the open editor. Every editor open has been
-// self-evicting through its OWN load-time report messages.
+// ESTABLISHED LAW (device: Android 10, Joplin mobile 3.7.2, proven through v0.0.4 + user controls): a
+// plugin BACKGROUND joplin.data.put NOTE-write while the mobile editor is open evicts the editor within
+// seconds, via a LOCAL (sync-independent) mechanism. User typing and remote sync of OTHER notes do NOT
+// evict. The whole editor stack (require -> ext -> linter -> markClass -> CSS -> tap card) is proven
+// safe during silent operation.
 //
-// v0.0.4 ISOLATES THAT by making the content script ABSOLUTELY SILENT until one deferred flush:
-//   - It does the SAME staged activation (S5a require -> S5b no-op ext -> S5c linter(zero) ->
-//     S5d linter emits spiketest+markClass -> S5e CSS -> S5f tap card, 2 s apart) and the SAME 5 s
-//     editor heartbeat, but every line is BUFFERED IN MEMORY — there is NO context.postMessage during
-//     any of it. So for the first 45 s the plugin background performs NO note-writes at all.
-//   - At t=45 s it posts ONE message {type:'flushTrail', lines:[...]} carrying the entire buffered
-//     trail; the background writes it with a SINGLE data.put. If the editor is evicted AT that first
-//     write, we will see the trail arrive once and then nothing — proving the WRITE is the killer.
-//   - It KEEPS buffering (heartbeats continue) and flushes AGAIN at t=90 s. A second flush arriving
-//     with heartbeats spanning 45–90 s proves the first flush's write did NOT evict the editor (so the
-//     theory needs refinement); a missing second flush proves it did.
+// OPEN QUESTION v0.0.5 ANSWERS: is joplin.settings.setValue during mobile editing ALSO lethal, or safe?
+// The mobile v1 design wants to persist ignore-state + buffer dictionary words to settings mid-edit; the
+// safety of that is currently only inference and MUST be measured. This build isolates it:
+//
+//   - Silent buffering is UNCHANGED from v0.0.4: the SAME staged activation (S5a require -> S5b no-op ext
+//     -> S5c linter(zero) -> S5d linter emits spiketest+markClass -> S5e CSS -> S5f tap card, 2 s apart)
+//     and the SAME 5 s editor heartbeat, all BUFFERED IN MEMORY — no postMessage during any of it.
+//   - FLUSH #1 at t=45 s posts {type:'flushToSettings', lines:[...]} — the background stores it ONLY via
+//     joplin.settings.setValue('trailBuffer', ...). NO data.put. (settings write #1)
+//   - FLUSH #2 at t=90 s posts {type:'flushToSettings', lines:[...]} — background APPENDS to the same
+//     setting. NO data.put. (settings write #2)
+//   - FLUSH #3 at t=135 s posts {type:'flushToNote', lines:[...tail]} — the background THEN does the
+//     (known-lethal) joplin.data.put of everything buffered in settings PLUS the tail carried here,
+//     under a '----- NOTE FLUSH -----' label. (the one note write)
+//
+// So the timeline discriminates cleanly:
+//   * editor alive past t=90 s (two settings writes survived) then evicted at ~t=135 s (note write)
+//       => settings.setValue is SAFE, and the note-write law is re-confirmed in the SAME session;
+//   * editor evicted at ~t=45 s (first settings write)
+//       => settings.setValue is ALSO lethal (nothing but the first buffer survives, recovered at the
+//          next plugin start — see below).
+//
+// WHY flush #3 carries a `lines` tail (a deliberate refinement over a bare {type:'flushToNote'}): it lets
+// the single note write deliver the COMPLETE trail — including the 90–135 s heartbeats that were never
+// pushed to settings — so (a) the note flush unambiguously contains heartbeats past 90 s and (b) no trail
+// is silently lost. It changes neither the message type nor the experiment: still exactly two settings
+// writes (t=45 s, t=90 s) followed by one note write (t=135 s).
+//
+// TRAIL-LOSS SAFETY: if the user closes the editor before t=135 s, flush #3 never fires, so whatever
+// flush #1/#2 pushed to settings would be stranded. The background therefore RECOVERS any leftover
+// 'trailBuffer' to the results note at plugin start (before any editor opens) under a distinct
+// '----- STARTUP RECOVERY -----' label, then clears it — so no trail is ever lost, and the label tells
+// a reader whether a block was a live NOTE FLUSH or a recovered-after-close buffer.
 //
 // Every line carries the per-LOAD 4-char id and an ISO timestamp captured AT RECORD TIME (not flush
 // time), so the buffered trail preserves the real on-editor timing even though it is delivered late.
@@ -52,14 +71,19 @@ const SPIKE_WORD = 'spiketest';
 const STYLE_ELEMENT_ID = 'harper-spike-styles';
 const STAGE_GAP_MS = 2000; // ~2 s between stages (unchanged from v0.0.3 — same staged timeline).
 
-// Editor-side heartbeat: record 'S5 HEARTBEAT[id] t=<n>s' every 5 s. Duration spans BOTH flushes with
-// margin so the t=90 s flush carries several heartbeats from the 45–90 s window (survival evidence).
+// Editor-side heartbeat: record 'S5 HEARTBEAT[id] t=<n>s' every 5 s. Duration spans ALL THREE flushes
+// with margin so the t=135 s note flush carries heartbeats past 90 s (survival evidence for BOTH settings
+// writes) — every 5 s from t=5 s up to ~t=140 s.
 const HEARTBEAT_INTERVAL_MS = 5000;
-const HEARTBEAT_DURATION_MS = 95_000;
+const HEARTBEAT_DURATION_MS = 140_000;
 
-// The two deferred, batched flushes. NOTHING is posted before FIRST_FLUSH_MS.
+// The three deferred, batched flushes. NOTHING is posted before FIRST_FLUSH_MS.
+//   #1 (t=45 s)  -> flushToSettings (settings write #1)
+//   #2 (t=90 s)  -> flushToSettings (settings write #2)
+//   #3 (t=135 s) -> flushToNote     (the one, known-lethal, note write)
 const FIRST_FLUSH_MS = 45_000;
 const SECOND_FLUSH_MS = 90_000;
+const THIRD_FLUSH_MS = 135_000;
 
 /** 4-char base36 id, distinguishes interleaved content-script loads (mobile reloads it per editor open). */
 function rid(): string {
@@ -89,13 +113,16 @@ export default (context: ContentScriptContext) => {
 			};
 
 			// The ONLY code that ever calls context.postMessage. Ships the lines buffered since the last
-			// flush as a single {type:'flushTrail'} message; the background writes them with ONE data.put.
-			const flush = (reason: string): void => {
+			// flush. `type` selects the background's storage path:
+			//   'flushToSettings' -> background stores via joplin.settings.setValue (NO data.put)
+			//   'flushToNote'     -> background does the one joplin.data.put of the whole settings buffer
+			//                        PLUS the tail carried here.
+			const flush = (type: 'flushToSettings' | 'flushToNote', reason: string): void => {
 				flushCount += 1;
 				const lines = trail.slice(flushedUpTo);
 				flushedUpTo = trail.length;
 				try {
-					void context.postMessage({ type: 'flushTrail', id, flush: flushCount, reason, lines });
+					void context.postMessage({ type, id, flush: flushCount, reason, lines });
 				} catch {
 					/* the reporting channel itself may be gone mid-teardown */
 				}
@@ -135,10 +162,22 @@ export default (context: ContentScriptContext) => {
 				if (Date.now() - heartbeatStart >= HEARTBEAT_DURATION_MS) clearInterval(heartbeatTimer);
 			}, HEARTBEAT_INTERVAL_MS);
 
-			// (0c) Schedule the two deferred flushes. These are the ONLY postMessage calls in the whole
+			// (0c) Schedule the three deferred flushes. These are the ONLY postMessage calls in the whole
 			// content script. Everything above/below merely records into `trail`.
-			setTimeout(() => flush('t=45s scheduled (first flush — entire buffered trail)'), FIRST_FLUSH_MS);
-			setTimeout(() => flush('t=90s scheduled (second flush — survival proof past first write)'), SECOND_FLUSH_MS);
+			//   #1/#2 -> settings writes (must NOT evict if the v1 design is viable)
+			//   #3    -> the one note write (expected to evict if the editor is still open)
+			setTimeout(
+				() => flush('flushToSettings', 't=45s (settings write #1 — buffered trail so far)'),
+				FIRST_FLUSH_MS,
+			);
+			setTimeout(
+				() => flush('flushToSettings', 't=90s (settings write #2 — survival proof past write #1)'),
+				SECOND_FLUSH_MS,
+			);
+			setTimeout(
+				() => flush('flushToNote', 't=135s (NOTE write — known-lethal; carries the 90-135s tail)'),
+				THIRD_FLUSH_MS,
+			);
 
 			if (!editorControl.cm6) {
 				record(`S5[${id}] no cm6 on editorControl — not a CM6 editor, bailing`);

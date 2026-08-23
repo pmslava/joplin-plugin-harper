@@ -10,47 +10,44 @@ import {
 } from '../../e2e/helpers';
 
 /**
- * DESKTOP pre-flight gate for the Harper mobile spike v0.0.4 (NO-ENGINE, SILENT-MODE build).
+ * DESKTOP pre-flight gate for the Harper mobile spike v0.0.5 (NO-ENGINE, SETTINGS-PROBE build).
  *
- * v0.0.4 tests the WRITE-EVICTION hypothesis: on-device the mobile editor was evicted ~1-2 s after the
- * content script loaded and the plugin background wrote its load-time trail to the results note via
- * joplin.data.put — each write scheduling a 1 s partial sync ("Preparing scheduled sync"). The refined
- * mechanism (traced in Joplin dev source): a data-API write schedules a partial sync
- * (BaseApplication.generalMiddleware -> registry.scheduleSync), and that sync's UpdateLocal of the
- * currently-open note dispatches EDITOR_NOTE_NEEDS_RELOAD (Synchronizer.ts) -> reducer bumps
- * editorNoteReloadTimeRequest -> Note screen componentDidUpdate calls Keyboard.dismiss() + remounts the
- * editor WebView via a changed React key. So background writes while an editor is open pump the sync
- * cycle that reloads the open note.
+ * ESTABLISHED LAW (on device): a plugin BACKGROUND joplin.data.put note-write while the mobile editor is
+ * open evicts the editor within seconds, via a LOCAL (sync-independent) mechanism. The whole editor stack
+ * (require -> ext -> linter -> markClass -> CSS -> tap card) is proven safe during silent operation.
  *
- * This build makes the content script ABSOLUTELY SILENT: it buffers its whole staged trail (S5a require
- * -> S5b no-op ext -> S5c linter(zero) -> S5d linter emits spiketest+markClass -> S5e CSS -> S5f tap
- * card) plus a 5 s heartbeat IN MEMORY, posting NOTHING until a single batched {type:'flushTrail'}
- * message at t=45 s, then again at t=90 s. The background appends each flush with ONE data.put. There is
- * NO main-side heartbeat (v0.0.3 had one — exactly the during-editing background write we must avoid).
+ * OPEN QUESTION v0.0.5 ANSWERS: is joplin.settings.setValue during mobile editing ALSO lethal, or safe?
+ * The content script buffers its whole staged trail (S5a..S5f + 5 s heartbeat) silently, then:
+ *   FLUSH #1 (t=45 s)  {type:'flushToSettings'} -> background stores via joplin.settings.setValue only
+ *   FLUSH #2 (t=90 s)  {type:'flushToSettings'} -> background appends to the same setting
+ *   FLUSH #3 (t=135 s) {type:'flushToNote'}     -> background does the ONE data.put of the whole settings
+ *                                                  buffer + the tail carried in flush #3, under a
+ *                                                  '----- NOTE FLUSH -----' label, then clears the buffer.
+ * On device: editor alive past t=90 s then evicted at ~t=135 s => settings.setValue SAFE + note-write law
+ * reconfirmed; editor dead at ~t=45 s => settings.setValue ALSO lethal.
  *
- * This DESKTOP gate runs the SAME no-engine plugin the user will sideload on Android, inside a real
- * desktop Joplin (Electron) with sync disabled (sync.target=0, so no sync cycle and no eviction — the
- * device-specific kill cannot and should not reproduce here). It proves the plumbing before anyone
- * touches a phone:
- *   - the plugin background runs and the no-engine probe reaches 'SILENT READY' (S0 env only; NO WASM
- *     stage, NO 'SPIKE COMPLETE', NO main heartbeat),
- *   - opening an editor loads the SILENT content script; for the first 45 s the results note receives NO
- *     S5 lines at all (silence is observable),
- *   - at ~45 s the FIRST flush arrives carrying the entire buffered trail (all S5a-S5f OK + >=5
- *     heartbeats), and because the desktop editor survives, a SECOND flush arrives at ~90 s (the same
- *     survival signal we will read on-device),
- *   - the spiketest underline paints and the tap card opens/closes (DOM behaviour is unchanged; only the
- *     reporting is deferred).
+ * This DESKTOP gate runs the SAME no-engine plugin inside a real desktop Joplin (Electron) with sync
+ * disabled (sync.target=0) — so the device-specific eviction cannot and should not reproduce here (the
+ * desktop editor survives every write). It proves the PLUMBING before anyone touches a phone:
+ *   - the background reaches 'SETTINGS PROBE READY' (S0 env only; NO WASM stage, NO 'SPIKE COMPLETE',
+ *     NO main heartbeat),
+ *   - during a >=140 s editor session NOTHING is written to the results note until ~t=135 s (flush #1/#2
+ *     go to a settings value, not the note): proven by the NOTE FLUSH block's received-timestamp landing
+ *     >=130 s after the editor opened, and by the absence of any earlier block,
+ *   - at ~t=135 s the single NOTE FLUSH delivers the whole trail: both SETTINGS FLUSH sub-headers, all
+ *     S5a-S5f OK, and heartbeats spanning well past 90 s (from the flush #3 tail),
+ *   - the spiketest underline paints and the tap card opens/closes (DOM behaviour unchanged).
  */
 
 const RESULTS_TITLE = 'Harper Mobile Spike Results';
 
-// Must match contentScript.ts FIRST_FLUSH_MS / SECOND_FLUSH_MS.
+// Must match contentScript.ts FIRST_FLUSH_MS / SECOND_FLUSH_MS / THIRD_FLUSH_MS.
 const FIRST_FLUSH_MS = 45_000;
 const SECOND_FLUSH_MS = 90_000;
+const THIRD_FLUSH_MS = 135_000;
 
-/** Re-select the Spike folder then the results note (forces a fresh DB read of its body) and return it. */
-async function readResultsNoteBody(win: Page): Promise<string> {
+/** Re-select the Spike folder then the results note (forces a fresh DB read of its body). */
+async function selectResultsNote(win: Page): Promise<boolean> {
   try {
     await win.getByText('Spike', { exact: true }).first().click({ timeout: 5000 });
     await win.waitForTimeout(400);
@@ -63,11 +60,62 @@ async function readResultsNoteBody(win: Page): Promise<string> {
   } catch {
     /* note may not be rendered yet */
   }
-  if (!(await editorIsPresent(win))) return '';
+  return editorIsPresent(win);
+}
+
+/** The SHORT read: innerText of the visible CM6 viewport. Fine only for a small (fully-rendered) note. */
+async function readResultsNoteBody(win: Page): Promise<string> {
+  if (!(await selectResultsNote(win))) return '';
   return getEditorBody(win);
 }
 
-test.describe('Harper mobile spike v0.0.4 (no-engine, SILENT) — desktop pre-flight', () => {
+/**
+ * The FULL read. CodeMirror 6 VIRTUALIZES long documents — only lines near the viewport live in the DOM,
+ * so `.cm-content` innerText returns just the visible slice. Once the results note grows past ~one screen
+ * (it does after a NOTE FLUSH), a single innerText read never sees the lines lower down. So we select the
+ * note, then step `.cm-scroller` from top to bottom, unioning the innerText rendered at each window into a
+ * document-ordered, de-duplicated whole. Returns the complete note body regardless of length.
+ */
+async function readResultsNoteBodyFull(win: Page): Promise<string> {
+  if (!(await selectResultsNote(win))) return '';
+  return win.evaluate(async () => {
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const content = document.querySelector('.cm-content') as HTMLElement | null;
+    const scroller = document.querySelector('.cm-scroller') as HTMLElement | null;
+    if (!content) return '';
+    // Small note fully rendered, or no scroller: one read suffices.
+    if (!scroller || scroller.scrollHeight <= scroller.clientHeight + 2) return content.innerText;
+
+    const seen = new Set<string>();
+    const out: string[] = [];
+    const collect = () => {
+      for (const line of content.innerText.split('\n')) {
+        if (!seen.has(line)) {
+          seen.add(line);
+          out.push(line);
+        }
+      }
+    };
+    const step = Math.max(120, Math.floor(scroller.clientHeight * 0.6));
+    scroller.scrollTop = 0;
+    await sleep(150);
+    collect();
+    // Step down with overlap so CM6's render margin never leaves a gap, collecting each new window.
+    while (scroller.scrollTop + scroller.clientHeight < scroller.scrollHeight - 2) {
+      const before = scroller.scrollTop;
+      scroller.scrollTop = Math.min(scroller.scrollTop + step, scroller.scrollHeight);
+      if (scroller.scrollTop === before) break; // no progress guard
+      await sleep(150);
+      collect();
+    }
+    scroller.scrollTop = scroller.scrollHeight; // final bottom window
+    await sleep(150);
+    collect();
+    return out.join('\n');
+  });
+}
+
+test.describe('Harper mobile spike v0.0.5 (no-engine, SETTINGS PROBE) — desktop pre-flight', () => {
   let joplin: JoplinInstance;
 
   test.beforeAll(async () => {
@@ -88,18 +136,18 @@ test.describe('Harper mobile spike v0.0.4 (no-engine, SILENT) — desktop pre-fl
       .toBe(true);
   });
 
-  test('no-engine SILENT probe reaches SILENT READY (no WASM stages, no main heartbeat)', async () => {
+  test('no-engine SETTINGS PROBE reaches SETTINGS PROBE READY (no WASM stages, no main heartbeat)', async () => {
     const { win } = joplin;
 
-    // Poll the results note until the no-engine probe signals silent readiness. The startup probe is
-    // written as ONE batched put (header + S0 env + SILENT READY); each read re-selects the note to
-    // force a fresh DB load.
+    // Poll the results note until the no-engine probe signals settings-probe readiness. The startup probe
+    // is written as ONE batched put (header + S0 env + SETTINGS PROBE READY); each read re-selects the
+    // note to force a fresh DB load.
     let body = '';
     await expect
       .poll(
         async () => {
           body = await readResultsNoteBody(win);
-          return body.includes('SILENT READY');
+          return body.includes('SETTINGS PROBE READY');
         },
         { timeout: 120_000, intervals: [2000] },
       )
@@ -108,38 +156,43 @@ test.describe('Harper mobile spike v0.0.4 (no-engine, SILENT) — desktop pre-fl
     // Capture the probe body as evidence (this is what the report quotes verbatim).
     // eslint-disable-next-line no-console
     console.log(
-      `\n========== HARPER SPIKE v0.0.4 RESULTS NOTE (desktop, after SILENT READY) ==========\n${body}\n` +
-        `====================================================================================\n`,
+      `\n========== HARPER SPIKE v0.0.5 RESULTS NOTE (desktop, after SETTINGS PROBE READY) ==========\n${body}\n` +
+        `============================================================================================\n`,
     );
 
-    // Hard assertions: no-engine SILENT build, correct header, no WASM/engine stages, no main heartbeat.
-    expect(body).toMatch(/===== SPIKE RUN v0\.0\.4 \(SILENT\) /); // header carries the silent version
+    // Hard assertions: no-engine SETTINGS-PROBE build, correct header, no WASM/engine stages, no heartbeat.
+    expect(body).toMatch(/===== SPIKE RUN v0\.0\.5 \(SETTINGS PROBE\) /); // header carries the version + mode
     expect(body).toContain('S0 ENV');
-    expect(body).toContain('SILENT READY');
+    expect(body).toContain('SETTINGS PROBE READY');
     expect(body).not.toContain('SPIKE COMPLETE');
     expect(body, 'no engine WASM stages must run in the no-engine build').not.toMatch(/\bS1 OK\b/);
     expect(body).not.toMatch(/\bS2 OK\b/);
     expect(body).not.toMatch(/\bS3 OK\b/);
-    // v0.0.4 removed the main-side heartbeat entirely (no background writes during editing).
-    expect(body, 'v0.0.4 must not emit a MAIN HEARTBEAT').not.toMatch(/MAIN HEARTBEAT/);
+    expect(body, 'v0.0.5 must not emit a MAIN HEARTBEAT').not.toMatch(/MAIN HEARTBEAT/);
+    // Fresh profile: nothing was stranded, so no recovery block at startup.
+    expect(body, 'fresh profile has nothing to recover at startup').not.toContain('STARTUP RECOVERY');
+    // Silence so far: opening an editor has not yet happened, so no flush of any kind has landed.
+    expect(body, 'no NOTE FLUSH before any editor session').not.toContain('NOTE FLUSH');
+    expect(body, 'no SETTINGS FLUSH ever reaches the note directly').not.toContain('SETTINGS FLUSH');
   });
 
-  test('S5 SILENT: no S5 lines for the first 45 s, then a flush delivers all stages OK + heartbeats, a 2nd flush proves survival, and the underline/card work', async () => {
+  test('S5 SETTINGS PROBE: two settings writes (t=45/90 s) touch the NOTE not at all; only the t=135 s NOTE FLUSH delivers the whole trail (all stages OK + heartbeats past 90 s); underline/card work', async () => {
     const { win } = joplin;
 
     await createNotebook(win, 'Spike Editor NB');
     await createNote(win, 'Spike editor probe ' + Date.now());
     await expect.poll(() => editorIsPresent(win), { timeout: 20_000 }).toBe(true);
-    // The content script's 45 s/90 s flush timers start ~now (when this editor opened).
+    // The content script's 45 s / 90 s / 135 s flush timers start ~now (when this editor opened). Timers
+    // never fire EARLY, so the note write can only happen at editorOpenedAt + (load delay) + 135 s.
     const editorOpenedAt = Date.now();
 
-    // Opening this editor starts the SILENT staged timeline (S5a immediately, S5b..S5f ~2 s apart ->
-    // S5f arms at ~10 s) plus the 5 s heartbeat — all BUFFERED, nothing posted. Seed the trigger word.
+    // Opening this editor starts the SILENT staged timeline (S5a immediately, S5b..S5f ~2 s apart -> S5f
+    // arms at ~10 s) plus the 5 s heartbeat — all BUFFERED, nothing posted. Seed the trigger word.
     await setEditorBody(win, 'A line with spiketest in it, and another spiketest too.');
 
     // Give the (silent) timeline time to pass S5d (linter emits, ~6 s), S5e (CSS) and S5f (card, ~10 s),
-    // then nudge a fresh doc change so the linter (now in emit mode) definitely re-runs and paints marks.
-    // DOM behaviour is unchanged by silent mode — only the reporting is deferred.
+    // then nudge a fresh doc change so the linter (now in emit mode) re-runs and paints marks. DOM
+    // behaviour is unchanged by the settings-probe protocol — only the reporting path is deferred.
     await win.waitForTimeout(14_000);
     await setEditorBody(win, 'A line with spiketest in it, and yet another spiketest here.');
 
@@ -162,49 +215,48 @@ test.describe('Harper mobile spike v0.0.4 (no-engine, SILENT) — desktop pre-fl
     await itWorks.click({ force: true });
     await expect.poll(() => card.count(), { timeout: 10_000 }).toBe(0);
 
-    // SILENCE CHECK: read the results note WITHOUT leaving the probe note yet is not possible (reading
-    // requires selecting the note), so we only assert the flushes AFTER the flush window. But we can
-    // confirm the results note still has no S5 lines at this early point — reading it here selects the
-    // results note, which would tear down the probe editor, so we DON'T read yet. Instead we stay on the
-    // probe note until both flushes have had time to fire (staying avoids reloading the content script).
-    //
-    // Wait until ~5 s past the SECOND flush (t=90 s) so BOTH flushes have posted from this editor. The
-    // desktop editor survives (sync disabled), so both must arrive — the same "survived -> 2nd flush"
-    // signal we read on-device.
-    const targetElapsed = SECOND_FLUSH_MS + 5_000;
+    // We must NOT read the results note mid-session — selecting it would tear down the probe editor and
+    // restart the content-script timers on a new load. So we stay on the probe note until ~5 s past the
+    // THIRD flush (the note write) at t=135 s, letting flush #1/#2 (settings) and flush #3 (note) all fire
+    // from THIS editor. On desktop (sync disabled) the editor survives every write, so flush #3's note
+    // write actually lands and we can read it afterwards.
+    const targetElapsed = THIRD_FLUSH_MS + 5_000; // 140 s
     const already = Date.now() - editorOpenedAt;
     if (already < targetElapsed) await win.waitForTimeout(targetElapsed - already);
 
-    // NOW navigate to the results note and assert the flushed trail landed. Both flush headers must be
-    // present; flush #1 carries the whole staged trail (all S5a-S5f OK) plus >=5 heartbeats.
+    // NOW navigate to the results note and assert the single NOTE FLUSH landed with the whole trail.
     let body = '';
     await expect
       .poll(
         async () => {
-          body = await readResultsNoteBody(win);
+          body = await readResultsNoteBodyFull(win);
           const beats = (body.match(/S5 HEARTBEAT\[\w+\] t=\d+s/g) || []).length;
           return (
-            /----- FLUSH #1\[\w+\]/.test(body) &&
-            /----- FLUSH #2\[\w+\]/.test(body) &&
+            /----- NOTE FLUSH \(expected to evict if editor still open\) #3\[\w+\]/.test(body) &&
+            /----- SETTINGS FLUSH #1\[\w+\]/.test(body) &&
+            /----- SETTINGS FLUSH #2\[\w+\]/.test(body) &&
             /S5a\[\w+\] require @codemirror\/lint ok/.test(body) &&
             /S5b\[\w+\] OK/.test(body) &&
             /S5c\[\w+\] OK/.test(body) &&
             /S5d\[\w+\] OK/.test(body) &&
             /S5e\[\w+\] OK/.test(body) &&
             /S5f\[\w+\] OK/.test(body) &&
-            beats >= 5
+            beats >= 18
           );
         },
         { timeout: 60_000, intervals: [3000] },
       )
       .toBe(true);
 
-    // Emit the flush + S5 + heartbeat lines verbatim for the report.
+    // Emit the settings-flush + NOTE FLUSH + S5 + heartbeat lines verbatim for the report.
     const s5Lines = body
       .split('\n')
       .filter(
         (l) =>
-          l.includes('FLUSH #') ||
+          l.includes('SETTINGS FLUSH') ||
+          l.includes('NOTE FLUSH') ||
+          l.includes('STARTUP RECOVERY') ||
+          l.includes('(tail:') ||
           /\bS5[a-f]?\b/.test(l) ||
           l.includes('HEARTBEAT') ||
           l.includes('EDITOR ERROR'),
@@ -212,13 +264,52 @@ test.describe('Harper mobile spike v0.0.4 (no-engine, SILENT) — desktop pre-fl
       .join('\n');
     // eslint-disable-next-line no-console
     console.log(
-      `\n========== HARPER SPIKE v0.0.4 RESULTS NOTE — FLUSHED SILENT TRAIL (desktop) ==========\n${s5Lines}\n` +
-        `=======================================================================================\n`,
+      `\n========== HARPER SPIKE v0.0.5 RESULTS NOTE — NOTE-FLUSH TRAIL (desktop) ==========\n${s5Lines}\n` +
+        `===================================================================================\n`,
     );
 
+    // --- SILENCE: nothing reached the note before ~t=135 s --------------------------------------------
+    // The NOTE FLUSH block is the ONLY thing written to the note during the session. The cleanest,
+    // skew-independent proof that flush #1/#2 (settings writes) NEVER touched the note is to compare, for
+    // ONE content-script instance, its NOTE FLUSH received time against its OWN SETTINGS FLUSH #2 stored
+    // time: both are plugin-side timestamps of setTimeout(...) from the SAME load, so the gap must be
+    // ~45 s (135 s note flush minus 90 s settings flush #2). If either settings write had reached the note,
+    // the note's first write would be at ~t=45 s, not ~45 s AFTER the t=90 s settings write.
+    const noteFlushMatch = body.match(
+      /----- NOTE FLUSH \(expected to evict if editor still open\) #3\[(\w+)\] (\S+) /,
+    );
+    expect(noteFlushMatch, 'NOTE FLUSH header with an id + received timestamp').not.toBeNull();
+    const nf = noteFlushMatch as RegExpMatchArray;
+    const nfId = nf[1];
+    const nfReceivedMs = Date.parse(nf[2]);
+    const sf2Match = body.match(new RegExp(`----- SETTINGS FLUSH #2\\[${nfId}\\] stored (\\S+) `));
+    expect(sf2Match, `same-instance (${nfId}) SETTINGS FLUSH #2 present`).not.toBeNull();
+    const sf2StoredMs = Date.parse((sf2Match as RegExpMatchArray)[1]);
+    const noteMinusSettings2 = nfReceivedMs - sf2StoredMs;
+    // Corroborating (skew-affected, logged not gated): how long after the editor opened the note write hit.
+    const sinceOpen = nfReceivedMs - editorOpenedAt;
+    // eslint-disable-next-line no-console
+    console.log(
+      `[spike-e2e] instance ${nfId}: NOTE FLUSH landed ${Math.round(noteMinusSettings2 / 1000)}s after its ` +
+        `own SETTINGS FLUSH #2, and ${Math.round(sinceOpen / 1000)}s after the editor opened`,
+    );
+    expect(
+      noteMinusSettings2,
+      'the note write is the t=135 s flush, ~45 s after the t=90 s settings write => settings writes never touched the note',
+    ).toBeGreaterThanOrEqual(40_000);
+    // The note write is unambiguously LATE (well past the t=90 s second settings write), even allowing for
+    // the several-second skew between content-script load and editorOpenedAt.
+    expect(sinceOpen, 'the only note write landed well past t=90 s').toBeGreaterThanOrEqual(110_000);
+
+    // Fresh profile + surviving editor: flush #3 fired live, so exactly a NOTE FLUSH (no STARTUP RECOVERY).
+    expect(body, 'flush #3 fired live; no recovery path was needed').not.toContain('STARTUP RECOVERY');
+
     // Individual hard assertions (redundant with the poll, but explicit).
-    expect(body, 'first flush header').toMatch(/----- FLUSH #1\[\w+\]/);
-    expect(body, 'second flush header (survival)').toMatch(/----- FLUSH #2\[\w+\]/);
+    expect(body, 'NOTE FLUSH #3 label').toMatch(
+      /----- NOTE FLUSH \(expected to evict if editor still open\) #3\[\w+\]/,
+    );
+    expect(body, 'SETTINGS FLUSH #1 sub-header (settings write #1)').toMatch(/----- SETTINGS FLUSH #1\[\w+\]/);
+    expect(body, 'SETTINGS FLUSH #2 sub-header (settings write #2)').toMatch(/----- SETTINGS FLUSH #2\[\w+\]/);
     expect(body, 'S5a view').toMatch(/S5a\[\w+\] require @codemirror\/view ok/);
     expect(body, 'S5a lint').toMatch(/S5a\[\w+\] require @codemirror\/lint ok/);
     expect(body, 'S5a state').toMatch(/S5a\[\w+\] require @codemirror\/state ok/);
@@ -227,10 +318,18 @@ test.describe('Harper mobile spike v0.0.4 (no-engine, SILENT) — desktop pre-fl
     expect(body, 'S5d').toMatch(/S5d\[\w+\] OK/);
     expect(body, 'S5e').toMatch(/S5e\[\w+\] OK/);
     expect(body, 'S5f').toMatch(/S5f\[\w+\] OK/);
-    const editorBeats = (body.match(/S5 HEARTBEAT\[\w+\] t=\d+s/g) || []).length;
+
+    // Heartbeats must span WELL PAST 90 s (delivered via flush #3's tail), proving the editor survived
+    // both settings writes on desktop and kept beating up to the note write.
+    const beatTs = (body.match(/S5 HEARTBEAT\[\w+\] t=(\d+)s/g) || []).map((l) =>
+      parseInt((l.match(/t=(\d+)s/) as RegExpMatchArray)[1], 10),
+    );
+    const maxBeat = beatTs.length ? Math.max(...beatTs) : 0;
     // eslint-disable-next-line no-console
-    console.log(`[spike-e2e] editor S5 HEARTBEAT count = ${editorBeats}`);
-    expect(editorBeats, 'at least 5 editor heartbeats in the flushed trail').toBeGreaterThanOrEqual(5);
+    console.log(`[spike-e2e] editor S5 HEARTBEAT count = ${beatTs.length}, max t = ${maxBeat}s`);
+    expect(beatTs.length, 'at least 18 editor heartbeats in the delivered trail').toBeGreaterThanOrEqual(18);
+    expect(maxBeat, 'heartbeats span past 90 s (flush #3 tail delivered 90-135 s)').toBeGreaterThanOrEqual(95);
+
     // No stage crashed the desktop editor.
     expect(body, 'no EDITOR ERROR on desktop').not.toContain('EDITOR ERROR');
   });

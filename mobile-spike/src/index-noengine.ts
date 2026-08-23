@@ -1,38 +1,49 @@
-// Harper Mobile Spike v0.0.4 — NO-ENGINE + SILENT BACKGROUND (plugin main process / mobile background).
+// Harper Mobile Spike v0.0.5 — NO-ENGINE + SETTINGS-PROBE background (plugin main process / mobile bg).
 //
-// WHY THIS EXISTS (v0.0.4 pivot). The v0.0.3 no-engine run STILL evicted the mobile editor even with
-// harper.js removed — so engine residency was NOT the killer. The device trail always ended the same
-// way: the content script loads, immediately posts its 4 load-time messages (S5 loaded + 3× S5a), the
-// background appends them to the results note via joplin.data.put, the app log shows each append batch
-// IMMEDIATELY FOLLOWED BY 'Preparing scheduled sync', and the editor is evicted before S5b (+2 s). The
-// plugin background itself stayed healthy (its own heartbeats kept ticking). That fingers the BACKGROUND
-// NOTE-WRITES themselves — each data.put schedules a sync / emits a note-change the mobile Note screen
-// reacts to — as the mechanism tearing down the open editor. Every editor open was self-evicting via its
-// OWN load-time report writes.
+// ESTABLISHED LAW (device: Android 10, Joplin mobile 3.7.2, proven through v0.0.4 + user controls): a
+// plugin BACKGROUND joplin.data.put NOTE-write while the mobile editor is open evicts the editor within
+// seconds, via a LOCAL (sync-independent) mechanism — identical eviction in airplane mode, so the earlier
+// sync/UpdateLocal diagnosis is refuted. User typing and remote sync of OTHER notes do NOT evict.
 //
-// v0.0.4 tests exactly that by REMOVING every background write that happens while an editor is open:
-//   - NO main-side heartbeat (v0.0.3 had one writing every 10 s — precisely the kind of during-editing
-//     background write we must eliminate). It is GONE.
-//   - The content script is now SILENT: it buffers its entire trail in memory and posts NOTHING until a
-//     single {type:'flushTrail'} message at t=45 s (then again at t=90 s). See contentScript.ts.
-//   - On receiving a flush, this background appends the WHOLE batch with ONE data.put (one write, not N).
-// So during an editor session the ONLY background note-writes are: one put at t≈45 s and one at t≈90 s.
-// If the editor survives to the first flush and is evicted AT it, the write is confirmed as the killer.
+// OPEN QUESTION v0.0.5 ANSWERS: is joplin.settings.setValue during mobile editing ALSO lethal, or safe?
+// The mobile v1 design wants to persist ignore-state + buffer dictionary words to settings mid-edit; that
+// safety claim is currently only inference from the refuted-diagnosis era and MUST be measured. This build
+// separates the two write kinds during an editor session (see contentScript.ts for the editor side):
 //
-// The only writes this build performs at startup (before any editor is open, so they cannot evict an
-// editor) are: create/reuse the results note and ONE batched probe write (header + S0 env + SILENT READY).
+//   FLUSH #1 (t=45 s)  {type:'flushToSettings'} -> stored ONLY via joplin.settings.setValue('trailBuffer')
+//   FLUSH #2 (t=90 s)  {type:'flushToSettings'} -> APPENDED to the same setting (settings write #2)
+//   FLUSH #3 (t=135 s) {type:'flushToNote'}     -> the ONE known-lethal joplin.data.put of the whole
+//                                                   settings buffer + the tail carried in the message
+//
+// So an on-device run reads: editor survives both settings writes (heartbeats continue past t=90 s) but
+// dies at the note write (~t=135 s) => settings.setValue is SAFE, note-write law re-confirmed. If instead
+// the editor dies at ~t=45 s, settings.setValue is ALSO lethal.
+//
+// The ONLY note-writes this build performs while an editor could be open are the ONE at t=135 s (flush #3)
+// and any STARTUP RECOVERY write (which runs at plugin start, before any editor opens — the safe window).
+// The startup writes (create/reuse the results note; header + S0 env + 'SETTINGS PROBE READY') also happen
+// before any editor opens.
+//
+// TRAIL-LOSS SAFETY: if the user closes the editor before t=135 s, flush #3 never fires and whatever
+// flush #1/#2 pushed to 'trailBuffer' would be stranded. So at EVERY plugin start we recover any leftover
+// buffer to the results note under a distinct '----- STARTUP RECOVERY -----' label and clear it. The label
+// (NOTE FLUSH vs STARTUP RECOVERY) tells a reader whether flush #3 fired live (editor open at t=135 s) or
+// the editor had already been closed.
 
 import joplin from 'api';
-import { ContentScriptType } from 'api/types';
+import { ContentScriptType, SettingItemType, SettingStorage } from 'api/types';
 
-// NOTE: intentionally NO `import ... from 'harper.js'` and NO './slimBinaryInlined' anywhere. Keeping
-// this entry harper-free keeps the emitted bundle tiny (no inlined WASM); engine residency is already
-// ruled out, so v0.0.4 stays engine-free and focuses purely on the write-eviction hypothesis.
+// NOTE: intentionally NO `import ... from 'harper.js'` and NO './slimBinaryInlined' anywhere. Engine
+// residency was ruled out in v0.0.3/v0.0.4, so this stays engine-free and focuses purely on the
+// write-eviction question (now: note-write vs settings-write).
 
 const RESULTS_TITLE = 'Harper Mobile Spike Results';
 const SPIKE_FOLDER = 'Spike';
 const CONTENT_SCRIPT_ID = 'harperSpikeCm';
-const SPIKE_VERSION = '0.0.4';
+const SPIKE_VERSION = '0.0.5';
+// The internal (non-public) String setting the content script's flushes are staged into. The whole point
+// of v0.0.5 is that flush #1/#2 write HERE (settings) and only flush #3 writes to a note.
+const TRAIL_BUFFER_KEY = 'trailBuffer';
 
 // ---------------------------------------------------------------------------
 // Tiny instrumentation helpers (all guarded — every primitive here is non-standard on some runtime).
@@ -57,7 +68,7 @@ function short(stack: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
-// Results note: create (or reuse by EXACT title). All output is appended here.
+// Results note: create (or reuse by EXACT title). All NOTE output is appended here.
 // ---------------------------------------------------------------------------
 let resultsNoteId: string | null = null;
 
@@ -97,9 +108,9 @@ async function ensureResultsNote(): Promise<void> {
 }
 
 /**
- * Append a BATCH of lines to the results note with a SINGLE read-modify-write (one data.put). This is
- * the whole point of v0.0.4: a flush of N buffered lines must cost exactly ONE background write, so the
- * count of editor-evicting writes during a session is minimised (one per flush, not one per line).
+ * Append a BATCH of lines to the results note with a SINGLE read-modify-write (one data.put). This IS a
+ * note-write, so it is only ever called at startup (safe window) or by flush #3 (deliberately, the one
+ * lethal write). Never call it for flush #1/#2 — those go to settings.
  */
 async function appendLinesRaw(lines: string[]): Promise<void> {
 	if (!resultsNoteId || lines.length === 0) return;
@@ -116,28 +127,94 @@ async function appendLinesRaw(lines: string[]): Promise<void> {
 	}
 }
 
-// Serialize every write through one promise chain so two flushes arriving close together can't interleave
-// a read-modify-write and lose lines. Each caller still awaits its batch committed in order.
-let appendChain: Promise<void> = Promise.resolve();
+// ---------------------------------------------------------------------------
+// Serialize EVERY background mutation (note appends AND settings mutations) through one promise chain so
+// a flushToNote's read-buffer -> write-note -> clear-buffer sequence cannot interleave with a concurrent
+// flushToSettings and lose or double lines.
+// ---------------------------------------------------------------------------
+let opChain: Promise<void> = Promise.resolve();
+function serialize<T>(fn: () => Promise<T>): Promise<T> {
+	const run = opChain.then(fn);
+	opChain = run.then(
+		() => undefined,
+		() => undefined,
+	);
+	return run;
+}
+
+/** appendLines: serialized note-write. */
 function appendLines(lines: string[]): Promise<void> {
-	const next = appendChain.then(() => appendLinesRaw(lines));
-	appendChain = next.catch(() => {
-		/* keep the chain alive even if one write rejects */
+	return serialize(() => appendLinesRaw(lines));
+}
+
+// --- the 'trailBuffer' setting: a JSON array of already-formatted lines --------------------------------
+async function getBuffer(): Promise<string[]> {
+	try {
+		const raw = await joplin.settings.value(TRAIL_BUFFER_KEY);
+		if (typeof raw === 'string' && raw.trim() !== '') {
+			const arr = JSON.parse(raw);
+			if (Array.isArray(arr)) return arr.map((x) => String(x));
+		}
+	} catch {
+		/* corrupt/absent -> treat as empty */
+	}
+	return [];
+}
+async function setBuffer(arr: string[]): Promise<void> {
+	await joplin.settings.setValue(TRAIL_BUFFER_KEY, JSON.stringify(arr));
+}
+
+/**
+ * flushToSettings: store a batch into the 'trailBuffer' SETTING (settings write, NO data.put). This is
+ * the write whose safety we are measuring — if it evicts the editor, the on-device run dies here.
+ */
+function storeFlushToSettings(header: string, lines: string[]): Promise<void> {
+	return serialize(async () => {
+		const prev = await getBuffer();
+		await setBuffer([...prev, header, ...lines]);
 	});
-	return next;
+}
+
+/**
+ * flushToNote: the ONE deliberate note-write. Reads the whole settings buffer (flush #1 + #2), appends the
+ * tail carried in flush #3's message, writes it all to the results note under a NOTE FLUSH label, then
+ * CLEARS the buffer (it is now delivered — so the next startup recovery finds nothing).
+ */
+function writeBufferToNote(label: string, tailHeader: string, tail: string[]): Promise<void> {
+	return serialize(async () => {
+		const buffered = await getBuffer();
+		await appendLinesRaw([label, ...buffered, tailHeader, ...tail]);
+		await setBuffer([]);
+	});
+}
+
+/**
+ * Startup recovery: if a prior editor was closed before flush #3, its flush #1/#2 lines are stranded in
+ * 'trailBuffer'. Deliver them to the results note under a STARTUP RECOVERY label (distinct from NOTE
+ * FLUSH, so a reader can tell flush #3 never fired) and clear the buffer. Runs at plugin start, before any
+ * editor opens — the safe window.
+ */
+function recoverStrandedBuffer(): Promise<void> {
+	return serialize(async () => {
+		const buffered = await getBuffer();
+		if (buffered.length === 0) return;
+		const label =
+			`----- STARTUP RECOVERY (undelivered settings buffer from an editor closed before the ` +
+			`t=135s note flush) ${new Date().toISOString()} (${buffered.length} lines) -----`;
+		await appendLinesRaw([label, ...buffered]);
+		await setBuffer([]);
+	});
 }
 
 // ---------------------------------------------------------------------------
-// The no-engine SILENT probe: S0 env only, then 'SILENT READY', written as ONE batched put at startup
-// (before any editor is open). There is deliberately NO WASM stage, NO 'SPIKE COMPLETE', and — unlike
-// v0.0.3 — NO main-side heartbeat. The editor-survival signal now comes entirely from the content
-// script's two deferred flushes.
+// The no-engine SETTINGS-PROBE startup: S0 env, then 'SETTINGS PROBE READY', written as ONE batched put
+// at startup (before any editor is open). NO WASM stage, NO 'SPIKE COMPLETE', NO main-side heartbeat.
 // ---------------------------------------------------------------------------
 async function runProbe(): Promise<void> {
 	await ensureResultsNote();
 
 	const out: string[] = [];
-	out.push(`===== SPIKE RUN v${SPIKE_VERSION} (SILENT) ${new Date().toISOString()} =====`);
+	out.push(`===== SPIKE RUN v${SPIKE_VERSION} (SETTINGS PROBE) ${new Date().toISOString()} =====`);
 	out.push('S0 START env...');
 	try {
 		let versionInfo = 'n/a';
@@ -160,18 +237,17 @@ async function runProbe(): Promise<void> {
 		out.push(`S0 FAIL: ${short((error as Error).message)} | ${short((error as Error).stack)}`);
 	}
 
-	// No engine is loaded, and there is no main heartbeat. Announce silent readiness — the editor probe
-	// (S5, content script) now carries everything else and speaks only via its deferred flushes.
-	out.push('SILENT READY');
+	// No engine, no heartbeat. Announce settings-probe readiness — the editor probe (S5, content script)
+	// carries everything else and speaks only via its three deferred flushes.
+	out.push('SETTINGS PROBE READY');
 
 	// ONE batched write for the entire startup probe.
 	await appendLines(out);
 }
 
 // ---------------------------------------------------------------------------
-// Global error handlers — capture anything the try/catch net misses. These may fire in the background at
-// any time; a background error is worth recording regardless (it is not a during-editing "gratuitous"
-// write — it only fires on an actual fault).
+// Global error handlers — capture anything the try/catch net misses. A background error is worth recording
+// regardless (it only fires on an actual fault, not as a during-editing gratuitous write).
 // ---------------------------------------------------------------------------
 function installGlobalErrorHandlers(): void {
 	const g: unknown = typeof self !== 'undefined' ? self : typeof globalThis !== 'undefined' ? globalThis : null;
@@ -191,44 +267,81 @@ function installGlobalErrorHandlers(): void {
 	});
 }
 
+async function registerSpikeSettings(): Promise<void> {
+	// A NON-public internal String setting. Storage: File so the buffer survives a full app restart (needed
+	// for startup recovery) and mirrors how the real plugin persists ignore-state/dictionary. This is the
+	// exact API surface (settings.setValue on a File-backed string) the v1 design would use mid-edit.
+	await joplin.settings.registerSettings({
+		[TRAIL_BUFFER_KEY]: {
+			value: '',
+			type: SettingItemType.String,
+			public: false,
+			label: 'Harper spike trail buffer (internal)',
+			storage: SettingStorage.File,
+		},
+	});
+}
+
 joplin.plugins.register({
 	onStart: async () => {
 		installGlobalErrorHandlers();
 
-		// Register the S5 content script FIRST so it can load (and start buffering) as soon as an editor
-		// opens. It is SILENT until it flushes.
+		// Register the internal trailBuffer setting FIRST so getBuffer/setBuffer are usable.
+		await registerSpikeSettings();
+
+		// Register the S5 content script so it loads (and starts buffering) as soon as an editor opens. It
+		// is SILENT until it flushes: settings at t=45/90 s, note at t=135 s.
 		await joplin.contentScripts.register(
 			ContentScriptType.CodeMirrorPlugin,
 			CONTENT_SCRIPT_ID,
 			'./contentScript.js',
 		);
 		await joplin.contentScripts.onMessage(CONTENT_SCRIPT_ID, async (message: unknown) => {
-			const msg = message as { type?: string; id?: string; flush?: number; reason?: string; lines?: unknown } | null;
-			// The ONLY message the v0.0.4 content script sends: a batched flush of buffered lines. Append
-			// the whole batch with ONE data.put, prefaced by a flush header so the note shows flush
-			// boundaries. The per-line ISO timestamps were captured on the EDITOR side at record time.
-			if (msg && msg.type === 'flushTrail' && Array.isArray(msg.lines)) {
-				const flushNo = typeof msg.flush === 'number' ? msg.flush : '?';
-				const idStr = typeof msg.id === 'string' ? msg.id : '?';
-				const reason = typeof msg.reason === 'string' ? msg.reason : '';
+			const msg = message as
+				| { type?: string; id?: string; flush?: number; reason?: string; lines?: unknown }
+				| null;
+			if (!msg) return null;
+			const flushNo = typeof msg.flush === 'number' ? msg.flush : '?';
+			const idStr = typeof msg.id === 'string' ? msg.id : '?';
+			const reason = typeof msg.reason === 'string' ? msg.reason : '';
+			const lines: string[] = Array.isArray(msg.lines) ? (msg.lines as string[]) : [];
+
+			// FLUSH #1/#2: settings write ONLY. NO data.put. This is the write under test.
+			if (msg.type === 'flushToSettings') {
 				const header =
-					`----- FLUSH #${flushNo}[${idStr}] received ${new Date().toISOString()} ` +
-					`(${msg.lines.length} lines) ${reason} -----`;
-				await appendLines([header, ...(msg.lines as string[])]);
-				return { ok: true, flush: flushNo };
+					`----- SETTINGS FLUSH #${flushNo}[${idStr}] stored ${new Date().toISOString()} ` +
+					`(${lines.length} lines) ${reason} -----`;
+				await storeFlushToSettings(header, lines);
+				return { ok: true, storedToSettings: flushNo };
 			}
+
+			// FLUSH #3: the ONE deliberate, known-lethal note-write of the whole settings buffer + the tail.
+			if (msg.type === 'flushToNote') {
+				const label =
+					`----- NOTE FLUSH (expected to evict if editor still open) #${flushNo}[${idStr}] ` +
+					`${new Date().toISOString()} ${reason} -----`;
+				const tailHeader =
+					`----- (tail: ${lines.length} lines recorded 90-135s, carried in the flushToNote message) -----`;
+				await writeBufferToNote(label, tailHeader, lines);
+				return { ok: true, wroteNote: flushNo };
+			}
+
 			return null;
 		});
 
-		// Run the no-engine SILENT probe (S0 + SILENT READY in one batched write). Guarded end-to-end so a
-		// failure still leaves the note diagnosable. NOTE: no heartbeat is started — background writes
-		// during editing are exactly what we must avoid.
+		// Startup recovery BEFORE the probe write, so any stranded buffer from a prior closed editor is
+		// delivered first (and cleared) — runs at plugin start, before any editor opens.
+		try {
+			await recoverStrandedBuffer();
+		} catch (error) {
+			await appendLines([`RECOVERY FATAL: ${short((error as Error).message)} | ${short((error as Error).stack)}`]);
+		}
+
+		// Run the no-engine SETTINGS-PROBE (S0 + 'SETTINGS PROBE READY' in one batched write). No heartbeat.
 		try {
 			await runProbe();
 		} catch (error) {
-			await appendLines([
-				`PROBE FATAL: ${short((error as Error).message)} | ${short((error as Error).stack)}`,
-			]);
+			await appendLines([`PROBE FATAL: ${short((error as Error).message)} | ${short((error as Error).stack)}`]);
 		}
 	},
 });

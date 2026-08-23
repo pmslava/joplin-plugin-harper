@@ -7,9 +7,9 @@
 		"desktop",
 		"mobile"
 	],
-	"version": "0.0.4",
+	"version": "0.0.5",
 	"name": "Harper Mobile Spike",
-	"description": "Instrumented on-device spike testing the write-eviction hypothesis: an engine-free (no WASM) build whose content script is SILENT — it buffers its whole trail in memory and posts nothing until a single batched flush at t=45s (then t=90s), so the background performs no note-writes while an editor is open until that flush. Proves whether background data.put note-writes are what evict the mobile editor. Not for publication.",
+	"description": "Instrumented on-device spike measuring whether joplin.settings.setValue is safe during mobile editing. Engine-free (no WASM); the content script buffers its whole trail silently, then flushes it to a settings value at t=45s and t=90s (settings writes) and only at t=135s triggers the one known-lethal data.put note-write. If the editor survives both settings writes but dies at the note write, settings are proven safe for the mobile v1 design. Not for publication.",
 	"author": "pmslava",
 	"homepage_url": "https://github.com/pmslava/joplin-plugin-harper",
 	"repository_url": "https://github.com/pmslava/joplin-plugin-harper",
