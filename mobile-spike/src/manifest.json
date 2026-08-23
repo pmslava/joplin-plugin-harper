@@ -7,9 +7,9 @@
 		"desktop",
 		"mobile"
 	],
-	"version": "0.0.3",
+	"version": "0.0.4",
 	"name": "Harper Mobile Spike",
-	"description": "Instrumented on-device spike isolating engine residency: the default build removes harper.js entirely (no WASM) to test whether the Joplin mobile editor survives when the plugin WebView holds no engine. Writes staged results + heartbeats to a note. Not for publication.",
+	"description": "Instrumented on-device spike testing the write-eviction hypothesis: an engine-free (no WASM) build whose content script is SILENT — it buffers its whole trail in memory and posts nothing until a single batched flush at t=45s (then t=90s), so the background performs no note-writes while an editor is open until that flush. Proves whether background data.put note-writes are what evict the mobile editor. Not for publication.",
 	"author": "pmslava",
 	"homepage_url": "https://github.com/pmslava/joplin-plugin-harper",
 	"repository_url": "https://github.com/pmslava/joplin-plugin-harper",

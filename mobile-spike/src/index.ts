@@ -18,7 +18,7 @@ import { slimBinaryInlined } from 'harper.js/slimBinaryInlined';
 const RESULTS_TITLE = 'Harper Mobile Spike Results';
 const SPIKE_FOLDER = 'Spike';
 const CONTENT_SCRIPT_ID = 'harperSpikeCm';
-const SPIKE_VERSION = '0.0.3'; // engine variant of v0.0.3 (built only with SPIKE_VARIANT=engine)
+const SPIKE_VERSION = '0.0.4'; // engine variant of v0.0.4 (built only with SPIKE_VARIANT=engine)
 
 // ---------------------------------------------------------------------------
 // Tiny instrumentation helpers (all guarded — every primitive here is non-standard on some runtime).
@@ -111,14 +111,35 @@ async function appendLineRaw(line: string): Promise<void> {
 	}
 }
 
-// Serialize every append through one promise chain. S5 now emits MANY messages that can arrive
-// concurrently with the probe's own appends; without serialization two read-modify-write cycles could
-// interleave and lose a line. Each caller still `await`s and gets its line committed in order.
+// Serialize every append through one promise chain. The probe's own appends and the content script's
+// flush can arrive concurrently; without serialization two read-modify-write cycles could interleave and
+// lose a line. Each caller still `await`s and gets its line(s) committed in order.
 let appendChain: Promise<void> = Promise.resolve();
 function appendLine(line: string): Promise<void> {
 	const next = appendChain.then(() => appendLineRaw(line));
 	appendChain = next.catch(() => {
 		/* keep the chain alive even if one append rejects */
+	});
+	return next;
+}
+
+/** Append a BATCH of lines with a SINGLE read-modify-write (one data.put) — used for the flush. */
+async function appendLinesRaw(lines: string[]): Promise<void> {
+	if (!resultsNoteId || lines.length === 0) return;
+	try {
+		const note = await joplin.data.get(['notes', resultsNoteId], { fields: ['body'] });
+		const body: string = (note && note.body) || '';
+		const sep = body === '' || body.endsWith('\n') ? '' : '\n';
+		await joplin.data.put(['notes', resultsNoteId], null, { body: `${body}${sep}${lines.join('\n')}\n` });
+	} catch (error) {
+		// eslint-disable-next-line no-console
+		console.error(`[harper-spike] appendLines failed (${lines.length} lines):`, error);
+	}
+}
+function appendLines(lines: string[]): Promise<void> {
+	const next = appendChain.then(() => appendLinesRaw(lines));
+	appendChain = next.catch(() => {
+		/* keep the chain alive even if one write rejects */
 	});
 	return next;
 }
@@ -281,17 +302,19 @@ joplin.plugins.register({
 			'./contentScript.js',
 		);
 		await joplin.contentScripts.onMessage(CONTENT_SCRIPT_ID, async (message: unknown) => {
-			const msg = message as { type?: string; line?: string } | null;
-			// v0.0.2 staged report: forward the content script's line verbatim, prefixed with a timestamp
-			// so a crash between stages is placeable in time (the line already carries a per-load id).
-			if (msg && msg.type === 's5' && typeof msg.line === 'string') {
-				await appendLine(`[${new Date().toISOString()}] ${msg.line}`);
-				return { ok: true };
-			}
-			// Backward-compatible with the old single-line signal.
-			if (msg && msg.type === 's5log') {
-				await appendLine(`[${new Date().toISOString()}] S5 content script loaded in editor`);
-				return { ok: true };
+			const msg = message as { type?: string; id?: string; flush?: number; reason?: string; lines?: unknown } | null;
+			// v0.0.4 SILENT protocol (shared contentScript.ts): the content script buffers its trail and
+			// posts a single batched {type:'flushTrail'} at t=45 s (then t=90 s). Append each flush with ONE
+			// data.put; the per-line ISO timestamps were captured on the editor side at record time.
+			if (msg && msg.type === 'flushTrail' && Array.isArray(msg.lines)) {
+				const flushNo = typeof msg.flush === 'number' ? msg.flush : '?';
+				const idStr = typeof msg.id === 'string' ? msg.id : '?';
+				const reason = typeof msg.reason === 'string' ? msg.reason : '';
+				const header =
+					`----- FLUSH #${flushNo}[${idStr}] received ${new Date().toISOString()} ` +
+					`(${msg.lines.length} lines) ${reason} -----`;
+				await appendLines([header, ...(msg.lines as string[])]);
+				return { ok: true, flush: flushNo };
 			}
 			return null;
 		});

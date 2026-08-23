@@ -1,44 +1,30 @@
-// Harper Mobile Spike v0.0.3 — SELF-DIAGNOSING CM6 content script (S5, staged activation + heartbeat).
+// Harper Mobile Spike v0.0.4 — SILENT-MODE CM6 content script (S5, staged activation + heartbeat,
+// but ZERO postMessage traffic until a single batched flush).
 //
-// SHARED by both v0.0.3 variants (engine and no-engine) — this script never imports harper.js, so it
-// is byte-identical regardless of which main-process entry ships. v0.0.3 changes vs v0.0.2:
-//   - STAGE_GAP_MS tightened 3000 -> 2000 (stages land sooner; a crash between reports is still
-//     attributable to exactly one stage).
-//   - an EDITOR-SIDE HEARTBEAT: every 5 s for 2 minutes we post 'S5 HEARTBEAT[id] t=<n>s', so the
-//     results note time-stamps precisely WHEN the editor webview dies even BETWEEN stages (v0.0.2's
-//     device evidence showed the death happens during the idle wait, not inside a stage's action).
+// WHY THIS EXISTS (v0.0.4 pivot). v0.0.1/v0.0.2/v0.0.3 all reached the SAME wall on-device: the moment
+// the content script loads it posts its trail (S5 loaded + S5a x3) back to the plugin background, the
+// background appends those lines to the results note via joplin.data.put, and within ~1 s of that
+// batch of note-writes the mobile Markdown editor is evicted (keyboard drops, viewer returns) — BEFORE
+// S5b (+2 s) ever runs. The plugin background stayed healthy throughout (its heartbeats kept ticking).
+// The refined hypothesis is therefore NOT "our CM6 code is the killer" and NOT "engine residency" — it
+// is that the BACKGROUND data-API note-writes THEMSELVES (each `put` schedules a sync / emits a
+// note-change the mobile Note screen reacts to) tear down the open editor. Every editor open has been
+// self-evicting through its OWN load-time report messages.
 //
-// WHY THIS EXISTS. On the Android device the ENGINE side (S0-S4, WASM in the plugin background
-// WebView) succeeded completely, but the EDITOR side died: opening a note to edit "immediately closes
-// the keyboard and switches to the viewer", and the results note showed 'S5 content script loaded'
-// appended once per attempt. From the Joplin source (dev @ 94911a8):
-//   - @codemirror/lint / view / state ARE bundled into the mobile editor (they are statically imported
-//     into the shared @joplin/editor codeMirrorRequire whitelist), and since the old content script
-//     posted its 's5log' AFTER addExtension AND that line appeared, module resolution + addExtension
-//     already work on-device. So the killer is something the script does AFTER load.
-//   - A plain JS exception in the content script is NOT fatal: the mobile MarkdownEditor webview installs
-//     its own window.onerror / onunhandledrejection (MarkdownEditor.tsx:137-147) that just postMessage →
-//     logs (onMessage :165-168). The ONLY automatic teardown that drops the keyboard and reloads the
-//     content script is a RENDERER-PROCESS crash → ExtendedWebView.refreshWebViewAfterCrash
-//     (index.tsx:92-100,144-145), which remounts the editor WebView. That reload is the user-visible
-//     "keyboard closes / back to viewer" and the repeated 'S5 loaded' lines.
+// v0.0.4 ISOLATES THAT by making the content script ABSOLUTELY SILENT until one deferred flush:
+//   - It does the SAME staged activation (S5a require -> S5b no-op ext -> S5c linter(zero) ->
+//     S5d linter emits spiketest+markClass -> S5e CSS -> S5f tap card, 2 s apart) and the SAME 5 s
+//     editor heartbeat, but every line is BUFFERED IN MEMORY — there is NO context.postMessage during
+//     any of it. So for the first 45 s the plugin background performs NO note-writes at all.
+//   - At t=45 s it posts ONE message {type:'flushTrail', lines:[...]} carrying the entire buffered
+//     trail; the background writes it with a SINGLE data.put. If the editor is evicted AT that first
+//     write, we will see the trail arrive once and then nothing — proving the WRITE is the killer.
+//   - It KEEPS buffering (heartbeats continue) and flushes AGAIN at t=90 s. A second flush arriving
+//     with heartbeats spanning 45–90 s proves the first flush's write did NOT evict the editor (so the
+//     theory needs refinement); a missing second flush proves it did.
 //
-// STRATEGY. Instead of doing everything at once, we activate the old content script's machinery in TIMED
-// SUB-STAGES (~3 s apart), each individually try/caught and reported to the results note via
-// context.postMessage (the plugin main process forwards it, prefixing a timestamp). If a stage's report
-// never arrives — or an error handler fires — the note's last S5x line fingers the killer.
-//   S5a  each @codemirror module resolved (view / lint / state), reported individually
-//   S5b  a no-op ViewPlugin added via addExtension            (proves addExtension alone is safe)
-//   S5c  the stock linter() added, source returns ZERO diagnostics (proves lint plumbing alone is safe)
-//   S5d  the linter source starts emitting the 'spiketest' diagnostic + markClass (proves decorations)
-//   S5e  the squiggle CSS injected                            (proves style injection)
-//   S5f  the mousedown + showTooltip tap card armed           (proves the card machinery)
-// FIRST THING (before any of the above) we install ADDITIVE global error handlers in the editor webview
-// — addEventListener, NOT window.onerror=, so we do not clobber Joplin's own handlers — reporting
-// 'S5 EDITOR ERROR: <msg> | <stack>' so a caught throw still yields a stack.
-//
-// Every report line carries a per-LOAD random 4-char id (e.g. 'S5a[k3f9] ...') so interleaved loads
-// (mobile reloads the content script per editor open) are distinguishable in the note.
+// Every line carries the per-LOAD 4-char id and an ISO timestamp captured AT RECORD TIME (not flush
+// time), so the buffered trail preserves the real on-editor timing even though it is delivered late.
 
 import type { EditorView as EditorViewT, Tooltip as TooltipT } from '@codemirror/view';
 
@@ -64,12 +50,16 @@ interface CodeMirrorControl {
 
 const SPIKE_WORD = 'spiketest';
 const STYLE_ELEMENT_ID = 'harper-spike-styles';
-const STAGE_GAP_MS = 2000; // ~2 s between stages: a crash between reports is attributable to one stage.
+const STAGE_GAP_MS = 2000; // ~2 s between stages (unchanged from v0.0.3 — same staged timeline).
 
-// Editor-side heartbeat: post 'S5 HEARTBEAT[id] t=<n>s' every 5 s for 2 minutes so the note pins the
-// exact time the editor webview dies, even during the idle waits between staged actions.
+// Editor-side heartbeat: record 'S5 HEARTBEAT[id] t=<n>s' every 5 s. Duration spans BOTH flushes with
+// margin so the t=90 s flush carries several heartbeats from the 45–90 s window (survival evidence).
 const HEARTBEAT_INTERVAL_MS = 5000;
-const HEARTBEAT_DURATION_MS = 2 * 60_000;
+const HEARTBEAT_DURATION_MS = 95_000;
+
+// The two deferred, batched flushes. NOTHING is posted before FIRST_FLUSH_MS.
+const FIRST_FLUSH_MS = 45_000;
+const SECOND_FLUSH_MS = 90_000;
 
 /** 4-char base36 id, distinguishes interleaved content-script loads (mobile reloads it per editor open). */
 function rid(): string {
@@ -82,76 +72,93 @@ function short(v: unknown): string {
 	return s.slice(0, 300).replace(/\s+/g, ' ').trim();
 }
 
-/**
- * FIRST THING: additive error handlers in the EDITOR webview. Guarded so only the first content-script
- * load per webview installs them (a renderer crash-reload creates a fresh window and installs anew).
- */
-function installEditorErrorHandlers(post: (line: string) => void, id: string): void {
-	const w = (typeof window !== 'undefined' ? window : typeof self !== 'undefined' ? self : null) as
-		| (Window & { __harperSpikeErr?: boolean })
-		| null;
-	if (!w || typeof w.addEventListener !== 'function') return;
-	if (w.__harperSpikeErr) return;
-	w.__harperSpikeErr = true;
-	w.addEventListener('error', (e: unknown) => {
-		const ev = e as { message?: string; error?: { message?: string; stack?: unknown }; filename?: string; lineno?: number };
-		const msg = ev.message ?? ev.error?.message ?? String(e);
-		post(`S5 EDITOR ERROR[${id}]: ${short(msg)} @ ${ev.filename ?? '?'}:${ev.lineno ?? '?'} | ${short(ev.error?.stack)}`);
-	});
-	w.addEventListener('unhandledrejection', (e: unknown) => {
-		const reason = (e as { reason?: unknown })?.reason;
-		const msg = reason instanceof Error ? reason.message : String(reason);
-		const stack = reason instanceof Error ? reason.stack : '';
-		post(`S5 EDITOR ERROR[${id}] (unhandledrejection): ${short(msg)} | ${short(stack)}`);
-	});
-}
-
 export default (context: ContentScriptContext) => {
-	const post = (line: string): void => {
-		try {
-			void context.postMessage({ type: 's5', line });
-		} catch {
-			/* the reporting channel itself may be gone mid-teardown */
-		}
-	};
-
 	return {
 		plugin: (editorControl: CodeMirrorControl) => {
 			const id = rid();
 
-			// (0) Error handlers BEFORE anything else touches CodeMirror.
-			installEditorErrorHandlers(post, id);
-			post(`S5[${id}] content script loaded in editor`); // parity with the old single line
+			// --- SILENT trail buffer -------------------------------------------------------------------
+			// Every diagnostic line lands here with an ISO timestamp captured NOW (record time), never
+			// sent immediately. `flushedUpTo` marks how much has already been shipped so each flush sends
+			// only the newly-buffered lines.
+			const trail: string[] = [];
+			let flushedUpTo = 0;
+			let flushCount = 0;
+			const record = (line: string): void => {
+				trail.push(`[${new Date().toISOString()}] ${line}`);
+			};
 
-			// (0b) Editor-side heartbeat: independent of the staged timeline, it keeps posting until the
-			// editor webview is torn down. The last heartbeat's t=<n>s pins the death time; a gap in the
-			// heartbeat sequence between two stages localises the crash to that idle interval.
+			// The ONLY code that ever calls context.postMessage. Ships the lines buffered since the last
+			// flush as a single {type:'flushTrail'} message; the background writes them with ONE data.put.
+			const flush = (reason: string): void => {
+				flushCount += 1;
+				const lines = trail.slice(flushedUpTo);
+				flushedUpTo = trail.length;
+				try {
+					void context.postMessage({ type: 'flushTrail', id, flush: flushCount, reason, lines });
+				} catch {
+					/* the reporting channel itself may be gone mid-teardown */
+				}
+			};
+
+			// (0) Additive error handlers BEFORE anything else touches CodeMirror. They RECORD (buffer) —
+			// they must not post, or the editor could be evicted by an error-triggered write before the
+			// deferred flush. Guarded so only the first content-script load per webview installs them.
+			(function installEditorErrorHandlers(): void {
+				const w = (typeof window !== 'undefined' ? window : typeof self !== 'undefined' ? self : null) as
+					| (Window & { __harperSpikeErr?: boolean })
+					| null;
+				if (!w || typeof w.addEventListener !== 'function') return;
+				if (w.__harperSpikeErr) return;
+				w.__harperSpikeErr = true;
+				w.addEventListener('error', (e: unknown) => {
+					const ev = e as { message?: string; error?: { message?: string; stack?: unknown }; filename?: string; lineno?: number };
+					const msg = ev.message ?? ev.error?.message ?? String(e);
+					record(`S5 EDITOR ERROR[${id}]: ${short(msg)} @ ${ev.filename ?? '?'}:${ev.lineno ?? '?'} | ${short(ev.error?.stack)}`);
+				});
+				w.addEventListener('unhandledrejection', (e: unknown) => {
+					const reason = (e as { reason?: unknown })?.reason;
+					const msg = reason instanceof Error ? reason.message : String(reason);
+					const stack = reason instanceof Error ? reason.stack : '';
+					record(`S5 EDITOR ERROR[${id}] (unhandledrejection): ${short(msg)} | ${short(stack)}`);
+				});
+			})();
+
+			record(`S5[${id}] content script loaded in editor (SILENT MODE — buffering, no postMessage yet)`);
+
+			// (0b) Editor-side heartbeat: buffered, not posted. Its last recorded t=<n>s pins the death
+			// time within a flush; a gap between two stages localises the crash to that idle interval.
 			const heartbeatStart = Date.now();
 			const heartbeatTimer = setInterval(() => {
 				const t = Math.round((Date.now() - heartbeatStart) / 1000);
-				post(`S5 HEARTBEAT[${id}] t=${t}s`);
+				record(`S5 HEARTBEAT[${id}] t=${t}s`);
 				if (Date.now() - heartbeatStart >= HEARTBEAT_DURATION_MS) clearInterval(heartbeatTimer);
 			}, HEARTBEAT_INTERVAL_MS);
 
+			// (0c) Schedule the two deferred flushes. These are the ONLY postMessage calls in the whole
+			// content script. Everything above/below merely records into `trail`.
+			setTimeout(() => flush('t=45s scheduled (first flush — entire buffered trail)'), FIRST_FLUSH_MS);
+			setTimeout(() => flush('t=90s scheduled (second flush — survival proof past first write)'), SECOND_FLUSH_MS);
+
 			if (!editorControl.cm6) {
-				post(`S5[${id}] no cm6 on editorControl — not a CM6 editor, bailing`);
+				record(`S5[${id}] no cm6 on editorControl — not a CM6 editor, bailing`);
 				return;
 			}
 			const view = editorControl.editor ?? null;
 
-			// --- S5a: module resolution, reported one by one ---------------------------------------
+			// --- S5a: module resolution, recorded one by one -------------------------------------------
 			// The namespace imports above already ran require('@codemirror/...') at module-eval; here we
-			// confirm each resolved to a usable object and report individually. (If a require had thrown,
+			// confirm each resolved to a usable object and record individually. (If a require had thrown,
 			// the whole script would have failed to load and NO S5 line would appear — itself diagnostic.)
 			try {
 				const okView = typeof (viewMod as { EditorView?: unknown }).EditorView === 'function';
 				const okLint = typeof (lintMod as { linter?: unknown }).linter === 'function';
 				const okState = typeof (stateMod as { StateField?: unknown }).StateField === 'function';
-				post(`S5a[${id}] require @codemirror/view ${okView ? 'ok' : 'FAIL'}`);
-				post(`S5a[${id}] require @codemirror/lint ${okLint ? 'ok' : 'FAIL'}`);
-				post(`S5a[${id}] require @codemirror/state ${okState ? 'ok' : 'FAIL'}`);
+				record(`S5a[${id}] require @codemirror/view ${okView ? 'ok' : 'FAIL'}`);
+				record(`S5a[${id}] require @codemirror/lint ${okLint ? 'ok' : 'FAIL'}`);
+				record(`S5a[${id}] require @codemirror/state ${okState ? 'ok' : 'FAIL'}`);
 			} catch (e) {
-				post(`S5a[${id}] FAIL ${short(e)}`);
+				record(`S5a[${id}] FAIL ${short(e)}`);
 			}
 
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic CM6 surfaces
@@ -197,7 +204,7 @@ export default (context: ContentScriptContext) => {
 				return out;
 			};
 
-			// --- click-to-open card (thin showTooltip StateField), armed only at S5f ----------------
+			// --- click-to-open card (thin showTooltip StateField), armed only at S5f --------------------
 			const setClickCard = StateEffect.define();
 			const clickCardField = StateField.define({
 				create: () => null,
@@ -269,7 +276,7 @@ export default (context: ContentScriptContext) => {
 				} as unknown as TooltipT;
 			}
 
-			// --- the staged timeline ----------------------------------------------------------------
+			// --- the staged timeline (identical actions to v0.0.3; only the reporting is now buffered) ---
 			const stages: Array<{ name: string; desc: string; run: () => void }> = [
 				{
 					name: 'S5b',
@@ -340,21 +347,21 @@ export default (context: ContentScriptContext) => {
 			let i = 0;
 			const runNext = (): void => {
 				if (i >= stages.length) {
-					post(`S5 DONE[${id}] all stages reported`);
+					record(`S5 DONE[${id}] all stages recorded`);
 					return;
 				}
 				const stage = stages[i++];
-				post(`${stage.name}[${id}] START ${stage.desc}`);
+				record(`${stage.name}[${id}] START ${stage.desc}`);
 				try {
 					stage.run();
-					post(`${stage.name}[${id}] OK`);
+					record(`${stage.name}[${id}] OK`);
 				} catch (e) {
-					post(`${stage.name}[${id}] FAIL ${short(e)}`);
+					record(`${stage.name}[${id}] FAIL ${short(e)}`);
 				}
 				setTimeout(runNext, STAGE_GAP_MS);
 			};
 
-			// Kick the chain after one beat so the S5a lines land before S5b starts.
+			// Kick the chain after one beat so the S5a lines are buffered before S5b starts.
 			setTimeout(runNext, STAGE_GAP_MS);
 		},
 	};
