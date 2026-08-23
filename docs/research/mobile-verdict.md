@@ -18,17 +18,20 @@ background in the other `mobile-*.md` docs in this directory.
 ## The one platform rule (the entire "bug", fully diagnosed)
 
 **A plugin background `joplin.data.put` note-write while the mobile editor is open evicts
-the editor.** Chain (file:line in Joplin dev @ 94911a8, see v0.0.4 report):
-`NOTE_UPDATE_ONE` → BaseApplication middleware schedules a **1 s partial sync**
-(`BaseApplication.ts:491-493`, `registry.ts:72-78`) → sync `UpdateLocal`s the *open* note
-("remote is more recent than local", `Synchronizer.ts:1018-1027`) → sole dispatcher of
-`EDITOR_NOTE_NEEDS_RELOAD` (`Synchronizer.ts:1115-1121`) → `Note.tsx:709-721`
-`Keyboard.dismiss()` + refreshKey rotation → editor WebView remount.
-
-Empirical proof (v0.0.4 silent probe): 45 s of zero writes = perfectly stable editor;
-the single flush write at t=45 s evicted the editor within seconds — in both sessions;
-flush #2 (t=90 s) never arrived. v0.0.1–v0.0.3 died instantly only because they wrote
-their own arrival messages on every editor open.
+the editor — via a LOCAL mechanism, sync-independent.** Empirical law, fully characterized
+on device (v0.0.4 silent probe + user controls):
+- 45 s of zero writes = perfectly stable editor; the single flush write at t=45 s evicted
+  the editor within seconds — both sessions; flush #2 (t=90 s) never arrived.
+  v0.0.1–v0.0.3 died instantly only because they wrote their own arrival messages on
+  every editor open.
+- User controls: own typing + routine sync during editing → no eviction (5 min stable);
+  remote changes to OTHER notes syncing in mid-edit → no eviction; **airplane mode
+  (sync attempts fail, nothing downloadable) → eviction identical.**
+The earlier sync-mediated explanation (partial sync → UpdateLocal of the open note →
+`EDITOR_NOTE_NEEDS_RELOAD`, diagnosed against the `dev` branch) is REFUTED by the
+airplane-mode control — that chain exists in source but is not what fires here. The true
+local dispatch path (in the 3.7.2 code the device actually runs) is still unidentified;
+the design rule below does not depend on identifying it.
 
 ## Port design consequences
 
