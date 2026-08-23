@@ -99,14 +99,11 @@ Once the plugin is listed: in Joplin desktop, go to **Tools → Options → Plug
 
 ## Requirements and limits
 
-- **Joplin desktop, version 3.1 or newer.** The plugin uses Joplin's CodeMirror 6 editor
-  integration, which requires 3.1+.
+- **Joplin 3.1 or newer on desktop, 3.3 or newer on mobile.** The plugin uses Joplin's CodeMirror 6 editor integration, which is what sets both minimums.
 - **Markdown editor only.** Harper checks the Markdown (CodeMirror) editor. It does **not** work in
   the Rich Text (WYSIWYG) editor, which offers no hook for this kind of decoration.
-- **Desktop only.** There is no mobile build.
-- **About 16 MB.** The plugin bundles Harper's WebAssembly engine so it can run offline, which makes
-  the `.jpl` roughly 16 MB — larger than a typical plugin, but that is the whole checker, downloaded
-  once.
+- **Desktop and Android.** The same plugin runs on Joplin desktop and on Joplin for Android. Plugin support on Joplin mobile is still Beta, so the phone side is newer and less proven than the desktop side. Only Android has been tested. There is no external dictionary file on mobile, since the plugin has no filesystem access there.
+- **About 21 MB.** The plugin bundles Harper's WebAssembly engine so it can run offline, which makes the `.jpl` roughly 21 MB. That is large for a plugin, but it is the whole checker, downloaded once.
 - **Startup warm-up.** The first check after you open a note takes a second or two while the engine
   loads and warms up. After that, re-checking a typical note is fast — on the order of ~50 ms for a
   few kilobytes of text.

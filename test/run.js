@@ -992,7 +992,8 @@ async function main() {
 					return (file, data, opts) => {
 						const result = target.writeFileSync(file, data, opts);
 						if (sabotage && String(file).endsWith('.harper-tmp')) {
-							const real = String(file).slice(0, -'.harper-tmp'.length);
+							// The temp file is a DOT-PREFIXED sibling: "<dir>/.<basename>.harper-tmp".
+							const real = path.join(path.dirname(String(file)), path.basename(String(file)).slice(1, -'.harper-tmp'.length));
 							target.appendFileSync(real, 'Gammarc\n');
 							const future = new Date(Date.now() + 4000);
 							target.utimesSync(real, future, future);
@@ -1036,7 +1037,12 @@ async function main() {
 				'Alpharc\nBetarc\nGammarc\n',
 				'the concurrent write survived intact — our stale rewrite did NOT land',
 			);
-			assert.ok(!fs.existsSync(`${raceFile}.harper-tmp`), 'the abandoned temp file was cleaned up');
+			const raceTmp = path.join(path.dirname(raceFile), `.${path.basename(raceFile)}.harper-tmp`);
+			assert.ok(!fs.existsSync(raceTmp), 'the abandoned temp file was cleaned up');
+			assert.ok(
+				!fs.readdirSync(raceDataDir).some((f) => f.endsWith('.harper-tmp') && !f.startsWith('.')),
+				'the temp file is dot-prefixed, so rclone-style sync is less likely to pick it up mid-write',
+			);
 			assert.deepStrictEqual(
 				JSON.parse(rstate.settings.syncBase),
 				['Alpharc', 'Betarc'],
@@ -1058,6 +1064,205 @@ async function main() {
 			assert.ok(noteHasIt, 'the raced-in file word reached the note');
 			assert.ok(!rstate.notes.rnote.body.includes('Betarc'), 'the note stays free of the deleted word');
 			assert.deepStrictEqual(JSON.parse(rstate.settings.syncBase), ['Alpharc', 'Gammarc']);
+		});
+	}
+
+	// =========================================================================
+	// v1.3.0 ABSENT-SIDE DATA LOSS — the presence gate on the commit (regression suite).
+	// =========================================================================
+	// An absent side infers no deletions, which keeps ONE pass safe. It does not keep TWO passes safe:
+	// if the base is still advanced on a pass where a configured side was missing, that side comes back
+	// holding older content and the other side's additions read as deletions on it — and are destroyed,
+	// silently and permanently, then synced everywhere. The commit therefore also requires every
+	// configured side to have been PRESENT. These three sequences are the exact ones that lost words
+	// before that gate existed; each ends with "nothing was wiped and the sides converge".
+	{
+		// ---- H1: the FILE goes absent (rclone moves it aside), then returns with stale content ----
+		const h1Dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-absent-file-'));
+		const h1File = path.join(h1Dir, 'dict.txt');
+		fs.writeFileSync(h1File, 'Alphaqx\n', 'utf8');
+		const h1state = await run({
+			dataDir: h1Dir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryPath: h1File, dictionaryNoteId: 'h1note' },
+			notes: { h1note: { id: 'h1note', body: '# h\n\nAlphaqx\n', updated_time: 100 } },
+		});
+		const h1h = h1state.contentScriptMessageHandlers['harperCm'];
+		const h1poll = () => h1state.intervals.find((i) => i.ms === 60000 && !i.cleared).fn();
+		const h1base = () => JSON.parse(h1state.settings.syncBase || 'null');
+		const h1spell = async (t) =>
+			(await h1h({ type: 'lint', text: t })).filter((l) => l.kind === 'Spelling').map((l) => l.problemText);
+
+		await test('absent file: a note-side add is served to the engine but does NOT advance the base', async () => {
+			assert.ok(await waitFor(() => Array.isArray(h1base())), 'precondition: converged with a base');
+			assert.deepStrictEqual(h1base(), ['Alphaqx'], 'precondition: base = the agreed word');
+			// rclone moves the file aside while another device adds a word to the note.
+			fs.renameSync(h1File, `${h1File}.moved`);
+			h1state.notes.h1note.body = '# h\n\nAlphaqx\nCharlieqx\n';
+			h1state.notes.h1note.updated_time += 100;
+			h1poll();
+			await waitFor(() => false, 300);
+			assert.deepStrictEqual(
+				await h1spell('Charlieqx alone.'),
+				[],
+				'the engine accepts the new word straight away — an absent side still serves additively',
+			);
+			assert.deepStrictEqual(
+				h1base(),
+				['Alphaqx'],
+				'the base did NOT absorb a word the absent file has never seen',
+			);
+		});
+
+		await test('absent file: when it returns stale, the note-side word SURVIVES and is pushed into the file', async () => {
+			fs.renameSync(`${h1File}.moved`, h1File);
+			const future = new Date(Date.now() + 3000);
+			fs.utimesSync(h1File, future, future);
+			h1poll();
+			const landed = await waitFor(() => fs.readFileSync(h1File, 'utf8').includes('Charlieqx'));
+			assert.ok(landed, 'the returning file receives the word it missed');
+			assert.ok(h1state.notes.h1note.body.includes('Charlieqx'), 'the note kept it — nothing was wiped');
+			assert.deepStrictEqual(await h1spell('Charlieqx alone.'), [], 'and the engine still accepts it');
+			assert.deepStrictEqual(h1base(), ['Alphaqx', 'Charlieqx'], 'only now does the base advance');
+		});
+
+		// ---- H1b: the NOTE goes absent (deleted / not yet synced), then returns with stale content ----
+		const h1bDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-absent-note-'));
+		const h1bFile = path.join(h1bDir, 'dict.txt');
+		fs.writeFileSync(h1bFile, 'Alphaqx\n', 'utf8');
+		const h1bstate = await run({
+			dataDir: h1bDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryPath: h1bFile, dictionaryNoteId: 'h1bnote' },
+			notes: { h1bnote: { id: 'h1bnote', body: '# h\n\nAlphaqx\n', updated_time: 100 } },
+		});
+		const h1bpoll = () => h1bstate.intervals.find((i) => i.ms === 60000 && !i.cleared).fn();
+		const h1bbase = () => JSON.parse(h1bstate.settings.syncBase || 'null');
+		let h1bSavedNote = null;
+
+		await test('absent note: a file-side add does NOT advance the base while the note is unreadable', async () => {
+			assert.ok(await waitFor(() => Array.isArray(h1bbase())), 'precondition: converged with a base');
+			// The note becomes unreadable (deleted on another device, or not yet synced here) while Zed
+			// adds a word to the external file.
+			h1bSavedNote = h1bstate.notes.h1bnote;
+			delete h1bstate.notes.h1bnote;
+			fs.writeFileSync(h1bFile, 'Alphaqx\nDeltaqx\n', 'utf8');
+			const future = new Date(Date.now() + 3000);
+			fs.utimesSync(h1bFile, future, future);
+			h1bpoll();
+			await waitFor(() => false, 300);
+			assert.deepStrictEqual(h1bbase(), ['Alphaqx'], 'the base stayed put with the note side missing');
+		});
+
+		await test('absent note: when it returns stale, the file-side word SURVIVES and reaches the note', async () => {
+			h1bstate.notes.h1bnote = h1bSavedNote;
+			h1bstate.notes.h1bnote.updated_time += 100;
+			h1bpoll();
+			const reached = await waitFor(() => h1bstate.notes.h1bnote.body.includes('Deltaqx'));
+			assert.ok(reached, 'the returning note receives the word it missed');
+			assert.ok(
+				fs.readFileSync(h1bFile, 'utf8').includes('Deltaqx'),
+				'the file kept it — the stale note did not read it as a deletion',
+			);
+			assert.deepStrictEqual(h1bbase(), ['Alphaqx', 'Deltaqx'], 'only now does the base advance');
+		});
+
+		// ---- H1c: FIRST RUN with the file absent (Joplin launched before the drive was mounted) ----
+		// The one that needs no race at all, and the worst: the first run would adopt the note as the
+		// base, commit it, and then delete every note-only word the moment the drive appeared.
+		const h1cDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-absent-first-'));
+		const h1cFile = path.join(h1cDir, 'dict.txt'); // deliberately NOT created yet
+		const h1cstate = await run({
+			dataDir: h1cDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryPath: h1cFile, dictionaryNoteId: 'h1cnote' },
+			notes: { h1cnote: { id: 'h1cnote', body: '# h\n\nAlphaqx\nBetaqx\nGammaqx\n', updated_time: 100 } },
+		});
+		const h1ch = h1cstate.contentScriptMessageHandlers['harperCm'];
+		const h1cpoll = () => h1cstate.intervals.find((i) => i.ms === 60000 && !i.cleared).fn();
+		const h1cbase = () => JSON.parse(h1cstate.settings.syncBase || 'null');
+		const h1cspell = async (t) =>
+			(await h1ch({ type: 'lint', text: t })).filter((l) => l.kind === 'Spelling').map((l) => l.problemText);
+
+		await test('first run with the drive unmounted: the note words load but NO base is recorded', async () => {
+			// Awaiting a lint awaits the engine warm-up, hence the whole startup reconcile.
+			assert.deepStrictEqual(
+				await h1cspell('Alphaqx Betaqx Gammaqx here.'),
+				[],
+				'all three note words are known to the engine even with no file side',
+			);
+			assert.strictEqual(h1cbase(), null, 'no base was committed: the configured file side was never seen');
+		});
+
+		await test('first run: when the drive mounts, NOTHING is wiped — all three words survive and converge', async () => {
+			fs.writeFileSync(h1cFile, 'Alphaqx\n', 'utf8'); // the drive appears, holding only its own word
+			h1cpoll();
+			const converged = await waitFor(() => fs.readFileSync(h1cFile, 'utf8').includes('Gammaqx'));
+			assert.ok(converged, 'the mounted file receives the note words');
+			assert.strictEqual(
+				fs.readFileSync(h1cFile, 'utf8'),
+				'Alphaqx\nBetaqx\nGammaqx\n',
+				'its own word is kept first, the note-only words are appended — no deletion inferred',
+			);
+			assert.ok(h1cstate.notes.h1cnote.body.includes('Betaqx'), 'the note kept Betaqx');
+			assert.ok(h1cstate.notes.h1cnote.body.includes('Gammaqx'), 'the note kept Gammaqx');
+			assert.deepStrictEqual(await h1cspell('Betaqx Gammaqx here.'), [], 'the engine still accepts both');
+			assert.deepStrictEqual(
+				h1cbase(),
+				['Alphaqx', 'Betaqx', 'Gammaqx'],
+				'the base is committed on the first pass that saw BOTH sides',
+			);
+		});
+	}
+
+	// =========================================================================
+	// v1.3.0 NO DUPLICATE LINES in the external file.
+	// =========================================================================
+	// The order-preserving rewrite keeps every line whose word is still wanted, so a duplicate line is
+	// permanent once it exists. Two ways one could appear, both closed here: add-to-dictionary
+	// appending a word the file already lists, and a duplicate the user (or another tool) left behind.
+	{
+		const dupDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-dup-'));
+		const dupFile = path.join(dupDir, 'dict.txt');
+		fs.writeFileSync(dupFile, '# c\nAlphadd\nBetadd\nAlphadd\n', 'utf8');
+		const dupstate = await run({
+			dataDir: dupDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryPath: dupFile, dictionaryNoteId: 'dupnote' },
+			notes: { dupnote: { id: 'dupnote', body: '# h\n\nAlphadd\nBetadd\n', updated_time: 100 } },
+		});
+		const duph = dupstate.contentScriptMessageHandlers['harperCm'];
+		const duppoll = () => dupstate.intervals.find((i) => i.ms === 60000 && !i.cleared).fn();
+
+		await test('no duplicates: add-to-dictionary of a word the file already lists appends NOTHING', async () => {
+			assert.ok(
+				await waitFor(() => Array.isArray(JSON.parse(dupstate.settings.syncBase || 'null'))),
+				'precondition: converged with a base',
+			);
+			const before = fs.readFileSync(dupFile, 'utf8');
+			await duph({ type: 'addWord', word: 'Betadd' });
+			assert.strictEqual(fs.readFileSync(dupFile, 'utf8'), before, 'the file is byte-identical: no second line');
+		});
+
+		await test('no duplicates: a rewrite collapses a repeated word to its FIRST line, order otherwise intact', async () => {
+			dupstate.notes.dupnote.body = '# h\n\nAlphadd\nBetadd\nMikedd\n'; // a new word forces a rewrite
+			dupstate.notes.dupnote.updated_time += 100;
+			duppoll();
+			const rewritten = await waitFor(() => fs.readFileSync(dupFile, 'utf8').includes('Mikedd'));
+			assert.ok(rewritten, 'the new word reached the file');
+			assert.strictEqual(
+				fs.readFileSync(dupFile, 'utf8'),
+				'# c\nAlphadd\nBetadd\nMikedd\n',
+				'the second "Alphadd" is gone; the comment, the first copy and the order all survive',
+			);
 		});
 	}
 

@@ -23,10 +23,15 @@
  * survives a concurrent deletion of the same word on the other side. Deletions therefore need
  * agreement-by-silence; additions need only one voice.
  *
- * ABSENT SIDES infer NO deletions. That is what makes an unreadable file (rclone mid-write, a
- * not-yet-synced note) safe: the side is passed as `null`, contributes nothing to `deleted`, and the
- * whole base survives. An *empty but readable* side is NOT absent — it is passed as `[]` and its
- * deletions are honoured, because emptying the dictionary note is a legitimate user action.
+ * ABSENT SIDES infer NO deletions: the side is passed as `null`, contributes nothing to `deleted`, and
+ * the whole base survives this pass. An *empty but readable* side is NOT absent — it is passed as `[]`
+ * and its deletions are honoured, because emptying the dictionary note is a legitimate user action.
+ *
+ * Absence is only half the safety story, and the half that lives here. This function has no idea
+ * whether the pass will be committed, and an absent side must ALSO stop the caller from advancing the
+ * base: otherwise the present side's additions land in a base the absent side never saw, and read as
+ * deletions when it returns. That gate is the caller's (`runReconcile`'s presence check); this
+ * function only guarantees that an absent side cannot delete anything *now*.
  *
  * FIRST RUN (no base persisted yet — every install upgrading from ≤1.2.0): the base is DEFINED as
  * the current union of all present sides plus pending, and deletion detection is SKIPPED entirely,

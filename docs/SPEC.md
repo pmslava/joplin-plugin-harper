@@ -1,7 +1,9 @@
 # joplin-plugin-harper — Specification
 
 Harper grammar checker integrated into Joplin desktop's Markdown editor.
-Plugin id: `io.github.pmslava.harper` · npm: `joplin-plugin-harper` · desktop only (mobile deferred).
+Plugin id: `io.github.pmslava.harper` · npm: `joplin-plugin-harper`.
+Desktop only when this spec was written; mobile (Android) shipped in v1.1.0, so "desktop only" below
+is historical — the platform decisions that changed are recorded in the dated update blocks.
 
 Research grounding: three reports (harper.js surface, Joplin plugin API, Cockpit scaffold blueprint),
 2026-08-21. Source-of-truth citations live in the reports; this file records the decisions.
@@ -34,6 +36,8 @@ Research grounding: three reports (harper.js surface, Joplin plugin API, Cockpit
   (so it syncs to Zed/harper-ls via the user's existing Nextcloud setup), else persists in plugin
   data. Verify harper-ls `dictionary.txt` line format compatibility before writing (Phase 1 item).
 - Ignored lints: `exportIgnoredLints()` hashes persisted in plugin data.
+
+**Updated in v1.3.0 — the dictionary is a three-way merge, not a union.** There are up to three word sources: the external file (desktop only), a synced Joplin dictionary note (both platforms, this is how the word list reaches the phone), and a pending buffer of add-to-dictionary words that have not been folded into a durable side yet. Up to v1.2.0 they were reconciled by UNION, which can only grow, so deleting a word from one side let the other side put it straight back. v1.3.0 reconciles them against a BASE instead: the word set this device last saw the sides agree on, persisted per device in a private setting (settings writes are the one write that is safe on both platforms at any time). A word the base remembers and a present side has dropped is a deletion and propagates everywhere; a word the base does not know is an addition. When the same word is deleted on one side and added on the other, the ADDITION wins - losing a word the user just asked for is worse than keeping one they meant to drop. A side that is absent this pass (unreadable file, note not yet synced) infers no deletions AND does not advance the base, so a drive that is briefly unreachable can never be read as "the user deleted everything". The external file keeps its own order: only the lines for deleted words are dropped, new words are appended at the end, and comments and blank lines stay where they were.
 
 ## Settings (v1)
 

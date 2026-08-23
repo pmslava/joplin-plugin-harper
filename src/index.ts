@@ -168,6 +168,19 @@ function expandTilde(p: string): string {
 	return p;
 }
 
+/**
+ * The temp path the atomic rewrite writes before renaming over `p`. It MUST be a sibling (rename is
+ * only atomic within a filesystem) and it is DOT-PREFIXED — the directory is typically rclone-synced,
+ * and sync tools ignore dotfiles far more often than they ignore an unknown suffix, so a mid-write
+ * temp file is less likely to be picked up and shipped to other devices.
+ */
+function tempSiblingPath(p: string): string {
+	const cut = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+	const dir = cut >= 0 ? p.slice(0, cut + 1) : '';
+	const base = cut >= 0 ? p.slice(cut + 1) : p;
+	return `${dir}.${base}.harper-tmp`;
+}
+
 function joinPath(dir: string, file: string): string {
 	try {
 		return __non_webpack_require__('path').join(dir, file);
@@ -226,9 +239,15 @@ interface FileSnapshot {
  * DESKTOP: read the external dictionary file, or return null when there is NO file side this pass
  * (mobile, no path configured, or the file is not readable right now).
  *
- * The null-vs-empty distinction is load-bearing for v1.3.0: an ABSENT side infers no deletions, so a
- * file that rclone has momentarily moved aside cannot wipe the dictionary, while a genuinely empty
- * (but readable) file correctly deletes everything the base remembered.
+ * The null-vs-empty distinction is load-bearing for v1.3.0: an ABSENT side infers no deletions, while
+ * a genuinely empty (but readable) file correctly deletes everything the base remembered.
+ *
+ * That protects a SINGLE pass only. Returning null stops this pass from reading the missing file as
+ * "the user deleted everything", but on its own it would not stop the damage across two passes: the
+ * base would still advance to absorb the other side's additions, and the file would look like it had
+ * deleted them the moment rclone put it back. What actually makes a momentarily-absent file unable to
+ * wipe the dictionary is the PRESENCE GATE on the commit in runReconcile — a pass that did not see a
+ * configured side does not advance the base at all.
  */
 function readExternalFile(): FileSnapshot | null {
 	if (isMobile()) return null;
@@ -495,8 +514,11 @@ async function pokeForceLint(): Promise<void> {
 //     an editor is open is simply not performed; the reconcile is idempotent, so the next trigger
 //     (selection change, poll, settings change) does it.
 //   * the file is rewritten in place, atomically, and only when its content actually changes.
-//   * `syncBase` is advanced ONLY when every side that needed writing was written. A partial pass
-//     leaves the base alone, so nothing is ever "forgotten" between two halves of a reconcile.
+//   * `syncBase` is advanced ONLY when every side that needed writing was written AND every
+//     configured side was actually PRESENT this pass. A partial pass leaves the base alone, so
+//     nothing is ever "forgotten" between two halves of a reconcile; an absent-side pass likewise
+//     leaves it alone, so the side that was missing cannot look like it deleted the other side's
+//     additions when it comes back. See the COMMIT block in runReconcile.
 //
 // Concurrent callers join the in-flight pass instead of racing it, and `lastEngineWords` keeps the
 // last good result so a failed pass leaves the engine's word set alone rather than emptying it.
@@ -563,6 +585,13 @@ async function runReconcile(reason: string): Promise<string[]> {
 		const base = await readSyncBase();
 		const merged = mergeDictionary({ base, note, file: file ? file.words : null, pending });
 
+		// PRESENCE GATE (v1.3.0 fix) — the other half of the commit condition, see the COMMIT block.
+		// A side is "present" when it is not configured at all (nothing to be absent) or it read back
+		// non-null this pass. On mobile there is no file side by construction, so it is never missing.
+		const noteSidePresent = !cfg.dictionaryNoteId || note !== null;
+		const fileSidePresent = isMobile() || !cfg.dictionaryPath || file !== null;
+		const allSidesPresent = noteSidePresent && fileSidePresent;
+
 		// --- NOTE side (L3-guarded; the plugin's only data.put) ---------------------------------
 		let noteWritten = true;
 		if (merged.noteChanged) {
@@ -587,8 +616,27 @@ async function runReconcile(reason: string): Promise<string[]> {
 		let fileWritten = true;
 		if (merged.fileChanged && file) fileWritten = rewriteExternalFile(file, merged.result);
 
-		// --- COMMIT: only when every side that needed writing actually got written --------------
-		if (noteWritten && fileWritten) {
+		// --- COMMIT: advance the base ONLY on a pass that saw the whole picture -----------------
+		//
+		// Two independent conditions, and BOTH are required:
+		//
+		//   (a) every side that needed writing actually got written — otherwise the base would move
+		//       past a change that never landed, and the retry would read it as a deletion;
+		//   (b) every CONFIGURED side was PRESENT this pass — this is the data-loss gate. An absent
+		//       side infers no deletions, but it also contributes nothing to the base, so committing
+		//       would fold the *present* side's additions into a base the absent side has never seen.
+		//       When it comes back with its older content, those additions read as deletions on that
+		//       side and are destroyed: word loss nobody asked for, synced to every device. It is not
+		//       an exotic race — "Joplin launched before the rclone/network drive was reachable" is
+		//       enough, and on a first run it would wipe every note-only word on mount.
+		//
+		// An uncommitted pass is still useful and still safe: the merge result is fed to the engine
+		// (additively, since no deletion can be inferred from a side that was not there), the pending
+		// buffer is kept rather than flushed, and the whole thing is recomputed next tick. It is a
+		// stable fixed point, not a write loop — with the base frozen, the same inputs keep producing
+		// the same result, so nothing is rewritten twice.
+		const committed = noteWritten && fileWritten && allSidesPresent;
+		if (committed) {
 			await writeSyncBase(merged.result);
 			if (pending.length) await joplin.settings.setValue('pendingWords', []);
 		}
@@ -597,7 +645,7 @@ async function runReconcile(reason: string): Promise<string[]> {
 			// eslint-disable-next-line no-console
 			console.info(
 				`[harper] dictionary reconcile (${reason}): +${merged.added.length} -${merged.deleted.length}` +
-					`${noteWritten && fileWritten ? '' : ' (partial — will retry)'}`,
+					`${committed ? '' : ' (partial — will retry)'}`,
 			);
 		}
 
@@ -633,12 +681,14 @@ async function reconcileAndApply(reason: string): Promise<void> {
  * MINIMAL DIFFS — the file is the user's own, edited by harper-ls/Zed and synced by rclone, so:
  *   * every surviving line is kept verbatim, in its original order (comments and blank lines too);
  *   * only the lines whose word is no longer in `target` are dropped;
+ *   * a word repeated on several lines collapses to its FIRST line (the file is a set of words);
  *   * genuinely new words are appended at the end, sorted, using the file's dominant line ending.
  *
  * RCLONE SAFETY — `snapshot` carries the mtime observed when the content was read. If the file has
  * changed since (someone else wrote it while we were merging) the rewrite is ABORTED and retried on
  * the next tick, so a concurrent writer's content is never clobbered by a stale computation. The
- * write itself is atomic: a sibling temp file in the same directory, then `rename`.
+ * write itself is atomic: a dot-prefixed sibling temp file in the same directory, fsync'd, then
+ * `rename`d over the original.
  *
  * Returns true when the file now matches `target` (written, or already identical), false when the
  * rewrite was skipped and must be retried.
@@ -647,7 +697,7 @@ function rewriteExternalFile(snapshot: FileSnapshot, target: string[]): boolean 
 	if (isMobile()) return false;
 	const fs = getFs();
 	const p = snapshot.path;
-	const tmp = `${p}.harper-tmp`;
+	const tmp = tempSiblingPath(p);
 	const keep = new Set(target);
 	const eol = snapshot.raw.includes('\r\n') ? '\r\n' : '\n';
 
@@ -662,8 +712,14 @@ function rewriteExternalFile(snapshot: FileSnapshot, target: string[]): boolean 
 	for (const line of lines) {
 		const word = line.replace(/\r$/, '').trim();
 		const isWordLine = word.length > 0 && !word.startsWith('# ');
-		if (isWordLine && !keep.has(word)) continue; // deleted elsewhere — drop this line
-		if (isWordLine) seen.add(word);
+		if (isWordLine) {
+			if (!keep.has(word)) continue; // deleted elsewhere — drop this line
+			// Exact duplicate of a word already kept: drop it and keep only the FIRST line. The file is
+			// a set of words, so a repeated line is noise; without this the rewrite would preserve it
+			// forever (both copies are in `keep`), making an accidental duplicate permanent.
+			if (seen.has(word)) continue;
+			seen.add(word);
+		}
 		kept.push(line); // comments, blank lines and surviving words stay byte-identical
 	}
 	const appended = target.filter((w) => !seen.has(w));
@@ -681,6 +737,20 @@ function rewriteExternalFile(snapshot: FileSnapshot, target: string[]): boolean 
 			return false;
 		}
 		fs.writeFileSync(tmp, content, 'utf8');
+		try {
+			// Flush the temp file to disk BEFORE the rename. rename() is atomic with respect to other
+			// readers, but not with respect to a crash: on several filesystems the metadata operation can
+			// hit the disk while the data behind it is still in the page cache, and the user would find
+			// their dictionary truncated to zero length. One fsync on the user's own small file is cheap.
+			const fd = fs.openSync(tmp, 'r+');
+			try {
+				fs.fsyncSync(fd);
+			} finally {
+				fs.closeSync(fd);
+			}
+		} catch {
+			/* best effort: an un-fsynced write is still correct, just less crash-durable */
+		}
 		try {
 			fs.chmodSync(tmp, before.mode & 0o777); // keep the user's permissions across the rename
 		} catch {
@@ -781,11 +851,22 @@ async function addWord(rawWord: string): Promise<void> {
 		const external = expandTilde(cfg.dictionaryPath);
 		if (external) {
 			try {
-				fs.appendFileSync(external, `${word}\n`);
+				// Never append a word the file already lists: the rewrite keeps every line whose word is
+				// still wanted, so a duplicate appended here would survive every future rewrite instead of
+				// being transient. An unreadable/absent file falls through to the append, which creates it.
+				let alreadyThere = false;
 				try {
-					lastExternalMtimeMs = fs.statSync(external).mtimeMs;
+					alreadyThere = parseWords(fs.readFileSync(external, 'utf8')).includes(word);
 				} catch {
-					/* ignore */
+					alreadyThere = false;
+				}
+				if (!alreadyThere) {
+					fs.appendFileSync(external, `${word}\n`);
+					try {
+						lastExternalMtimeMs = fs.statSync(external).mtimeMs;
+					} catch {
+						/* ignore */
+					}
 				}
 			} catch {
 				// eslint-disable-next-line no-console
