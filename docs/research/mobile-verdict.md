@@ -54,6 +54,19 @@ writes at t=45 s and t=90 s during active editing caused nothing; the deliberate
 4. This is arguably an upstream Joplin issue ("background plugin note-write evicts the
    mobile editor via sync") — `mobile-spike/` is a minimal repro if we file it.
 
+## Cold start (v1.1.1 + v0.0.6 probe, 2026-08-23)
+
+- v1.1.1 defers all startup I/O out of onStart (handler ~1 ms; budget-tested) and warms the
+  engine in the background at launch — user-assessed "a little faster... can use with this
+  speed" on device.
+- The remaining fixed cost is parsing the ~21 MB inlined-WASM bundle at app start. The
+  v0.0.6 device probe CLOSED the separate-.wasm alternative on Android: from the plugin
+  iframe, `XHR file://` fails (status=0, onerror) and `fetch file://` fails — the
+  null-origin sandbox cannot read installationDir files (desktop can: both return 200).
+  `indexedDB` exists by typeof but compiled-Module caching is not a viable path in modern
+  Chromium. Verdict: the inlined bundle is the Android floor unless Joplin core ever
+  exposes plugin assets over a fetchable scheme.
+
 ## Not blockers, for the record
 
 - No CSP anywhere in the mobile plugin path (WASM allowed — opposite of desktop's editor).
