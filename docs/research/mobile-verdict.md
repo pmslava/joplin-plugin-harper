@@ -27,11 +27,19 @@ on device (v0.0.4 silent probe + user controls):
 - User controls: own typing + routine sync during editing → no eviction (5 min stable);
   remote changes to OTHER notes syncing in mid-edit → no eviction; **airplane mode
   (sync attempts fail, nothing downloadable) → eviction identical.**
-The earlier sync-mediated explanation (partial sync → UpdateLocal of the open note →
-`EDITOR_NOTE_NEEDS_RELOAD`, diagnosed against the `dev` branch) is REFUTED by the
-airplane-mode control — that chain exists in source but is not what fires here. The true
-local dispatch path (in the 3.7.2 code the device actually runs) is still unidentified;
-the design rule below does not depend on identifying it.
+The earlier sync-mediated explanation (diagnosed against the `dev` branch) was refuted by
+the airplane-mode control. The TRUE path, identified in the 3.7.2 source the device runs
+(tag android-v3.7.2 @ a0bed69a7) and consistent with every observation: the data-API note
+PUT route dispatches `EDITOR_NOTE_NEEDS_RELOAD` **unconditionally** after `Note.save`
+(`packages/lib/services/rest/routes/notes.ts:553`), with no note id — so the reducer
+(`reducer.ts:1596`) bumps the reload for whatever note is OPEN, even when the plugin wrote
+a different note → `Note.tsx:705-711` → refreshKey remount. User edits and sync do not
+pass through that route, which is why only plugin writes evict.
+
+**Settings are SAFE — device-proven (v0.0.5, outcome A):** two `joplin.settings.setValue`
+writes at t=45 s and t=90 s during active editing caused nothing; the deliberate
+`data.put` at t=135 s evicted on schedule in the same session. Source agrees:
+`Setting.setValue` dispatches only `SETTING_UPDATE_ONE`, which no Note-screen prop watches.
 
 ## Port design consequences
 
