@@ -908,8 +908,55 @@ async function registerSettings(): Promise<void> {
 	await joplin.settings.registerSettings(defs);
 }
 
+// =============================================================================
+// COLD-START: background warm-up (v1.1.1).
+// =============================================================================
+// onStart must return FAST — it wires only the cheap registrations (see the onStart handler below).
+// Everything heavy is kicked off HERE, AFTER onStart returns, so it overlaps the user opening/reading a
+// note instead of blocking the plugin's onStart handler (device-measured cold start was ~7.7 s):
+//   1. ENGINE WARM-UP — build the LocalLinter + apply the dictionary/overrides/ignored-lints config
+//      (LocalLinter.setup() is ~1.5-2 s on mobile). Started immediately so the FIRST lint is served warm.
+//      A lint request that arrives before warm-up finishes just awaits the SAME in-flight linterPromise
+//      (getLinter is idempotent via its `if (!linterPromise)` guard) — never a rebuild, never an error;
+//      the underlines simply appear a moment later, warm.
+//   2. START FLUSH — persist any words buffered from a previous session to the dictionary note. Still
+//      L3-guarded (flushDictionaryNote no-ops while an editor is open) and serialized (flushInFlight).
+// Both are fire-and-forget and independently error-caught, so onStart is unblocked and neither task can
+// take the other (or the plugin) down. Guarded so a mobile double-mount cannot warm twice.
+let backgroundInitStarted = false;
+
+async function warmUpEngine(): Promise<void> {
+	try {
+		// getLinter() builds the linter AND applies configuration in one shared promise; concurrent
+		// callers (an early lint, a double-mount) await the same instance — no second buildLinter.
+		await getLinter();
+	} catch (error) {
+		// eslint-disable-next-line no-console
+		console.warn('[harper] background engine warm-up failed:', error);
+		return;
+	}
+	// Reconcile: if the dictionary words finished importing only now, poke any open editor to re-lint so
+	// late-arriving words clear their underlines. A no-op when no editor is open.
+	await pokeForceLint();
+}
+
+function startBackgroundInit(): void {
+	if (backgroundInitStarted) return; // idempotent — a mobile double-mount must not warm twice
+	backgroundInitStarted = true;
+	void warmUpEngine();
+	// flushDictionaryNote never rejects (it try/catches internally), so no extra .catch is needed.
+	void flushDictionaryNote('plugin-start');
+}
+
 joplin.plugins.register({
 	onStart: async () => {
+		// ---------------------------------------------------------------------------------------------
+		// EAGER — the cheap, fast registrations ONLY. Target: well under 500 ms of handler time, with
+		// ZERO engine build, ZERO joplin.data.get/put and ZERO fs reads. Anything heavier is deferred to
+		// startBackgroundInit() AFTER this handler returns (see the cold-start note above). The harness
+		// budget test asserts exactly this: onStart awaits none of that work.
+		// ---------------------------------------------------------------------------------------------
+
 		// Resolve platform FIRST — every branch below (settings registration, fs guards, flush
 		// discipline) keys off it, and it must be known before registerSettings runs.
 		await resolvePlatform();
@@ -975,11 +1022,18 @@ joplin.plugins.register({
 			// Older API without onNoteSelectionChange — the start flush + poll still persist words.
 		}
 
-		// Poll for out-of-band dictionary changes (desktop file via rclone; the note via sync).
+		// Poll for out-of-band dictionary changes (desktop file via rclone; the note via sync). Armed here
+		// (synchronously) so it is wired the instant onStart returns — arming a timer touches no engine,
+		// data or fs, and its first tick is 60 s out; the tick's own work stays deferred. (The test
+		// harness captures setInterval only for the synchronous span of onStart, so this must stay eager.)
 		setInterval(pollDictionaryTick, 60_000);
 
-		// START flush: before any editor mounts, persist any words left buffered from a previous session
-		// (e.g. added on mobile just before the app was closed). editorOpen is still false here.
-		await flushDictionaryNote('plugin-start');
+		// ---------------------------------------------------------------------------------------------
+		// BACKGROUND — kick off the engine warm-up + initial dictionary import + start flush, all
+		// fire-and-forget. Deferred to a fresh macrotask so it starts strictly AFTER onStart's promise
+		// resolves: the host records onStart as "done" (fast handler time), THEN the heavy work runs and
+		// overlaps the user opening a note. Started last, so every handler above is wired first.
+		// ---------------------------------------------------------------------------------------------
+		setTimeout(startBackgroundInit, 0);
 	},
 });

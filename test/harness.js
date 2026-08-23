@@ -306,9 +306,15 @@ async function run(options) {
     const realClearInterval = global.clearInterval
     global.setInterval = (fn, ms) => { const id = state.intervals.length; state.intervals.push({ fn, ms, cleared: false }); return id }
     global.clearInterval = (id) => { if (typeof id === 'number' && state.intervals[id]) state.intervals[id].cleared = true }
+    // Handler time of the onStart PROMISE itself (v1.1.1 cold-start budget). The heavy work (engine build,
+    // dictionary reads/import, start flush) is now fire-and-forget on a macrotask AFTER onStart resolves,
+    // so this measures only the eager registrations — the budget test asserts it is small and that no
+    // data.get/put or fs read was awaited within it.
+    const onStartStartedAt = Date.now()
     try {
         await state.onStart({})
     } finally {
+        state.onStartMs = Date.now() - onStartStartedAt
         global.setInterval = realSetInterval
         global.clearInterval = realClearInterval
     }

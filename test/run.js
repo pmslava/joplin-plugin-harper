@@ -563,16 +563,94 @@ async function main() {
 		});
 	}
 
+	// =========================================================================
+	// v1.1.1 COLD-START BUDGET — onStart returns fast; engine + I/O warm in the background.
+	// =========================================================================
+	// Restructure claim: onStart wires only the cheap registrations (settings, content script, command,
+	// change/selection hooks, poll-timer arming) and AWAITS none of the heavy work. The engine build
+	// (LocalLinter.setup()), the initial dictionary reads + importWords, and the start-of-session flush
+	// are all fire-and-forget AFTER onStart resolves. This budget block instruments that boundary:
+	//   (a) onStart's own handler time is tiny AND, at the instant it resolves, ZERO joplin.data.get,
+	//       ZERO joplin.data.put and ZERO fs reads have been awaited — while the content script, settings
+	//       and poll timer ARE already wired (fast path);
+	//   (b) the background then warms the engine + imports the dictionary WITHOUT any lint request, a
+	//       subsequent lint is served warm and reflects the imported words, and the deferred start flush
+	//       persists the previous-session pending word into the note (editor never open, L3-safe).
+	let budgetOnStartMs = -1;
+	{
+		const budgetNotes = {
+			'budget-note': { id: 'budget-note', title: 'Harper Dictionary', body: '# hdr\n\nAlreadyknown\n', updated_time: 10 },
+		};
+		const fsBefore = fsReadCount;
+		const bstate = await run({
+			dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'harper-budget-')),
+			installationDir: DIST_DIR,
+			require: requireStub, // counting fs-extra: proves fs reads are deferred, not awaited in onStart
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			// A configured dictionary note + a word buffered from a "previous session" (editor NOT open),
+			// so there is a real dictionary import AND a real start flush to defer.
+			initialSettings: { dictionaryNoteId: 'budget-note', pendingWords: ['Zbudgetword'] },
+			notes: budgetNotes,
+		});
+		budgetOnStartMs = bstate.onStartMs;
+		// Snapshot the counters at the instant onStart resolved (before draining any background macrotask).
+		const getsAtReturn = bstate.gets.length;
+		const putsAtReturn = bstate.notePuts.length;
+		const fsAtReturn = fsReadCount - fsBefore;
+
+		await test('budget: onStart returns fast having AWAITED zero engine build, zero data.get/put, zero fs reads', () => {
+			assert.ok(
+				bstate.onStartMs < 500,
+				`onStart handler took ${bstate.onStartMs} ms — must be < 500 ms (engine build + I/O are deferred, not awaited)`,
+			);
+			assert.strictEqual(getsAtReturn, 0, `no joplin.data.get awaited in onStart, saw ${getsAtReturn}`);
+			assert.strictEqual(putsAtReturn, 0, `no joplin.data.put awaited in onStart, saw ${putsAtReturn}`);
+			assert.strictEqual(fsAtReturn, 0, `no fs read awaited in onStart, saw ${fsAtReturn}`);
+			// ...yet the fast path IS fully wired the instant onStart returns:
+			assert.strictEqual(bstate.contentScripts.length, 1, 'content script registered eagerly');
+			assert.ok(bstate.contentScriptMessageHandlers['harperCm'], 'onMessage handler wired eagerly');
+			assert.ok(bstate.registeredSettings, 'settings registered eagerly');
+			assert.ok(bstate.commands.find((c) => c.name === 'harper.createDictionaryNote'), 'command registered eagerly');
+			assert.ok(bstate.intervals.find((i) => i.ms === 60000 && !i.cleared), 'poll timer armed eagerly (harness-captured)');
+		});
+
+		await test('budget: the background init issues the deferred dictionary read WITHOUT any lint request', async () => {
+			// No lint was ever requested; the data.get can only come from the background warm-up /
+			// start-flush that onStart kicked off after returning.
+			const ran = await waitFor(() => bstate.gets.length > 0);
+			assert.ok(ran, 'a background joplin.data.get ran on its own (deferred dictionary read)');
+		});
+
+		const bh = bstate.contentScriptMessageHandlers['harperCm'];
+		await test('budget: a lint served after warm-up works and reflects the background-imported dictionary word', async () => {
+			const r = await bh({ type: 'lint', text: 'Alreadyknown but Qwertyxz is not.' });
+			assert.ok(Array.isArray(r) && r.length >= 1, 'lint returns issues once the engine is warm');
+			const spelled = r.filter((l) => l.kind === 'Spelling').map((l) => l.problemText);
+			assert.ok(!spelled.includes('Alreadyknown'), '"Alreadyknown" (a note word) was imported → not flagged');
+			assert.ok(spelled.includes('Qwertyxz'), '"Qwertyxz" (unknown) IS still flagged');
+		});
+
+		await test('budget: the deferred start flush persisted the previous-session pending word into the note (editor never open)', async () => {
+			const flushed = await waitFor(() =>
+				bstate.notePuts.some((p) => p.id === 'budget-note' && /(^|\n)Zbudgetword(\n|$)/.test(p.body || '')),
+			);
+			assert.ok(flushed, 'the start flush folded the buffered pending word into the dictionary note');
+			const put = bstate.notePuts[bstate.notePuts.length - 1];
+			assert.ok(/(^|\n)Alreadyknown(\n|$)/.test(put.body), 'the note keeps its existing word');
+			assert.deepStrictEqual(bstate.settings.pendingWords, [], 'pendingWords cleared after the deferred flush');
+		});
+	}
+
 	// ---- version quadruple --------------------------------------------------
 	// The four version fields (package.json, src/manifest.json, and BOTH package-lock fields) must
 	// stay pinned together; a stale lockfile drifted them once in the sibling project. Bump all four
 	// on every release, or the harness (and thus the publish gate) fails.
-	await test('version: package.json, manifest, and both package-lock fields are all 1.1.0', () => {
+	await test('version: package.json, manifest, and both package-lock fields are all 1.1.1', () => {
 		const readJSON = (...rel) => JSON.parse(fs.readFileSync(path.join(REPO_ROOT, ...rel), 'utf8'));
 		const pkg = readJSON('package.json');
 		const manifest = readJSON('src', 'manifest.json');
 		const lock = readJSON('package-lock.json');
-		const expected = '1.1.0';
+		const expected = '1.1.1';
 		assert.strictEqual(pkg.version, expected, 'package.json version');
 		assert.strictEqual(manifest.version, expected, 'src/manifest.json version');
 		assert.strictEqual(lock.version, expected, 'package-lock.json top-level version');
@@ -582,6 +660,7 @@ async function main() {
 	// ---- measurements (printed, not asserted) -------------------------------
 	console.log('');
 	console.log('  MEASUREMENTS');
+	console.log(`    onStart handler time (eager path only; engine + I/O deferred): ${budgetOnStartMs} ms`);
 	console.log(`    linter init (first lint: binary load + setup + prime): ${initMs} ms`);
 	console.log(`    lint latency, ~${docBytes} B doc, median of 5: ${medianMs} ms  (runs: ${latencies.join(', ')})`);
 	console.log('');
