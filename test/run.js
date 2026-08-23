@@ -1353,7 +1353,7 @@ async function main() {
 		const pkg = readJSON('package.json');
 		const manifest = readJSON('src', 'manifest.json');
 		const lock = readJSON('package-lock.json');
-		const expected = '1.3.0';
+		const expected = '1.3.1';
 		assert.strictEqual(pkg.version, expected, 'package.json version');
 		assert.strictEqual(manifest.version, expected, 'src/manifest.json version');
 		assert.strictEqual(lock.version, expected, 'package-lock.json top-level version');
