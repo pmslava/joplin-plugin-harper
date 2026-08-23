@@ -11,10 +11,28 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const fsExtra = require('fs-extra');
+const ts = require('typescript');
 const { run } = require('./harness');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const DIST_DIR = path.join(REPO_ROOT, 'dist');
+
+/**
+ * Load a dependency-free TypeScript module from src/ directly (transpile + evaluate), so the pure
+ * merge core can be unit-tested as a FUNCTION rather than only through the bundle's side effects.
+ * It is the very same source webpack compiles into dist/index.js — no second copy to drift.
+ */
+function loadTsModule(relPath) {
+	const source = fs.readFileSync(path.join(REPO_ROOT, relPath), 'utf8');
+	const js = ts.transpileModule(source, {
+		compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2019 },
+	}).outputText;
+	const mod = { exports: {} };
+	// eslint-disable-next-line no-new-func
+	new Function('exports', 'module', 'require', js)(mod.exports, mod, require);
+	return mod.exports;
+}
+const { mergeDictionary } = loadTsModule('src/dictionaryMerge.ts');
 
 // Wrap the real fs-extra so a test can count how many readFileSync calls a given operation makes
 // (used to prove the 60s dictionary poll does ZERO file reads when the mtime is unchanged).
@@ -73,6 +91,149 @@ function median(nums) {
 async function main() {
 	if (!fs.existsSync(path.join(DIST_DIR, 'index.js'))) {
 		throw new Error('dist/index.js not found — run `npm run dist` first (npm test does this).');
+	}
+
+	// =========================================================================
+	// v1.3.0 PURE MERGE CORE — mergeDictionary(), exhaustively.
+	// =========================================================================
+	// The whole deletion story reduces to this one pure function; everything else in the plugin is
+	// plumbing that reads the sides, writes what it says to write, and stores the new base. Base B,
+	// note N, file F, pending P:
+	//     added = (N-B) ∪ (F-B) ∪ P     deleted = (B-N)|N present ∪ (B-F)|F present
+	//     result = (B - (deleted - added)) ∪ added        [addition beats a concurrent deletion]
+	// A side passed as null is ABSENT (no deletions inferred); a side passed as [] is EMPTY (its
+	// deletions count).
+	{
+		const merge = (o) =>
+			mergeDictionary({ base: null, note: null, file: null, pending: [], ...o });
+
+		await test('merge: a word added on the NOTE side survives and is pushed to the file', () => {
+			const m = merge({ base: ['a'], note: ['a', 'new'], file: ['a'], pending: [] });
+			assert.deepStrictEqual(m.result, ['a', 'new']);
+			assert.deepStrictEqual(m.added, ['new']);
+			assert.deepStrictEqual(m.deleted, []);
+			assert.strictEqual(m.noteChanged, false, 'the note already has it — no note write');
+			assert.strictEqual(m.fileChanged, true, 'the file is missing it — rewrite the file');
+		});
+
+		await test('merge: a word added on the FILE side survives and is pushed to the note', () => {
+			const m = merge({ base: ['a'], note: ['a'], file: ['a', 'new'], pending: [] });
+			assert.deepStrictEqual(m.result, ['a', 'new']);
+			assert.deepStrictEqual(m.added, ['new']);
+			assert.strictEqual(m.noteChanged, true, 'the note is missing it — write the note');
+			assert.strictEqual(m.fileChanged, false, 'the file already has it — no rewrite');
+		});
+
+		await test('merge: a word deleted on the NOTE side is deleted everywhere (the reported bug)', () => {
+			const m = merge({ base: ['keep', 'gone'], note: ['keep'], file: ['keep', 'gone'], pending: [] });
+			assert.deepStrictEqual(m.result, ['keep'], 'the union would have resurrected "gone"');
+			assert.deepStrictEqual(m.deleted, ['gone']);
+			assert.strictEqual(m.noteChanged, false, 'the note already reflects the deletion');
+			assert.strictEqual(m.fileChanged, true, 'the file still carries it — rewrite it');
+		});
+
+		await test('merge: a word deleted on the FILE side is deleted everywhere', () => {
+			const m = merge({ base: ['keep', 'gone'], note: ['keep', 'gone'], file: ['keep'], pending: [] });
+			assert.deepStrictEqual(m.result, ['keep']);
+			assert.deepStrictEqual(m.deleted, ['gone']);
+			assert.strictEqual(m.noteChanged, true, 'the note still carries it — write it');
+			assert.strictEqual(m.fileChanged, false);
+		});
+
+		await test('merge: a word deleted on BOTH sides is deleted, with zero writes', () => {
+			const m = merge({ base: ['keep', 'gone'], note: ['keep'], file: ['keep'], pending: [] });
+			assert.deepStrictEqual(m.result, ['keep']);
+			assert.deepStrictEqual(m.deleted, ['gone']);
+			assert.strictEqual(m.noteChanged, false);
+			assert.strictEqual(m.fileChanged, false, 'both sides already agree — nothing to write');
+		});
+
+		await test('merge: CONFLICT — a local add-to-dictionary beats a concurrent remote deletion', () => {
+			// The word was deleted from the note on another device; on this one the user just added it
+			// back via the card. Addition wins: it stays, and the note is rewritten to carry it again.
+			const m = merge({ base: ['w'], note: [], file: ['w'], pending: ['w'] });
+			assert.deepStrictEqual(m.result, ['w'], 'addition wins over the concurrent deletion');
+			assert.deepStrictEqual(m.deleted, []);
+			assert.strictEqual(m.noteChanged, true, 'the note gets the re-added word back');
+			assert.strictEqual(m.fileChanged, false);
+		});
+
+		await test('merge: CONFLICT — a fresh word on one side beats a deletion on the other', () => {
+			// "fresh" is unknown to the base, so it can only be an addition, never a deletion.
+			const m = merge({ base: ['old'], note: ['old', 'fresh'], file: [], pending: [] });
+			assert.deepStrictEqual(m.result, ['fresh'], '"old" deleted from the file, "fresh" added in the note');
+			assert.deepStrictEqual(m.added, ['fresh']);
+			assert.deepStrictEqual(m.deleted, ['old']);
+			assert.ok(m.noteChanged && m.fileChanged, 'both sides differ from the result');
+		});
+
+		await test('merge: FIXED POINT — everything already agrees means zero writes and zero churn', () => {
+			const m = merge({ base: ['a', 'b'], note: ['b', 'a'], file: ['a', 'b'], pending: [] });
+			assert.deepStrictEqual(m.result, ['a', 'b']);
+			assert.deepStrictEqual(m.added, []);
+			assert.deepStrictEqual(m.deleted, []);
+			assert.strictEqual(m.noteChanged, false, 'no note write at the fixed point (order is irrelevant)');
+			assert.strictEqual(m.fileChanged, false, 'no file write at the fixed point');
+			assert.strictEqual(m.firstRun, false);
+		});
+
+		await test('merge: FIRST RUN (base=null) adopts the union and infers NO deletion', () => {
+			const m = merge({ base: null, note: ['n'], file: ['f'], pending: ['p'] });
+			assert.strictEqual(m.firstRun, true);
+			assert.deepStrictEqual(m.result, ['f', 'n', 'p'], 'exactly the v1.2.0 union');
+			assert.deepStrictEqual(m.deleted, [], 'a first run can never delete anything');
+			assert.deepStrictEqual(m.added, [], 'the union IS the base, so nothing counts as new');
+			assert.ok(m.noteChanged && m.fileChanged, 'both sides are still missing union words');
+		});
+
+		await test('merge: an ABSENT side (null: unreadable file / unsynced note) infers no deletions', () => {
+			// The file could not be read this pass (rclone moved it aside). Its "missing" words must NOT
+			// be treated as deletions, and it must not be rewritten from a merge it did not take part in.
+			const m = merge({ base: ['a', 'b'], note: ['a', 'b'], file: null, pending: [] });
+			assert.deepStrictEqual(m.result, ['a', 'b']);
+			assert.deepStrictEqual(m.deleted, []);
+			assert.strictEqual(m.fileChanged, false, 'an absent side is never written');
+		});
+
+		await test('merge: an EMPTY BUT READABLE side deletes what the base remembered', () => {
+			const m = merge({ base: ['a', 'b'], note: [], file: ['a', 'b'], pending: [] });
+			assert.deepStrictEqual(m.result, [], 'emptying the dictionary note is a legitimate deletion');
+			assert.deepStrictEqual(m.deleted, ['a', 'b']);
+			assert.strictEqual(m.fileChanged, true);
+		});
+
+		await test('merge: MOBILE shape (file absent) still propagates a note-side deletion', () => {
+			const m = merge({ base: ['keep', 'gone'], note: ['keep'], file: null, pending: [] });
+			assert.deepStrictEqual(m.result, ['keep']);
+			assert.deepStrictEqual(m.deleted, ['gone']);
+			assert.strictEqual(m.noteChanged, false, 'the note is already correct — no data.put needed');
+			assert.strictEqual(m.fileChanged, false, 'there is no file side on mobile');
+		});
+
+		await test('merge: NO SIDES at all (no note, no file) keeps the base and folds in pending', () => {
+			const m = merge({ base: ['a'], note: null, file: null, pending: ['b'] });
+			assert.deepStrictEqual(m.result, ['a', 'b']);
+			assert.deepStrictEqual(m.deleted, []);
+		});
+
+		await test('merge: output is deduped, trimmed, blank-free and code-unit sorted', () => {
+			const m = merge({ base: null, note: [' b ', 'a', '', '  ', 'b'], file: ['C', 'a'], pending: [] });
+			assert.deepStrictEqual(m.result, ['C', 'a', 'b'], 'code-unit order puts uppercase first');
+		});
+
+		await test('merge: IDEMPOTENT — feeding the result back as base+sides is a fixed point', () => {
+			const first = merge({ base: ['keep', 'gone'], note: ['keep'], file: ['keep', 'gone'], pending: [] });
+			const second = mergeDictionary({
+				base: first.result,
+				note: first.result,
+				file: first.result,
+				pending: [],
+			});
+			assert.deepStrictEqual(second.result, first.result);
+			assert.strictEqual(second.noteChanged, false, 'no ping-pong: the second pass writes nothing');
+			assert.strictEqual(second.fileChanged, false);
+			assert.deepStrictEqual(second.deleted, [], 'the deletion is not re-derived from the old base');
+		});
 	}
 
 	// A throwaway per-run data dir so the plugin can write userWords.txt / ignoredLints.json.
@@ -541,6 +702,42 @@ async function main() {
 			assert.deepStrictEqual(mstate.settings.pendingWords, [], 'pendingWords cleared after a successful flush');
 			assert.strictEqual(mobileFsCalls.length, 0, 'the whole mobile flow touched ZERO filesystem');
 		});
+
+		// v1.3.0: deletions reach mobile too. A word removed from the dictionary note on ANY device
+		// arrives here by sync; the 60 s poll notices the note's updated_time and reconciles it into the
+		// engine. There is no file side on mobile, so the merge is base-vs-note-vs-pending — and because
+		// the note already reflects the deletion there is nothing to write: ZERO data.put, ZERO fs.
+		await test('mobile: a word deleted from the dictionary note reaches the engine (zero fs, zero note writes)', async () => {
+			assert.deepStrictEqual(
+				JSON.parse(mstate.settings.syncBase || 'null'),
+				['Alpha', 'Zzblort'],
+				'precondition: the flush recorded a merge base',
+			);
+			const known = await mh({ type: 'lint', text: 'Zzblort alone.' });
+			assert.ok(
+				!known.some((l) => l.problemText === 'Zzblort'),
+				'precondition: Zzblort is currently accepted',
+			);
+			const putsBefore = mstate.notePuts.length;
+			// The deletion syncs in from another device: the note loses the word.
+			mstate.notes['dict-note-1'].body = '# Harper Dictionary — comment\n\nAlpha\n';
+			mstate.notes['dict-note-1'].updated_time = 5000;
+			const pollTimer = mstate.intervals.find((i) => i.ms === 60000 && !i.cleared);
+			assert.ok(pollTimer, 'a 60s dictionary poll interval was armed on mobile too');
+			pollTimer.fn();
+			const forgotten = await waitFor(async () => {
+				const r = await mh({ type: 'lint', text: 'Zzblort alone.' });
+				return r.some((l) => l.problemText === 'Zzblort' && l.kind === 'Spelling');
+			});
+			assert.ok(forgotten, 'the deleted word is flagged again on mobile');
+			assert.ok(
+				!(await mh({ type: 'lint', text: 'Alpha alone.' })).some((l) => l.problemText === 'Alpha'),
+				'the surviving word is still accepted',
+			);
+			assert.strictEqual(mstate.notePuts.length, putsBefore, 'the note already reflects it — ZERO data.put');
+			assert.deepStrictEqual(JSON.parse(mstate.settings.syncBase || 'null'), ['Alpha'], 'the base advanced');
+			assert.strictEqual(mobileFsCalls.length, 0, 'still ZERO filesystem access on the mobile path');
+		});
 	}
 
 	// ---- dictionary-note PARSE: header + blank lines skipped ----------------
@@ -642,6 +839,229 @@ async function main() {
 	}
 
 	// =========================================================================
+	// v1.3.0 DELETION PROPAGATION — the user-reported bug, end to end.
+	// =========================================================================
+	// "Deleting a word from the dictionary note resurrects it after the next poll." Under v1.2.0 the
+	// note and the file were reconciled by UNION, so the surviving copy in the file put the word
+	// straight back. These tests drive the real bundle through the whole cycle: converge, delete,
+	// poll, and assert the word is gone from the note, from the file AND from the engine — and stays
+	// gone. The external file is deliberately UNSORTED and carries a comment, so the same tests also
+	// pin the "minimal diff" promise: surviving lines keep their order, comments survive, new words
+	// are appended at the end.
+	{
+		const delDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-delete-'));
+		const delFile = path.join(delDataDir, 'dict.txt');
+		const INITIAL_FILE = '# my own words\nZuluqx\nAlphaqx\nBetaqx\n';
+		fs.writeFileSync(delFile, INITIAL_FILE, 'utf8');
+		const delNotes = {
+			dnote: { id: 'dnote', body: '# h\n\nAlphaqx\nBetaqx\nZuluqx\n', updated_time: 100 },
+		};
+		const dstate = await run({
+			dataDir: delDataDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryPath: delFile, dictionaryNoteId: 'dnote' },
+			notes: delNotes,
+		});
+		const dh = dstate.contentScriptMessageHandlers['harperCm'];
+		const readDelFile = () => fs.readFileSync(delFile, 'utf8');
+		const delPoll = () => {
+			const t = dstate.intervals.find((i) => i.ms === 60000 && !i.cleared);
+			assert.ok(t, 'a 60s dictionary poll interval was armed');
+			t.fn();
+		};
+		/** Change a note body as another device's sync would, and bump its updated_time so the poll sees it. */
+		const editNote = (body) => {
+			dstate.notes.dnote.body = body;
+			dstate.notes.dnote.updated_time = (dstate.notes.dnote.updated_time || 0) + 100;
+		};
+		/** Rewrite the external file as rclone/Zed would, guaranteeing an mtime the poll must notice. */
+		const editFile = (content) => {
+			fs.writeFileSync(delFile, content, 'utf8');
+			const future = new Date(Date.now() + 2000);
+			fs.utimesSync(delFile, future, future);
+		};
+		const spellingIn = async (text) =>
+			(await dh({ type: 'lint', text })).filter((l) => l.kind === 'Spelling').map((l) => l.problemText);
+		const syncBase = () => JSON.parse(dstate.settings.syncBase || 'null');
+
+		await test('deletion: baseline — the first reconcile records a syncBase and writes NOTHING (sides already agree)', async () => {
+			const based = await waitFor(() => Array.isArray(syncBase()));
+			assert.ok(based, 'a syncBase was persisted by the first reconcile');
+			assert.deepStrictEqual(syncBase(), ['Alphaqx', 'Betaqx', 'Zuluqx'], 'base = the reconciled set');
+			assert.strictEqual(dstate.notePuts.length, 0, 'nothing to add anywhere — no note write');
+			assert.strictEqual(readDelFile(), INITIAL_FILE, 'the file is untouched, order and comment intact');
+			const spelled = await spellingIn('Alphaqx Betaqx Zuluqx are known.');
+			assert.deepStrictEqual(spelled, [], 'all three words are known to the engine');
+		});
+
+		await test('deletion: a word ADDED in the note is appended at the END of the file, order preserved', async () => {
+			editNote('# h\n\nAlphaqx\nBetaqx\nMikeqx\nZuluqx\n');
+			delPoll();
+			const landed = await waitFor(() => readDelFile().includes('Mikeqx'));
+			assert.ok(landed, 'the new note word reached the file');
+			assert.strictEqual(
+				readDelFile(),
+				'# my own words\nZuluqx\nAlphaqx\nBetaqx\nMikeqx\n',
+				'surviving lines keep their original (unsorted) order; the new word is appended last',
+			);
+		});
+
+		await test('deletion: THE BUG — deleting a word from the note removes it from the file AND the engine', async () => {
+			assert.deepStrictEqual(await spellingIn('Betaqx alone.'), [], 'precondition: Betaqx is accepted');
+			editNote('# h\n\nAlphaqx\nMikeqx\nZuluqx\n'); // the user deletes "Betaqx" from the dictionary note
+			delPoll();
+			const removed = await waitFor(() => !readDelFile().includes('Betaqx'));
+			assert.ok(removed, 'the external file no longer contains the deleted word');
+			assert.strictEqual(
+				readDelFile(),
+				'# my own words\nZuluqx\nAlphaqx\nMikeqx\n',
+				'ONLY the deleted line was dropped — comment, order and the other words are untouched',
+			);
+			assert.ok(!dstate.notes.dnote.body.includes('Betaqx'), 'the note does not get it back');
+			assert.deepStrictEqual(
+				await spellingIn('Betaqx alone.'),
+				['Betaqx'],
+				'the engine forgot the word: it is flagged as a misspelling again',
+			);
+			assert.deepStrictEqual(syncBase(), ['Alphaqx', 'Mikeqx', 'Zuluqx'], 'the base advanced past the deletion');
+		});
+
+		await test('deletion: it STAYS gone across further poll cycles (no resurrection, no writes)', async () => {
+			const putsBefore = dstate.notePuts.length;
+			const fileBefore = readDelFile();
+			delPoll();
+			await drain();
+			delPoll();
+			await waitFor(() => false, 300); // let any async poll work settle
+			assert.strictEqual(readDelFile(), fileBefore, 'file unchanged at the new fixed point');
+			assert.strictEqual(dstate.notePuts.length, putsBefore, 'no note writes at the new fixed point');
+			assert.ok(!dstate.notes.dnote.body.includes('Betaqx'), 'still absent from the note');
+			assert.deepStrictEqual(await spellingIn('Betaqx alone.'), ['Betaqx'], 'still unknown to the engine');
+		});
+
+		await test('deletion: the REVERSE direction — deleting from the FILE rewrites the note and the engine', async () => {
+			editFile('# my own words\nZuluqx\nMikeqx\n'); // "Alphaqx" deleted from the file (Zed / rclone)
+			const putsBefore = dstate.notePuts.length;
+			delPoll();
+			const written = await waitFor(
+				() => dstate.notePuts.length > putsBefore && !dstate.notes.dnote.body.includes('Alphaqx'),
+			);
+			assert.ok(written, 'the note was rewritten without the word deleted from the file');
+			assert.ok(dstate.notes.dnote.body.includes('Zuluqx'), 'the surviving words stay in the note');
+			assert.deepStrictEqual(
+				await spellingIn('Alphaqx alone.'),
+				['Alphaqx'],
+				'the engine forgot the file-deleted word too',
+			);
+			assert.deepStrictEqual(syncBase(), ['Mikeqx', 'Zuluqx']);
+		});
+
+		await test('deletion: CONFLICT — a local add-to-dictionary beats a concurrent note-side deletion', async () => {
+			// The user deletes the word in the note on another device while, on this one, they add the
+			// very same word via the card. The addition must win — losing a word the user just asked for
+			// is far worse than keeping one they meant to drop.
+			editNote('# h\n\nZuluqx\n'); // "Mikeqx" deleted remotely
+			await dh({ type: 'addWord', word: 'Mikeqx' }); // ...and re-added locally (buffered in pendingWords)
+			delPoll();
+			const restored = await waitFor(() => dstate.notes.dnote.body.includes('Mikeqx'));
+			assert.ok(restored, 'the note carries the re-added word again');
+			assert.ok(readDelFile().includes('Mikeqx'), 'the file keeps it too');
+			assert.deepStrictEqual(await spellingIn('Mikeqx alone.'), [], 'the engine still accepts it');
+			assert.deepStrictEqual(syncBase(), ['Mikeqx', 'Zuluqx'], 'the base keeps the word that won');
+			assert.deepStrictEqual(dstate.settings.pendingWords, [], 'the pending buffer was flushed');
+		});
+	}
+
+	// ---- v1.3.0 FILE-REWRITE SAFETY: a concurrent writer (rclone) must never be clobbered ----
+	// The rewrite reads the file, merges, writes a sibling temp file and renames it into place. If the
+	// file changes between the read and the rename — rclone landing a synced copy, Zed saving — the
+	// rewrite is ABORTED (the temp file removed, the merge base left alone) and retried next tick, so
+	// the other writer's content survives and is merged rather than overwritten. This test sabotages
+	// the write exactly in that window through the fs stub.
+	{
+		const raceDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-race-'));
+		const raceFile = path.join(raceDataDir, 'dict.txt');
+		fs.writeFileSync(raceFile, 'Alpharc\nBetarc\n', 'utf8');
+		let sabotage = false;
+		// Stands in for rclone writing the file while our temp file is being written.
+		const sabotagingFsExtra = new Proxy(fsExtra, {
+			get(target, prop) {
+				if (prop === 'writeFileSync') {
+					return (file, data, opts) => {
+						const result = target.writeFileSync(file, data, opts);
+						if (sabotage && String(file).endsWith('.harper-tmp')) {
+							const real = String(file).slice(0, -'.harper-tmp'.length);
+							target.appendFileSync(real, 'Gammarc\n');
+							const future = new Date(Date.now() + 4000);
+							target.utimesSync(real, future, future);
+						}
+						return result;
+					};
+				}
+				return target[prop];
+			},
+		});
+		const rstate = await run({
+			dataDir: raceDataDir,
+			installationDir: DIST_DIR,
+			require: (name) => {
+				if (name === 'fs-extra') return sabotagingFsExtra;
+				throw new Error(`Unexpected joplin.require(${name})`);
+			},
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryPath: raceFile, dictionaryNoteId: 'rnote' },
+			notes: { rnote: { id: 'rnote', body: '# h\n\nAlpharc\nBetarc\n', updated_time: 10 } },
+		});
+		const racePoll = () => rstate.intervals.find((i) => i.ms === 60000 && !i.cleared).fn();
+		const rh = rstate.contentScriptMessageHandlers['harperCm'];
+
+		await test('file safety: a write that races a concurrent file change is ABORTED, keeping the other writer\'s content', async () => {
+			const based = await waitFor(() => Array.isArray(JSON.parse(rstate.settings.syncBase || 'null')));
+			assert.ok(based, 'precondition: converged with a base');
+			// Awaiting a lint also awaits the engine warm-up, so every startup reconcile is done before
+			// the sabotage is armed and exactly ONE rewrite attempt races the concurrent writer.
+			const known = await rh({ type: 'lint', text: 'Alpharc and Betarc.' });
+			assert.strictEqual(known.filter((l) => l.kind === 'Spelling').length, 0, 'precondition: both words known');
+			sabotage = true;
+			// A word is deleted from the note, so the file needs rewriting — and rclone lands mid-write.
+			rstate.notes.rnote.body = '# h\n\nAlpharc\n';
+			rstate.notes.rnote.updated_time = 20;
+			racePoll();
+			const raced = await waitFor(() => fs.readFileSync(raceFile, 'utf8').includes('Gammarc'));
+			assert.ok(raced, 'the concurrent writer got its word in');
+			assert.strictEqual(
+				fs.readFileSync(raceFile, 'utf8'),
+				'Alpharc\nBetarc\nGammarc\n',
+				'the concurrent write survived intact — our stale rewrite did NOT land',
+			);
+			assert.ok(!fs.existsSync(`${raceFile}.harper-tmp`), 'the abandoned temp file was cleaned up');
+			assert.deepStrictEqual(
+				JSON.parse(rstate.settings.syncBase),
+				['Alpharc', 'Betarc'],
+				'a partial pass does NOT advance the merge base — the deletion is retried, not lost',
+			);
+		});
+
+		await test('file safety: the next tick converges — the deletion lands and the raced-in word is kept', async () => {
+			sabotage = false;
+			racePoll();
+			const settled = await waitFor(() => !fs.readFileSync(raceFile, 'utf8').includes('Betarc'));
+			assert.ok(settled, 'the retried rewrite dropped the deleted word');
+			assert.strictEqual(
+				fs.readFileSync(raceFile, 'utf8'),
+				'Alpharc\nGammarc\n',
+				'deleted word gone, concurrently-added word kept, order preserved',
+			);
+			const noteHasIt = await waitFor(() => rstate.notes.rnote.body.includes('Gammarc'));
+			assert.ok(noteHasIt, 'the raced-in file word reached the note');
+			assert.ok(!rstate.notes.rnote.body.includes('Betarc'), 'the note stays free of the deleted word');
+			assert.deepStrictEqual(JSON.parse(rstate.settings.syncBase), ['Alpharc', 'Gammarc']);
+		});
+	}
+
+	// =========================================================================
 	// v1.1.1 COLD-START BUDGET — onStart returns fast; engine + I/O warm in the background.
 	// =========================================================================
 	// Restructure claim: onStart wires only the cheap registrations (settings, content script, command,
@@ -723,12 +1143,12 @@ async function main() {
 	// The four version fields (package.json, src/manifest.json, and BOTH package-lock fields) must
 	// stay pinned together; a stale lockfile drifted them once in the sibling project. Bump all four
 	// on every release, or the harness (and thus the publish gate) fails.
-	await test('version: package.json, manifest, and both package-lock fields are all 1.2.0', () => {
+	await test('version: package.json, manifest, and both package-lock fields are all 1.3.0', () => {
 		const readJSON = (...rel) => JSON.parse(fs.readFileSync(path.join(REPO_ROOT, ...rel), 'utf8'));
 		const pkg = readJSON('package.json');
 		const manifest = readJSON('src', 'manifest.json');
 		const lock = readJSON('package-lock.json');
-		const expected = '1.2.0';
+		const expected = '1.3.0';
 		assert.strictEqual(pkg.version, expected, 'package.json version');
 		assert.strictEqual(manifest.version, expected, 'src/manifest.json version');
 		assert.strictEqual(lock.version, expected, 'package-lock.json top-level version');

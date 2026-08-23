@@ -52,12 +52,21 @@ by setting **External dictionary file** to its absolute path. When that path is 
 - *Add to dictionary* **appends** the new word to that same file (one word per line).
 - The file is re-read automatically about every 60 seconds, so changes made outside Joplin are
   picked up without a restart.
+- **Removals are picked up too.** Delete a word from the file (or from the dictionary note, if you
+  use one) and the plugin removes it everywhere else as well, so it starts being flagged again.
+
+Deleting a word is the one case where the plugin writes more than a new line, so it does as little
+as it can: it drops only the lines for words you removed, appends genuinely new words at the end,
+and leaves every other line, comments included, exactly where it was. Surviving lines are never
+reordered or rewritten, and the file is left completely untouched when nothing changed. Writes go
+through a temporary file in the same directory and an atomic rename, and if the file changes while
+the plugin is working on it, the write is abandoned and retried on the next pass, so a sync client
+writing at the same moment is never clobbered.
 
 This is deliberately just a flat text file with no special format. That makes it easy to keep the
 file wherever you like and sync it between machines with your own tooling (a synced folder, a
 version-controlled dotfile, `rsync`/`rclone`, and so on) — or to share the same word list with
-another tool that reads a plain word-per-line dictionary. Harper only ever reads and appends lines;
-it never rewrites or reorders the file.
+another tool that reads a plain word-per-line dictionary.
 
 ## Settings
 

@@ -7,6 +7,8 @@ import {
   createNote,
   editorIsPresent,
   focusEditor,
+  getEditorBody,
+  setEditorBody,
   runCommand,
   openNoteFromList,
   readNoteBodyFresh,
@@ -87,5 +89,87 @@ test.describe('Harper dictionary note<->file mirror', () => {
     console.log(`[harper-e2e] mirror NOTE->FILE ok: file now = ${JSON.stringify(fileText)}`);
     expect(fileText).toContain(FILE_WORD); // the original file word is preserved
     expect(fileText).toContain(NOTE_WORD); // the note word was mirrored in
+  });
+
+  /**
+   * v1.3.0 — DELETION propagates (the user-reported bug: a word deleted from the dictionary note came
+   * back on the next poll, resurrected by the union with the external file).
+   *
+   * Runs against whatever state the app is in: it reuses the dictionary note the previous test made
+   * when it is there, and creates its own notebook + scratch note + dictionary note when it is not.
+   * That matters because a Playwright retry restarts the worker, so `beforeAll` hands this test a
+   * FRESH profile with no notebook, no scratch note and no dictionary note at all. Either way both
+   * notes end up in the SAME notebook, which is what `openNoteFromList` (a note-list click) needs.
+   */
+  test('a word deleted from the dictionary note is removed from the file and stays gone', async () => {
+    const { win } = joplin;
+    const DEL_WORD = 'Zqxdelete';
+    const readDict = () => (fs.existsSync(dictFile) ? fs.readFileSync(dictFile, 'utf8') : '');
+    /** The file's words, in file order, with comment and blank lines skipped (the plugin's own parse). */
+    const dictWords = () =>
+      readDict()
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0 && !line.startsWith('# '));
+    const noteIsListed = async (title: string) =>
+      (await win.locator('.note-list-item-wrapper, .note-list-item').filter({ hasText: title }).count()) > 0;
+
+    let scratch = 'MScratch';
+    if (!(await noteIsListed('Harper Dictionary'))) {
+      // Fresh profile (a retry): build the whole fixture, dictionary note included. The create command
+      // puts it in the selected notebook, so it lands next to the scratch note in the note list.
+      scratch = 'DScratch';
+      await createNotebook(win, 'Harper Delete NB');
+      await createNote(win, scratch);
+      await expect.poll(() => editorIsPresent(win), { timeout: 20_000 }).toBe(true);
+      await runCommand(win, 'Harper Create dictionary note');
+    }
+    await openNoteFromList(win, scratch);
+    await expect.poll(() => editorIsPresent(win), { timeout: 20_000 }).toBe(true);
+
+    // 1) Add the word by hand at the end of the dictionary note, then leave the note so the plugin
+    //    reconciles: the word must reach the external file (v1.2.0 behaviour, still expected).
+    await openNoteFromList(win, 'Harper Dictionary');
+    await focusEditor(win);
+    await win.keyboard.press('Control+End');
+    await win.keyboard.press('Enter');
+    await win.keyboard.type(DEL_WORD);
+    await win.waitForTimeout(2500); // let Joplin persist the edited body before we navigate away
+    await openNoteFromList(win, scratch); // selection change -> reconcile
+    await expect.poll(readDict, { timeout: 90_000 }).toContain(DEL_WORD);
+    // eslint-disable-next-line no-console
+    console.log(`[harper-e2e] deletion setup ok: file = ${JSON.stringify(readDict())}`);
+
+    // 2) Now DELETE that word from the note, as a user editing their dictionary note would: select
+    //    the body and retype it without that line.
+    //    The keep-list comes from the FILE, not from the editor: the Markdown editor hides the "# "
+    //    of a heading, so retyping what `getEditorBody` reports would silently turn the note's own
+    //    comment header into a dictionary word.
+    const keep = dictWords().filter((w) => w !== DEL_WORD);
+    expect(keep.length).toBeGreaterThan(0);
+    await openNoteFromList(win, 'Harper Dictionary');
+    await setEditorBody(win, `# harper dictionary\n\n${keep.join('\n')}`);
+    const typed = await getEditorBody(win);
+    expect(typed).not.toContain(DEL_WORD); // the word really is out of the note body now
+    await win.waitForTimeout(2500);
+    await openNoteFromList(win, scratch); // selection change -> reconcile
+
+    // 3) The file must lose the word (v1.2.0 kept it, and put it straight back into the note).
+    await expect.poll(readDict, { timeout: 90_000 }).not.toContain(DEL_WORD);
+    // eslint-disable-next-line no-console
+    console.log('[harper-e2e] deletion ok: the word is gone from the external file');
+
+    // 4) …and it must not be resurrected by a further reconcile cycle, on either side.
+    await openNoteFromList(win, 'Harper Dictionary');
+    await win.waitForTimeout(1500);
+    await openNoteFromList(win, scratch);
+    await win.waitForTimeout(5000);
+    const fileAfter = readDict();
+    // eslint-disable-next-line no-console
+    console.log(`[harper-e2e] file after a further cycle = ${JSON.stringify(fileAfter)}`);
+    expect(fileAfter).not.toContain(DEL_WORD);
+    for (const word of keep) expect(fileAfter).toContain(word); // survivors are untouched
+    const noteAfter = await readNoteBodyFresh(win, 'Harper Dictionary', scratch);
+    expect(noteAfter).not.toContain(DEL_WORD);
   });
 });
