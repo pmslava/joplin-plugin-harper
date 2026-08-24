@@ -440,7 +440,8 @@ type LockAttempt =
   /** A live run holds the lock; the caller decides whether to wait. */
   | { status: 'held'; pid: number | null; owner: string | null }
   /** A stale lock was broken, or another process won a race — retry immediately. */
-  | { status: 'retry' };
+  /** `contended` = another acquirer holds the reclaim lock; `broke` = a stale lock was broken. */
+  | { status: 'retry'; reason: 'broke' | 'contended' };
 
 /**
  * True when the reclaim lock was left behind by a process that died mid-reclaim.
@@ -518,19 +519,23 @@ function tryTakeReclaimLock(): boolean {
       }
       continue;
     }
-    const ours = incarnationOf(LOCK_RECLAIM_DIR);
     try {
       fs.writeFileSync(LOCK_RECLAIM_PID_FILE, String(process.pid), 'utf8');
     } catch {
-      /* advisory: the TTL is what bounds a reclaim lock that never gets a pid */
+      /* the read-back below turns a failed write into a clean loss, never a silent hold */
     }
-    // Read back: if our incarnation is no longer at the path, someone broke it in the pid-less
-    // instant and this process does NOT hold the reclaim lock.
-    if (ours !== null && incarnationOf(LOCK_RECLAIM_DIR) !== ours) {
+    // Read back the PID FILE, not the incarnation. The incarnation token is derived from the
+    // directory's creation time, and on a filesystem that records no btime that falls back to
+    // mtime — which the write above has just moved, so the comparison could never match and every
+    // acquirer would spin out its retry budget. The pid is stable on every filesystem and answers
+    // the same question: did anyone break our lock in the instant before it named us? A lock that
+    // was broken and retaken names someone else; one broken and not yet retaken names nobody.
+    if (readPidFile(LOCK_RECLAIM_PID_FILE) !== process.pid) {
       warn(`lost the E2E reclaim lock at ${LOCK_RECLAIM_DIR} before it named us; retrying`);
       return false;
     }
-    ourReclaimIncarnation = ours;
+    // AFTER the write, for the same reason the outer lock's token is taken after its writes.
+    ourReclaimIncarnation = incarnationOf(LOCK_RECLAIM_DIR);
     return true;
   }
   return false;
@@ -561,11 +566,11 @@ function releaseReclaimLock(): void {
  * it, so the directory at LOCK_DIR cannot change identity between the verdict and the rename.
  */
 function reclaimStaleLock(): LockAttempt {
-  if (!tryTakeReclaimLock()) return { status: 'retry' }; // another acquirer is mid-reclaim
+  if (!tryTakeReclaimLock()) return { status: 'retry', reason: 'contended' };
   try {
     // The incarnation the verdict below belongs to.
     const judged = incarnationOf(LOCK_DIR);
-    if (judged === null) return { status: 'retry' }; // gone already — go race the plain mkdir
+    if (judged === null) return { status: 'retry', reason: 'broke' }; // gone already — go race the plain mkdir
 
     const holder = readLockPid();
     if (holder !== null && pidAlive(holder)) {
@@ -583,7 +588,7 @@ function reclaimStaleLock(): LockAttempt {
     try {
       fs.renameSync(LOCK_DIR, aside);
     } catch {
-      return { status: 'retry' }; // it vanished under us; the plain mkdir will settle it
+      return { status: 'retry', reason: 'broke' }; // it vanished under us; the plain mkdir will settle it
     }
     // rename(2) is atomic but unconditional, so prove what we carried off IS the incarnation judged
     // above. Unreachable while the intent lock holds; kept because the cost of being wrong is two
@@ -608,7 +613,7 @@ function reclaimStaleLock(): LockAttempt {
       // Debris only: the lock is gone as far as the protocol is concerned, and the pre-run sweep
       // (sweepLockDebris) removes what is left behind.
     }
-    return { status: 'retry' };
+    return { status: 'retry', reason: 'broke' };
   } finally {
     releaseReclaimLock();
   }
@@ -687,7 +692,19 @@ export async function acquireLock(): Promise<void> {
       // way the loop makes progress. The cap only guarantees termination if the lock directory is
       // somehow pathological.
       if (++breaks > LOCK_RETRY_CAP) {
-        throw new Error(`Could not settle the E2E lock at ${LOCK_DIR}: it keeps reappearing stale.`);
+        // Two very different outcomes share this cap. A reclaim lock held by a LIVE process is now
+        // waited out by design rather than broken, so hitting the cap that way is not corruption —
+        // it is one wedged reclaimer, and saying "keeps reappearing stale" would send the reader
+        // hunting for the wrong thing.
+        throw new Error(
+          attempt.reason === 'contended'
+            ? `Could not settle the E2E lock at ${LOCK_DIR}: another acquirer has held the reclaim ` +
+              `lock at ${LOCK_RECLAIM_DIR} for ${formatDuration(Date.now() - startedAt)} without ` +
+              `finishing, and its process is still alive, so it is being waited out rather than ` +
+              `broken. If that process is genuinely wedged, end it (or remove that directory) and ` +
+              `retry.`
+            : `Could not settle the E2E lock at ${LOCK_DIR}: it keeps reappearing stale.`
+        );
       }
       await sleep(50);
       continue;
