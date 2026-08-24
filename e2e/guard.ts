@@ -23,12 +23,16 @@ import * as path from 'path';
  *   - a soft RAM gate that aborts locally when memory is too low (warn-only under CI);
  *   - best-effort in-process teardown on SIGINT/SIGTERM/uncaughtException/exit.
  *
- * SAFETY: every process match is anchored on THIS repo's absolute `.e2e-cache/squashfs-root` path.
- * The developer's real desktop Joplin runs from `/tmp/.mount_XXXXXX/joplin` and can NEVER match, nor
- * a sibling repo's `.e2e-cache` path — the guard only ever touches this repo's own E2E processes.
+ * SAFETY: every process match is anchored on THIS repo's absolute `.e2e-cache/squashfs-root` path
+ * AND on the process being an orphan (reparented to init). The developer's real desktop Joplin runs
+ * from `/tmp/.mount_XXXXXX/joplin` and can NEVER match, nor a sibling repo's `.e2e-cache` path — and
+ * the orphan condition means a LIVE run of this same checkout is never a target either.
  *
- * Kept in lockstep across the three forked harnesses (cockpit / harper / ridgeline): the hardening
- * logic is byte-identical; only the self-contained repo paths below differ by location.
+ * LOCKSTEP: the machine-wide LOCK PROTOCOL below — its constants, its staleness rules and its
+ * reclaim sequence — is kept in SEMANTIC lockstep with the sibling harnesses (cockpit / harper /
+ * ridgeline); the repos stop excluding each other the moment those semantics diverge. The rest of
+ * this file is neither byte-identical nor required to be: the sweeps, the teardown and the logging
+ * style have each evolved to fit their own repo.
  */
 
 // --- Self-contained repo paths (guard.ts lives in <repo>/e2e/). ---------------------------------
@@ -62,20 +66,26 @@ const LOCK_OWNER_FILE = path.join(LOCK_DIR, 'owner');
  *
  * mkdir is the only compare-and-swap a filesystem offers, so the judge-then-rename sequence is
  * serialised behind a SECOND mkdir: only the holder of this directory may break a stale lock, and
- * it re-forms its verdict while holding it. Breaking a stranded intent lock is always safe — it
- * guards a code path, not a resource — so it can never deadlock an acquire.
+ * it re-forms its verdict while holding it.
+ *
+ * This directory is itself broken by the SAME rename-and-prove sequence, never by an unconditional
+ * remove — breaking it the sloppy way would just move the original race down one level. It is
+ * breakable only when its holder is dead, or when it never named one and has sat past its TTL: a
+ * reclaimer that is merely slow (suspended, blocked on a hung filesystem) is waited out rather than
+ * broken, and LOCK_RETRY_CAP bounds that wait with a diagnostic rather than a hang.
  */
 const LOCK_RECLAIM_DIR = `${LOCK_DIR}.reclaim`;
 const LOCK_RECLAIM_PID_FILE = path.join(LOCK_RECLAIM_DIR, 'pid');
 /**
- * The reclaim lock is held for a handful of syscalls, so anything older than this was stranded by a
- * process that died mid-reclaim and may be cleared — four orders of magnitude of headroom.
+ * How long a reclaim lock that names NO pid may sit before it counts as stranded. It is held for a
+ * handful of syscalls and names its holder immediately, so this is four orders of magnitude of
+ * headroom. A reclaim lock that DOES name a pid is judged by that pid alone, never by age.
  */
 const LOCK_RECLAIM_TTL_MS = 10_000;
 /**
  * How many 'retry' rounds acquireLock() tolerates before declaring the lock pathological. A retry
  * costs 50 ms, so this is a 20 s ceiling — deliberately well past LOCK_RECLAIM_TTL_MS, so a reclaim
- * lock stranded by a dead process always self-heals before an acquirer gives up on it.
+ * lock stranded pid-less always self-heals before an acquirer gives up on it.
  */
 const LOCK_RETRY_CAP = 400;
 
@@ -141,6 +151,24 @@ interface ProcInfo {
   cmdline: string;
 }
 
+/**
+ * /proc entries this sweep could not read for lack of permission. A sweep scans /proc more than
+ * once, so the counter is module-scoped and reported ONCE per sweep by reportProcDenied() rather
+ * than once per scan (let alone once per entry).
+ */
+let procDenied = 0;
+
+/** One summary line per sweep rather than per-entry noise. Resets the counter. */
+function reportProcDenied(): void {
+  if (procDenied === 0) return;
+  const n = procDenied;
+  procDenied = 0;
+  warn(
+    `could not read ${n} /proc entr${n === 1 ? 'y' : 'ies'} (permission denied): leftover E2E ` +
+      `processes owned by another user, or hidden by a hidepid mount, are invisible to the sweep`
+  );
+}
+
 function readProc(): ProcInfo[] {
   const out: ProcInfo[] = [];
   let entries: string[];
@@ -150,9 +178,8 @@ function readProc(): ProcInfo[] {
     return out; // no /proc — nothing to sweep
   }
   // A process that exits between readdir and read is routine and silent; a permission denial is
-  // not — it means the sweep is BLIND to that process, so it is counted and reported once below
-  // rather than per entry.
-  let denied = 0;
+  // not — it means the sweep is BLIND to that process, so it is counted and reported once per
+  // sweep rather than per entry.
   for (const name of entries) {
     if (!/^\d+$/.test(name)) continue;
     const pid = Number(name);
@@ -161,7 +188,7 @@ function readProc(): ProcInfo[] {
       cmdline = fs.readFileSync(`/proc/${pid}/cmdline`).toString('utf8');
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (code === 'EACCES' || code === 'EPERM') denied++;
+      if (code === 'EACCES' || code === 'EPERM') procDenied++;
       continue; // process vanished / not readable
     }
     if (cmdline.length === 0) continue; // kernel threads have empty cmdline
@@ -176,13 +203,6 @@ function readProc(): ProcInfo[] {
     }
     out.push({ pid, ppid, cmdline });
   }
-  if (denied > 0) {
-    warn(
-      `could not read ${denied} /proc entr${denied === 1 ? 'y' : 'ies'} (permission denied): ` +
-        `leftover E2E processes owned by another user, or hidden by a hidepid mount, are invisible ` +
-        `to the sweep`
-    );
-  }
   return out;
 }
 
@@ -190,11 +210,20 @@ function readProc(): ProcInfo[] {
 // Pre-run orphan sweep (the deterministic half of the hardening).
 // ================================================================================================
 
-/** (a) Kill every leftover process whose cmdline references THIS repo's extracted Joplin tree. */
+/**
+ * (a) Kill every ORPHANED leftover process whose cmdline references THIS repo's extracted Joplin
+ * tree. Both conditions matter, and the second is not redundant: the path alone also matches a
+ * CONCURRENT run of this same checkout, so if the machine-wide lock is ever lost — or a sibling
+ * worktree on an older protocol races it — a second run would SIGKILL the first run's live Joplin
+ * tree mid-test. A live run's Joplin was spawned by a live Playwright worker, so it has a real
+ * parent; only a run that died leaves its Joplin reparented to init. Same condition the Xvfb sweep
+ * below has always used.
+ */
 function sweepJoplinProcesses(selfPids: Set<number>): number {
   let killed = 0;
   for (const p of readProc()) {
     if (selfPids.has(p.pid)) continue;
+    if (p.ppid !== 1) continue; // only orphans; a live run's Joplin has a live parent
     // Path-anchored: matches this repo's main Joplin AND its renderer/gpu/zygote children (all exec
     // the same binary under EXTRACT_DIR). Cannot match the real desktop Joplin (/tmp/.mount_XXXXXX)
     // nor a sibling repo's .e2e-cache tree.
@@ -278,7 +307,9 @@ function sweepStaleProfiles(): void {
  */
 function sweepLockDebris(): void {
   const parent = path.dirname(LOCK_DIR);
-  const stalePrefix = `${path.basename(LOCK_DIR)}.stale-`;
+  const base = path.basename(LOCK_DIR);
+  // Both kinds of rename-aside debris: from breaking the lock, and from breaking the intent lock.
+  const stalePrefixes = [`${base}.stale-`, `${base}.reclaim.stale-`];
   let entries: string[];
   try {
     entries = fs.readdirSync(parent);
@@ -286,7 +317,7 @@ function sweepLockDebris(): void {
     return;
   }
   for (const name of entries) {
-    if (!name.startsWith(stalePrefix)) continue;
+    if (!stalePrefixes.some((prefix) => name.startsWith(prefix))) continue;
     const debris = path.join(parent, name);
     try {
       fs.rmSync(debris, { recursive: true, force: true });
@@ -319,6 +350,7 @@ export async function sweepOrphans(): Promise<void> {
   await sweepOrphanXvfb(selfPids);
   sweepStaleProfiles();
   sweepLockDebris();
+  reportProcDenied();
 }
 
 // ================================================================================================
@@ -327,6 +359,8 @@ export async function sweepOrphans(): Promise<void> {
 let weOwnLock = false;
 /** The incarnation of LOCK_DIR this process created; see incarnationOf() and releaseLock(). */
 let ourLockIncarnation: string | null = null;
+/** The incarnation of LOCK_RECLAIM_DIR this process took; see releaseReclaimLock(). */
+let ourReclaimIncarnation: string | null = null;
 
 /** Parse a pid file written by the lock protocol: null when absent, empty or not a pid. */
 function readPidFile(file: string): number | null {
@@ -408,21 +442,42 @@ type LockAttempt =
   /** A stale lock was broken, or another process won a race — retry immediately. */
   | { status: 'retry' };
 
-/** True when the reclaim lock was left behind by a process that died mid-reclaim. */
+/**
+ * True when the reclaim lock was left behind by a process that died mid-reclaim.
+ *
+ * The pid decides FIRST, and a live pid decides outright: a reclaimer that has stalled — suspended,
+ * blocked on a hung filesystem — is slow, not dead, and breaking its intent lock would put two
+ * reclaimers back into the sequence this lock exists to serialise. Age is consulted ONLY for a lock
+ * that names no pid at all, where it is the only way to tell "created a microsecond ago" from
+ * "created by a process that died before it could write".
+ */
 function reclaimLockIsStranded(): boolean {
+  const pid = readPidFile(LOCK_RECLAIM_PID_FILE);
+  if (pid !== null) return !pidAlive(pid);
   let ageMs: number;
   try {
     ageMs = Date.now() - createdMs(fs.statSync(LOCK_RECLAIM_DIR));
   } catch {
     return false; // already gone; the caller's next mkdir settles it
   }
-  if (ageMs >= LOCK_RECLAIM_TTL_MS) return true;
-  const pid = readPidFile(LOCK_RECLAIM_PID_FILE);
-  // A young reclaim lock with no pid yet is the microsecond between its mkdir and its write.
-  return pid !== null && !pidAlive(pid);
+  return ageMs >= LOCK_RECLAIM_TTL_MS;
 }
 
-/** Take the reclaim intent lock, or report that another acquirer is already breaking the lock. */
+/**
+ * Take the reclaim intent lock, or report that another acquirer is already breaking the lock.
+ *
+ * Breaking a STRANDED intent lock is the same hazard one level down, so it is broken the same way
+ * the outer lock is: rename the judged incarnation aside, then prove that what was carried off is
+ * the incarnation the verdict was formed about. Two acquirers that both judged the same stranded
+ * lock cannot therefore both end up holding it — the one whose rename carried off the other's fresh
+ * intent lock puts it back and returns false.
+ *
+ * Once this returns true the caller's exclusivity is self-sustaining: the directory names a LIVE
+ * pid, and reclaimLockIsStranded() above never reports a live-pid lock as stranded, so no other
+ * acquirer may legitimately break it. The only opening is the instant between the mkdir and the pid
+ * write, which the read-back below closes: a holder whose incarnation is no longer at the path lost
+ * it during that instant, and is told so rather than proceeding.
+ */
 function tryTakeReclaimLock(): boolean {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -430,30 +485,71 @@ function tryTakeReclaimLock(): boolean {
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
       if (attempt > 0) return false; // someone re-took it the instant we cleared it
+      const judged = incarnationOf(LOCK_RECLAIM_DIR);
+      if (judged === null) continue; // it vanished; go straight back to the mkdir
       if (!reclaimLockIsStranded()) return false;
       warn(`clearing a stranded E2E reclaim lock at ${LOCK_RECLAIM_DIR}`);
+      const aside = `${LOCK_RECLAIM_DIR}.stale-${process.pid}-${Date.now()}`;
       try {
-        fs.rmSync(LOCK_RECLAIM_DIR, { recursive: true, force: true });
+        fs.renameSync(LOCK_RECLAIM_DIR, aside);
       } catch {
+        return false; // someone broke it first
+      }
+      const moved = incarnationOf(aside);
+      if (moved !== null && moved !== judged) {
+        // We carried off an intent lock created AFTER our verdict — someone else broke the stranded
+        // one and took it. Put it back and lose deliberately, saying so: a reclaimer that stands
+        // down silently is indistinguishable from one that never tried.
+        warn(
+          `another acquirer took the E2E reclaim lock ${LOCK_RECLAIM_DIR} first; putting its lock ` +
+            `back and standing down`
+        );
+        try {
+          fs.renameSync(aside, LOCK_RECLAIM_DIR);
+        } catch (err2) {
+          warn(`could not restore an E2E reclaim lock: ${(err2 as Error).message}; it is at ${aside}`);
+        }
         return false;
+      }
+      try {
+        fs.rmSync(aside, { recursive: true, force: true });
+      } catch {
+        /* debris only; sweepLockDebris() removes it */
       }
       continue;
     }
+    const ours = incarnationOf(LOCK_RECLAIM_DIR);
     try {
       fs.writeFileSync(LOCK_RECLAIM_PID_FILE, String(process.pid), 'utf8');
     } catch {
-      /* advisory: the TTL is what actually bounds a stranded reclaim lock */
+      /* advisory: the TTL is what bounds a reclaim lock that never gets a pid */
     }
+    // Read back: if our incarnation is no longer at the path, someone broke it in the pid-less
+    // instant and this process does NOT hold the reclaim lock.
+    if (ours !== null && incarnationOf(LOCK_RECLAIM_DIR) !== ours) {
+      warn(`lost the E2E reclaim lock at ${LOCK_RECLAIM_DIR} before it named us; retrying`);
+      return false;
+    }
+    ourReclaimIncarnation = ours;
     return true;
   }
   return false;
 }
 
+/** Release the reclaim intent lock — but only the incarnation this process actually took. */
 function releaseReclaimLock(): void {
+  const ours = ourReclaimIncarnation;
+  ourReclaimIncarnation = null;
+  // Never remove an intent lock that is not ours: if ours was broken while we held it, removing
+  // what replaced it would hand a third reclaimer the sequence its holder is still inside.
+  const holder = readPidFile(LOCK_RECLAIM_PID_FILE);
+  if (holder !== null && holder !== process.pid) return;
+  const current = incarnationOf(LOCK_RECLAIM_DIR);
+  if (ours !== null && current !== null && current !== ours) return;
   try {
     fs.rmSync(LOCK_RECLAIM_DIR, { recursive: true, force: true });
   } catch {
-    /* the TTL bounds anything we fail to remove */
+    /* the next sweep removes anything we fail to remove */
   }
 }
 
@@ -539,7 +635,6 @@ function tryTakeLock(): LockAttempt {
   }
 
   weOwnLock = true;
-  ourLockIncarnation = incarnationOf(LOCK_DIR);
   try {
     fs.writeFileSync(LOCK_PID_FILE, String(process.pid), 'utf8'); // first: a pid-less lock is ambiguous
     fs.writeFileSync(LOCK_OWNER_FILE, `${REPO_ROOT} since ${new Date().toISOString()}`, 'utf8');
@@ -554,6 +649,11 @@ function tryTakeLock(): LockAttempt {
         `${path.dirname(LOCK_DIR)} is writable and has free space, then retry.`
     );
   }
+  // AFTER the writes, never before. On a filesystem that reports no btime, createdMs() falls back
+  // to mtime — and writing `pid` and `owner` INTO the directory changes its mtime, so a token taken
+  // before them is one this process could never match again, and releaseLock() would refuse to
+  // remove its OWN lock on every single run. On a btime filesystem this ordering is a no-op.
+  ourLockIncarnation = incarnationOf(LOCK_DIR);
   installFatalHandlers();
   return { status: 'acquired' };
 }
