@@ -140,6 +140,9 @@ export async function hoverLintRange(win: Page, word: string): Promise<void> {
  * Since v1.0.2 fully suppresses the stock hover tooltip, no pointer-parking gymnastics are needed to
  * distinguish the click path — a card can only come from this click. We click the `.cm-lintRange` and
  * wait for the click tooltip's card, retrying the click a few times to absorb the debounced re-lint.
+ *
+ * `win` is any Joplin renderer page: pass the main window, or the secondary "Open in new window"
+ * page (launch.ts findSecondaryWindow) to drive the card painted in THAT window.
  */
 export async function openHarperCardByClick(win: Page, word: string) {
   const range = win.locator('.cm-lintRange').filter({ hasText: word }).first();
@@ -386,6 +389,20 @@ async function submitGotoAnything(win: Page, text: string): Promise<void> {
  */
 export async function runCommand(win: Page, labelQuery: string): Promise<void> {
   await submitGotoAnything(win, `:${labelQuery}`);
+}
+
+/**
+ * Open the currently selected note in a SECOND Joplin window ("Open in new window").
+ *
+ * Driven through the command palette (`openNoteInNewWindow`, label "Open in new window") rather than
+ * the Ctrl+Alt+N accelerator: Electron resolves menu accelerators in the browser process from native
+ * key events, which CDP-injected input never produces, whereas Goto Anything's `:` mode is plain DOM
+ * and is already how the other specs run commands. The command dispatches WINDOW_OPEN, which
+ * React-portals the note editor into a fresh `about:blank` window — see launch.ts
+ * findSecondaryWindow for how to get a Page for it.
+ */
+export async function openNoteInNewWindow(win: Page): Promise<void> {
+  await runCommand(win, 'openNoteInNewWindow');
 }
 
 /**

@@ -245,6 +245,34 @@ async function findMainWindow(browser: Browser, timeoutMs: number): Promise<Page
   throw new Error('Could not find the Joplin main window via CDP');
 }
 
+/**
+ * Locate the SECONDARY note window ("Open in new window") across CDP contexts.
+ *
+ * Joplin creates it from the main renderer with `window.open('about:blank')` and React-portals the
+ * note editor into its body (gui/NewWindowOrIFrame.tsx), so it shows up as an extra `about:blank`
+ * page in the same CDP browser — never as its own index.html. We therefore skip the main window and
+ * the plugin webviews (`?pluginId=`) and wait for the first remaining page that actually has a
+ * CodeMirror editor in it, which also guarantees the portal has finished mounting.
+ */
+export async function findSecondaryWindow(browser: Browser, timeoutMs = 60_000): Promise<Page> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    for (const ctx of browser.contexts()) {
+      for (const p of ctx.pages()) {
+        if (p.isClosed()) continue;
+        const url = p.url();
+        if (url.includes('index.html') || url.includes('pluginId=')) continue;
+        const hasEditor = await p
+          .evaluate(() => !!document.querySelector('.cm-content'))
+          .catch(() => false);
+        if (hasEditor) return p;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  throw new Error('Could not find the secondary Joplin note window via CDP');
+}
+
 /** Wait until the Joplin main UI has rendered (React app mounted, not a blank window). */
 export async function waitForJoplinReady(win: Page): Promise<void> {
   await win.waitForFunction(

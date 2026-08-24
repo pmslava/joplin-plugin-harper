@@ -88,6 +88,32 @@ function alreadyActivated(view: unknown | undefined): boolean {
 	}
 }
 
+// -----------------------------------------------------------------------------
+// PER-WINDOW DOCUMENT. Joplin's "Open in new window" renders the SAME React editor into a SECOND
+// Electron window (window.open('about:blank') + createPortal, gui/NewWindowOrIFrame.tsx) while this
+// content script keeps running in the MAIN renderer's JS realm — so the bare global `document` is
+// ALWAYS the main window's, no matter which window the editor is painted in. Joplin replicates its own
+// theme/chrome stylesheets into each secondary document but has no mechanism to replicate a plugin's
+// appended <style>, so every stylesheet injection and every node we create must go through the
+// EDITOR'S own document instead. `view.dom.ownerDocument` is that document (CM6 adopts the view's DOM
+// into the portal target on mount); the fallback keeps the DOM-less Node harness a no-op.
+// -----------------------------------------------------------------------------
+function documentOf(view: EditorView | undefined): Document | undefined {
+	try {
+		const dom = view ? (view.dom as HTMLElement) : null;
+		if (dom && dom.ownerDocument) return dom.ownerDocument;
+	} catch {
+		/* fall through to the global document */
+	}
+	return typeof document === 'undefined' ? undefined : document;
+}
+
+/** The window that owns `el` — the secondary window when the editor is painted there. */
+function windowOf(el: HTMLElement): Window {
+	const doc = el.ownerDocument;
+	return (doc && doc.defaultView) || window;
+}
+
 // Mobile tap-target CSS (Material ~48 dp / Apple HIG ~44 pt). Injected only when the platform handshake
 // reports 'mobile'; it bumps every card button to >=44 px min-height with roomier spacing so pills,
 // add-to-dictionary and dismiss are comfortable to tap (mobile-product-design.md §2). Desktop is
@@ -102,13 +128,13 @@ const MOBILE_CSS = `
 .harper-container.harper-mobile .harper-disable-btn{min-width:44px;min-height:44px;}
 .harper-container.harper-mobile .harper-dict-btn{min-width:44px;min-height:44px;}
 `;
-function ensureMobileStyles(): void {
-	if (typeof document === 'undefined') return;
-	if (document.getElementById(MOBILE_STYLE_ELEMENT_ID)) return;
-	const style = document.createElement('style');
+function ensureMobileStyles(doc: Document): void {
+	if (!doc) return;
+	if (doc.getElementById(MOBILE_STYLE_ELEMENT_ID)) return;
+	const style = doc.createElement('style');
 	style.id = MOBILE_STYLE_ELEMENT_ID;
 	style.textContent = MOBILE_CSS;
-	(document.head || document.documentElement).appendChild(style);
+	(doc.head || doc.documentElement).appendChild(style);
 }
 
 // Platform reported by the plugin main process via the getConfig handshake; 'mobile' enlarges tap
@@ -296,14 +322,17 @@ const CARD_CSS = `
 .harper-container.harper-dark .harper-btn[style*="background: #e5e5e5"]{background:#4b4b4b;color:#ffffff;}
 `;
 
-/** Inject the underline + card stylesheet once into the document head (idempotent). */
-function ensureStyles(): void {
-	if (typeof document === 'undefined') return;
-	if (document.getElementById(STYLE_ELEMENT_ID)) return;
-	const style = document.createElement('style');
+/**
+ * Inject the underline + card stylesheet once into `doc`'s head (idempotent PER DOCUMENT — a
+ * secondary window gets its own copy; see documentOf).
+ */
+function ensureStyles(doc: Document): void {
+	if (!doc) return;
+	if (doc.getElementById(STYLE_ELEMENT_ID)) return;
+	const style = doc.createElement('style');
 	style.id = STYLE_ELEMENT_ID;
 	style.textContent = buildKindCss() + CARD_CSS;
-	(document.head || document.documentElement).appendChild(style);
+	(doc.head || doc.documentElement).appendChild(style);
 }
 
 // -----------------------------------------------------------------------------
@@ -335,7 +364,7 @@ function isDarkEditor(view: EditorView): boolean {
 	try {
 		let el: HTMLElement | null = (view.contentDOM as HTMLElement) || (view.dom as HTMLElement);
 		for (let i = 0; el && i < 12; i++) {
-			const rgb = parseRgb(getComputedStyle(el).backgroundColor);
+			const rgb = parseRgb(windowOf(el).getComputedStyle(el).backgroundColor);
 			if (rgb && rgb.a > 0) return isDark(rgb);
 			el = el.parentElement;
 		}
@@ -343,7 +372,8 @@ function isDarkEditor(view: EditorView): boolean {
 		/* fall through */
 	}
 	try {
-		const varBg = getComputedStyle(view.dom).getPropertyValue('--joplin-background-color').trim();
+		const dom = view.dom as HTMLElement;
+		const varBg = windowOf(dom).getComputedStyle(dom).getPropertyValue('--joplin-background-color').trim();
 		if (varBg) {
 			if (varBg.startsWith('#')) {
 				const hex = varBg.slice(1);
@@ -369,17 +399,17 @@ function isDarkEditor(view: EditorView): boolean {
 // (dropping every attribute), exactly matching what Harper's renderer emits (<code>/<em>/<strong>).
 // -----------------------------------------------------------------------------
 const ALLOWED_TAGS = new Set(['CODE', 'EM', 'STRONG', 'B', 'I']);
-function sanitizeInto(target: HTMLElement, html: string): void {
-	const template = document.createElement('template');
+function sanitizeInto(doc: Document, target: HTMLElement, html: string): void {
+	const template = doc.createElement('template');
 	template.innerHTML = html;
 	const walk = (src: Node, dst: Node): void => {
 		src.childNodes.forEach((child) => {
 			if (child.nodeType === Node.TEXT_NODE) {
-				dst.appendChild(document.createTextNode(child.textContent || ''));
+				dst.appendChild(doc.createTextNode(child.textContent || ''));
 			} else if (child.nodeType === Node.ELEMENT_NODE) {
 				const el = child as HTMLElement;
 				if (ALLOWED_TAGS.has(el.tagName)) {
-					const clean = document.createElement(el.tagName.toLowerCase());
+					const clean = doc.createElement(el.tagName.toLowerCase());
 					walk(el, clean); // no attributes copied
 					dst.appendChild(clean);
 				} else {
@@ -461,33 +491,36 @@ function renderCard(
 	lint: PlainLint,
 	relint: (view: EditorView) => void,
 ): HTMLElement {
-	ensureStyles();
+	// The card is built for THIS view's window (documentOf), so it is styled and painted correctly
+	// whether the editor lives in the main window or in a secondary "Open in new window" one.
+	const doc = documentOf(view);
+	ensureStyles(doc);
 	const color = lintKindColor(lint.kind);
 
-	const container = document.createElement('div');
+	const container = doc.createElement('div');
 	container.className = 'harper-container fade-in';
 	container.style.setProperty('--harper-kind-color', color);
 	if (isDarkEditor(view)) container.classList.add('harper-dark');
 	if (isMobilePlatform) {
-		ensureMobileStyles();
+		ensureMobileStyles(doc);
 		container.classList.add('harper-mobile');
 	}
 
 	// --- header: kind title (colored underline) + controls (disable-rule, close) ----------------
-	const header = document.createElement('div');
+	const header = doc.createElement('div');
 	header.className = 'harper-header';
 	header.style.borderBottom = `2px solid ${color}`;
 
-	const title = document.createElement('span');
+	const title = doc.createElement('span');
 	title.className = 'harper-title';
 	title.textContent = lint.kindPretty || lint.kind;
 	header.appendChild(title);
 
-	const controls = document.createElement('div');
+	const controls = doc.createElement('div');
 	controls.className = 'harper-controls';
 
 	if (lint.ruleName) {
-		const disableBtn = document.createElement('button');
+		const disableBtn = doc.createElement('button');
 		disableBtn.type = 'button';
 		disableBtn.className = 'harper-disable-btn';
 		disableBtn.title = `Disable rule ${lint.ruleName}`;
@@ -500,7 +533,7 @@ function renderCard(
 		controls.appendChild(disableBtn);
 	}
 
-	const closeBtn = document.createElement('button');
+	const closeBtn = doc.createElement('button');
 	closeBtn.type = 'button';
 	closeBtn.className = 'harper-close-btn';
 	closeBtn.title = 'Close';
@@ -513,20 +546,20 @@ function renderCard(
 	container.appendChild(header);
 
 	// --- body: message_html with the per-kind-underlined <code> word chip -----------------------
-	const body = document.createElement('div');
+	const body = doc.createElement('div');
 	body.className = 'harper-body';
-	sanitizeInto(body, lint.messageHtml || lint.message || '');
+	sanitizeInto(doc, body, lint.messageHtml || lint.message || '');
 	container.appendChild(body);
 
 	// --- footer: suggestion pills (left), dictionary icon + Dismiss (right) ---------------------
-	const footer = document.createElement('div');
+	const footer = doc.createElement('div');
 	footer.className = 'harper-footer';
 
-	const left = document.createElement('div');
+	const left = doc.createElement('div');
 	left.className = 'harper-child-cont';
 	for (const suggestion of lint.suggestions) {
 		const label = suggestionPillLabel(suggestion);
-		const pill = document.createElement('button');
+		const pill = doc.createElement('button');
 		pill.type = 'button';
 		pill.className = 'harper-btn';
 		pill.style.background = color;
@@ -543,12 +576,12 @@ function renderCard(
 	}
 	footer.appendChild(left);
 
-	const right = document.createElement('div');
+	const right = doc.createElement('div');
 	right.className = 'harper-child-cont';
 
 	// Add-to-dictionary — Spelling lints only (UI spec §2.5a).
 	if (lint.kind === 'Spelling') {
-		const dictBtn = document.createElement('button');
+		const dictBtn = doc.createElement('button');
 		dictBtn.type = 'button';
 		dictBtn.className = 'harper-btn harper-dict-btn';
 		dictBtn.title = 'Add word to user dictionary';
@@ -563,7 +596,7 @@ function renderCard(
 	}
 
 	// Dismiss (= our Phase-1 "Ignore") — grey pill, always present (UI spec §2.5b).
-	const dismissBtn = document.createElement('button');
+	const dismissBtn = doc.createElement('button');
 	dismissBtn.type = 'button';
 	dismissBtn.className = 'harper-btn';
 	dismissBtn.style.background = '#e5e5e5';
@@ -661,10 +694,11 @@ function buildClickTooltip(from: number, to: number, diagnostic: Diagnostic): To
 		end: to,
 		above: false,
 		create: (view: EditorView) => {
+			const doc = documentOf(view);
 			const card = diagnostic.renderMessage
 				? (diagnostic.renderMessage(view) as HTMLElement)
-				: document.createElement('div');
-			const dom = document.createElement('div');
+				: doc.createElement('div');
+			const dom = doc.createElement('div');
 			dom.className = 'harper-click-tooltip';
 			dom.appendChild(card);
 			return { dom };
@@ -774,14 +808,15 @@ export default (context: ContentScriptContext) => {
 					if (config) applyUnderlineStyle(config.underlineStyle);
 					if (config && config.platform === 'mobile') {
 						isMobilePlatform = true;
-						ensureMobileStyles();
+						ensureMobileStyles(documentOf(editorControl.editor));
 					}
 				} catch {
 					/* keep the default */
 				}
 
-				// Inject styles eagerly so the first underline paints with the per-kind color.
-				ensureStyles();
+				// Inject styles eagerly so the first underline paints with the per-kind color — into THIS
+				// editor's own document, which is the secondary window's when the note was opened there.
+				ensureStyles(documentOf(editorControl.editor));
 
 				// linter delay 0: our `debouncedLint` owns the idle-delay against the mutable value.
 				// tooltipFilter: () => null FULLY SUPPRESSES the stock hover tooltip (v1.0.2). The
