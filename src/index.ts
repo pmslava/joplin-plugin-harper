@@ -61,12 +61,15 @@ interface LintMessage { type: 'lint'; text: string; }
 interface AddWordMessage { type: 'addWord'; word: string; }
 interface IgnoreLintMessage { type: 'ignoreLint'; text: string; start: number; end: number; ruleName: string; }
 interface DisableRuleMessage { type: 'disableRule'; ruleName: string; }
+/** The multi-window refresh long-poll (see the pokeForceLint block for the full design). */
+interface WaitForRefreshMessage { type: 'waitForRefresh'; generation: number; }
 type IncomingMessage =
 	| GetConfigMessage
 	| LintMessage
 	| AddWordMessage
 	| IgnoreLintMessage
-	| DisableRuleMessage;
+	| DisableRuleMessage
+	| WaitForRefreshMessage;
 
 // webpack rewrites bare `require(...)` inside the bundle; __non_webpack_require__ emits a raw
 // runtime `require` resolved by Node/Electron instead. The plugin main process runs with Node
@@ -490,9 +493,70 @@ async function getLinter(): Promise<LocalLinter> {
 }
 
 // -----------------------------------------------------------------------------
-// Main -> editor re-lint poke.
+// Main -> editor re-lint poke (MULTI-WINDOW).
 // -----------------------------------------------------------------------------
+// `editor.execCommand` cannot reach an unfocused window: Joplin registers that command's runtime
+// once PER EDITOR with a priority that is 0 whenever the editor's document lacks focus, and
+// CommandService executes exactly ONE highest-priority runtime (useWindowCommandHandler +
+// getWindowCommandPriority in the app bundle). So with several note windows open, an execCommand
+// poke alone refreshes only the focused editor and leaves every other window stale — old
+// underline style, old debounce, old dictionary/rule state. The poke therefore has two halves:
+//
+//   1. CONFIG-GENERATION LONG-POLL — every open desktop editor keeps one 'waitForRefresh'
+//      message parked here (holding a reply promise open is safe: the desktop plugin IPC keys
+//      replies by callbackId with NO timeout). Bumping the generation resolves them ALL, so every
+//      window refreshes, focused or not. A parked reply is bounded by a heartbeat: after
+//      REFRESH_HEARTBEAT_MS it resolves with the current (unchanged) generation and the content
+//      script immediately re-parks, so the scheme stays live even across a bridge that will not
+//      hold a reply open indefinitely.
+//   2. the execCommand poke (unchanged) — the focused window's path, and the ONLY path on mobile
+//      (a single window; the content script does not subscribe there).
+let configGeneration = 0;
+
+interface RefreshWaiter {
+	resolve: (reply: { generation: number }) => void;
+	timer: ReturnType<typeof setTimeout>;
+}
+let refreshWaiters: RefreshWaiter[] = [];
+
+const REFRESH_HEARTBEAT_MS = 25_000;
+
+function bumpConfigGeneration(): void {
+	configGeneration++;
+	const waiters = refreshWaiters;
+	refreshWaiters = [];
+	for (const waiter of waiters) {
+		clearTimeout(waiter.timer);
+		waiter.resolve({ generation: configGeneration });
+	}
+}
+
+/**
+ * The 'waitForRefresh' long-poll: an up-to-date editor's request parks until the next
+ * bumpConfigGeneration (or the heartbeat); a stale editor's request is answered immediately, so a
+ * bump that landed while that editor was between polls is never lost. Deliberately does NOT touch
+ * `editorOpen`: these requests arrive continuously from every open editor, so treating one as the
+ * getConfig handshake would pin the L3 note-write deferral open forever.
+ */
+function waitForRefresh(clientGeneration: number): Promise<{ generation: number }> {
+	if (clientGeneration !== configGeneration) {
+		return Promise.resolve({ generation: configGeneration });
+	}
+	return new Promise((resolve) => {
+		const waiter: RefreshWaiter = {
+			resolve,
+			timer: setTimeout(() => {
+				refreshWaiters = refreshWaiters.filter((w) => w !== waiter);
+				resolve({ generation: configGeneration });
+			}, REFRESH_HEARTBEAT_MS),
+		};
+		refreshWaiters.push(waiter);
+	});
+}
+
 async function pokeForceLint(): Promise<void> {
+	// Resolve every parked subscription FIRST (all windows), then poke the focused editor.
+	bumpConfigGeneration();
 	try {
 		await joplin.commands.execute('editor.execCommand', { name: 'harper.forceLint' });
 	} catch {
@@ -1053,8 +1117,15 @@ async function handleMessage(message: IncomingMessage | unknown): Promise<unknow
 				underlineStyle: underlineStyle === 'solid' ? 'solid' : 'squiggly',
 				// The content script sizes its tap targets off this (>=44 px on mobile).
 				platform: isMobile() ? 'mobile' : 'desktop',
+				// The multi-window refresh dedupe token: the content script records which generation a
+				// getConfig-driven refresh served, keeping a poke-plus-subscription overlap in the
+				// focused window to AT MOST one redundant relint (the two getConfigs race, so the
+				// second usually still sees a not-yet-updated token) — and never a missed one.
+				generation: configGeneration,
 			};
 		}
+		case 'waitForRefresh':
+			return waitForRefresh(typeof msg.generation === 'number' ? msg.generation : -1);
 		case 'lint':
 			return lintText(msg.text ?? '');
 		case 'addWord':

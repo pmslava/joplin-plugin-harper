@@ -114,6 +114,27 @@ function windowOf(el: HTMLElement): Window {
 	return (doc && doc.defaultView) || window;
 }
 
+/**
+ * Claim the refresh-subscription epoch for an editorControl; returns a predicate that says whether
+ * this activation still owns it. Kept on `window` (shared across module evaluations in the realm,
+ * exactly like the L5 registry above) and keyed PER CONTROL — not per window — so if `plugin()` is
+ * ever re-invoked on the same control (new view), the new activation's subscription supersedes the
+ * old loop instead of accumulating a second one; the superseded loop sees ownsEpoch() go false and
+ * exits on its next iteration.
+ */
+function claimSubscriptionEpoch(control: object): () => boolean {
+	try {
+		const w = window as unknown as { __harperSubscriptionEpochs?: WeakMap<object, number> };
+		if (!w.__harperSubscriptionEpochs) w.__harperSubscriptionEpochs = new WeakMap<object, number>();
+		const epochs = w.__harperSubscriptionEpochs;
+		const epoch = (epochs.get(control) ?? 0) + 1;
+		epochs.set(control, epoch);
+		return () => epochs.get(control) === epoch;
+	} catch {
+		return () => true; // no window (non-browser harness) — a single loop, nothing to supersede
+	}
+}
+
 // Mobile tap-target CSS (Material ~48 dp / Apple HIG ~44 pt). Injected only when the platform handshake
 // reports 'mobile'; it bumps every card button to >=44 px min-height with roomier spacing so pills,
 // add-to-dictionary and dismiss are comfortable to tap (mobile-product-design.md §2). Desktop is
@@ -797,15 +818,212 @@ export default (context: ContentScriptContext) => {
 			];
 			editorControl.addExtension(clickExtension);
 
+			// -----------------------------------------------------------------------------------------
+			// GENERATION-TAGGED CONFIG REFRESH (the multi-window fix).
+			//
+			// The plugin main process stamps every getConfig reply — and every 'waitForRefresh'
+			// resolution — with its config generation. Two refresh paths share it:
+			//   * the `harper.forceLint` poke (below): Joplin dispatches it to the FOCUSED window's
+			//     editor only, so it cannot be the whole story with several note windows open;
+			//   * the long-poll subscription (subscribeToRefreshPokes): one parked 'waitForRefresh'
+			//     per open desktop editor, resolved for ALL of them the instant anything bumps the
+			//     generation — this is what un-stales the unfocused windows.
+			//
+			// `lastSeenGeneration` is PER-EDITOR state and must stay in this closure: every window's
+			// content script runs in the MAIN renderer's JS realm (secondary windows are rendered into
+			// their documents from the main realm), so module-level state is shared across windows,
+			// and a shared generation would let the focused window's refresh suppress the unfocused
+			// windows' — the very staleness bug the subscription exists to fix.
+			let lastSeenGeneration = -1;
+
+			// POSITIVE desktop gate for the subscription: only a handshake that actually SAID
+			// 'desktop' subscribes. Gating on `!isMobilePlatform` would be fail-OPEN — a failed first
+			// handshake leaves that flag false and would start the (mobile-unverified) long-poll on
+			// mobile; an unknown platform instead fails closed to the pre-existing poke-only behavior.
+			let platformIsDesktop = false;
+
+			interface RefreshConfig {
+				enabled?: boolean;
+				debounceMs?: number;
+				underlineStyle?: string;
+				platform?: string;
+				generation?: number;
+			}
+
+			// Apply a getConfig reply (delay + underline style + generation) and relint this editor.
+			// `editorControl.editor` is read freshly so a note switch (new view) is handled. A null
+			// config (failed handshake) keeps the current values but still refreshes the underlines.
+			const applyConfigAndRelint = (config: RefreshConfig | null): void => {
+				if (config && typeof config.debounceMs === 'number') currentDelay = config.debounceMs;
+				if (config) applyUnderlineStyle(config.underlineStyle);
+				if (config && typeof config.generation === 'number') lastSeenGeneration = config.generation;
+				const current = editorControl.editor;
+				if (current) relint(current);
+			};
+
+			// The shared refresh: re-read the config, then relint INSIDE the reply (see the ORDERING
+			// note on the harper.forceLint command below). With `skipWhenGenerationSeen`, a reply whose
+			// generation this editor already refreshed for is dropped — keeping a poke-plus-
+			// subscription overlap in the focused window to AT MOST one redundant relint (the bump
+			// fires before the execCommand poke, so the two getConfigs race and the skip usually sees
+			// a not-yet-updated token) without ever suppressing another window's refresh (the token is
+			// per-editor). An un-stamped reply always relints.
+			//
+			// Returns whether the refresh was served a REAL config. The rejection path still relints
+			// (with the current values — a failed handshake must never leave the underlines stale) but
+			// reports false, and applyConfigAndRelint never advances the generation token from a null
+			// config — so a caller can tell "this generation is genuinely handled" (advance the token)
+			// from "relinted blind, retry for the config" (leave it stale).
+			const refreshFromConfig = (skipWhenGenerationSeen: boolean): Promise<boolean> =>
+				context.postMessage({ type: 'getConfig' }).then(
+					(config) => {
+						const c = config as RefreshConfig | null;
+						if (
+							skipWhenGenerationSeen &&
+							c &&
+							typeof c.generation === 'number' &&
+							c.generation === lastSeenGeneration
+						) {
+							return true; // the other refresh path already handled this generation
+						}
+						applyConfigAndRelint(c);
+						return true;
+					},
+					() => {
+						/* handshake failed — keep the current delay/style, but still refresh */
+						applyConfigAndRelint(null);
+						return false;
+					},
+				);
+
+			const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+			// Whether this activation's editor is still live. Reads `editorControl.editor` freshly (a
+			// note switch can swap the view) and requires an attached DOM inside a still-open window —
+			// this is what lets a closed secondary window's subscription loop terminate instead of
+			// long-polling forever in the shared realm. documentOf resolves the editor's OWN document
+			// (the secondary window's when the note is painted there — see the per-window note on it).
+			const editorLooksAlive = (): boolean => {
+				try {
+					const view = editorControl.editor;
+					if (!view || !view.dom) return false;
+					const doc = documentOf(view);
+					const win = doc ? doc.defaultView : null;
+					if (!win || win.closed) return false;
+					return view.dom.isConnected;
+				} catch {
+					return false;
+				}
+			};
+
+			// BOUNDED grace re-checks, so a TRANSIENT detach (the editor DOM being re-parented during a
+			// layout change) cannot permanently kill the subscription: a negative first look is
+			// re-checked a few times over ~5s before the loop gives up. A closed window stays dead on
+			// every re-check, so real teardown still terminates the loop promptly.
+			const editorStillAlive = async (): Promise<boolean> => {
+				if (editorLooksAlive()) return true;
+				for (let attempt = 0; attempt < 3; attempt++) {
+					await sleep(1700);
+					if (editorLooksAlive()) return true;
+				}
+				return false;
+			};
+
+			const REFRESH_ERROR_BACKOFF_MS = 5000;
+			// Client-side bound on one parked poll. The main-side ~25s heartbeat keeps a WORKING bridge
+			// live, but cannot help if the bridge silently drops a message (neither resolves nor
+			// rejects) — without this race the loop would stall forever on that one promise.
+			const REFRESH_POLL_TIMEOUT_MS = 60_000;
+			const POLL_TIMED_OUT = 'harper-poll-timeout';
+
+			// The long-poll loop: park a 'waitForRefresh' carrying the last generation this editor
+			// refreshed for; the main process answers immediately when that is stale (a bump landed
+			// while we were between polls), on the next bump while parked, or as a plain heartbeat
+			// (same generation) after ~25s. One loop per activated editor: the L5 guard above makes a
+			// double activation on the same VIEW a no-op, and the epoch claim makes a re-activation on
+			// the same CONTROL (new view) supersede the previous loop instead of stacking a second one.
+			//
+			// The generation token only advances on a refresh that was served a real config; a failed
+			// refresh leaves it stale so the NEXT poll is answered instantly and retried — after the
+			// error backoff, which is what keeps that instant answer from hot-spinning.
+			const subscribeToRefreshPokes = (): void => {
+				const ownsEpoch = claimSubscriptionEpoch(editorControl as object);
+				void (async () => {
+					while (ownsEpoch() && (await editorStillAlive())) {
+						// The whole body is containment-wrapped: a SYNCHRONOUS throw anywhere in it (e.g.
+						// context.postMessage throwing outright on a torn-down bridge, before any promise
+						// exists) would otherwise reject this void IIFE — an unhandled rejection and a
+						// permanently dead subscription, i.e. a silent regression to the pre-fix behavior.
+						// A throw takes the same route as a failed round trip: back off, then re-enter
+						// through the epoch/liveness check above.
+						try {
+							let generation: number | null = null;
+							let timedOut = false;
+							const timeout: { handle: ReturnType<typeof setTimeout> | null } = { handle: null };
+							try {
+								const reply = (await Promise.race([
+									context.postMessage({
+										type: 'waitForRefresh',
+										generation: lastSeenGeneration,
+									}),
+									new Promise<typeof POLL_TIMED_OUT>((resolve) => {
+										timeout.handle = setTimeout(() => resolve(POLL_TIMED_OUT), REFRESH_POLL_TIMEOUT_MS);
+									}),
+								])) as { generation?: number } | typeof POLL_TIMED_OUT | null;
+								if (reply === POLL_TIMED_OUT) {
+									timedOut = true;
+								} else {
+									generation =
+										reply && typeof reply.generation === 'number' ? reply.generation : null;
+								}
+							} catch {
+								generation = null;
+							} finally {
+								if (timeout.handle) clearTimeout(timeout.handle);
+							}
+							if (timedOut) continue; // dropped reply — re-iterate through the liveness check
+							if (generation === null) {
+								// Failed/malformed round trip: back off, then re-park with the stale generation —
+								// anything that changed meanwhile is then answered immediately.
+								await sleep(REFRESH_ERROR_BACKOFF_MS);
+								continue;
+							}
+							if (generation !== lastSeenGeneration) {
+								// Liveness/ownership BEFORE claiming the generation: a break here must leave the
+								// token stale so this editor's own command-path refresh is never wrongly skipped.
+								if (!ownsEpoch() || !(await editorStillAlive())) break;
+								const tokenBefore = lastSeenGeneration;
+								if (!(await refreshFromConfig(false))) {
+									// Relinted blind (see refreshFromConfig); token deliberately NOT advanced, so
+									// the retry below is answered instantly — backoff first or it would hot-spin.
+									await sleep(REFRESH_ERROR_BACKOFF_MS);
+									continue;
+								}
+								// A stamped reply advanced the token inside applyConfigAndRelint — the stamp is
+								// authoritative, including DOWNWARD (a restarted plugin process starts its
+								// generations over). Only when the reply left the token untouched (un-stamped)
+								// do we claim THIS resolution's generation ourselves — unconditionally, since
+								// flooring it would strand a token above a restarted server's generation in an
+								// instant-answer loop with no backoff.
+								if (lastSeenGeneration === tokenBefore) lastSeenGeneration = generation;
+							}
+							// generation === lastSeen is the heartbeat: nothing changed, just re-park.
+						} catch {
+							await sleep(REFRESH_ERROR_BACKOFF_MS);
+						}
+					}
+				})();
+			};
+
 			// Ask the plugin main process for the configured debounce before building the linter, then
 			// keep it live via the `harper.forceLint` poke.
 			void (async () => {
 				try {
-					const config = (await context.postMessage({ type: 'getConfig' })) as
-						| { enabled: boolean; debounceMs: number; underlineStyle?: string; platform?: string }
-						| null;
+					const config = (await context.postMessage({ type: 'getConfig' })) as RefreshConfig | null;
 					if (config && typeof config.debounceMs === 'number') currentDelay = config.debounceMs;
 					if (config) applyUnderlineStyle(config.underlineStyle);
+					if (config && typeof config.generation === 'number') lastSeenGeneration = config.generation;
+					if (config && config.platform === 'desktop') platformIsDesktop = true;
 					if (config && config.platform === 'mobile') {
 						isMobilePlatform = true;
 						ensureMobileStyles(documentOf(editorControl.editor));
@@ -842,35 +1060,33 @@ export default (context: ContentScriptContext) => {
 				// `forceLinting`. `harper.forceLint` therefore genuinely refreshes the underlines AND
 				// re-reads debounceMs + underlineStyle (via getConfig), so both apply live — no reopen.
 				//
-				// ORDERING (v1.2.0): the relint now runs INSIDE the getConfig continuation. debounceMs
-				// only affects the NEXT typing burst, so the old code could fire it in parallel; the
-				// underline style is baked into each Diagnostic's markClass by `toDiagnostic`, so a
-				// relint that races ahead of the config reply would repaint in the OLD style and the
-				// user would see no change until they typed again. Awaiting the config first makes the
-				// poke itself the repaint. The rejection path still relints (with the current values),
-				// so a failed handshake can never leave the underlines stale.
+				// ORDERING (v1.2.0): the relint runs INSIDE the getConfig continuation (see
+				// refreshFromConfig). debounceMs only affects the NEXT typing burst, so the old code
+				// could fire it in parallel; the underline style is baked into each Diagnostic's
+				// markClass by `toDiagnostic`, so a relint that races ahead of the config reply would
+				// repaint in the OLD style and the user would see no change until they typed again.
+				// Awaiting the config first makes the poke itself the repaint. The rejection path still
+				// relints (with the current values), so a failed handshake can never leave the
+				// underlines stale.
+				//
+				// NOTE (multi-window): this command reaches the FOCUSED window's editor only, so it is the
+				// instant path for that window (and the only path on mobile); every other window is
+				// refreshed by the subscription below. The skip flag drops the reply when the
+				// subscription already refreshed this editor for the same generation.
 				try {
 					editorControl.registerCommand('harper.forceLint', () => {
-						const relintNow = (): void => {
-							const current = editorControl.editor;
-							if (current) relint(current);
-						};
-						void context.postMessage({ type: 'getConfig' }).then(
-							(config) => {
-								const c = config as { debounceMs?: number; underlineStyle?: string } | null;
-								if (c && typeof c.debounceMs === 'number') currentDelay = c.debounceMs;
-								if (c) applyUnderlineStyle(c.underlineStyle);
-								relintNow();
-							},
-							() => {
-								/* handshake failed — keep the current delay/style, but still refresh */
-								relintNow();
-							},
-						);
+						void refreshFromConfig(true);
 					});
 				} catch {
 					/* registerCommand unavailable — main's poke will simply no-op */
 				}
+
+				// DESKTOP ONLY, FAIL-CLOSED: subscribe to main-process refresh pokes so THIS editor
+				// relints even when its window is unfocused. Mobile is a single window — the
+				// execCommand poke always reaches it — and the parked-reply IPC behavior is verified
+				// against the desktop PluginRunner only; a FAILED handshake (platform unknown) also
+				// stays poke-only, i.e. exactly the pre-subscription behavior.
+				if (platformIsDesktop) subscribeToRefreshPokes();
 			})();
 		},
 	};
