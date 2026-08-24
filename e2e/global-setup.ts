@@ -3,7 +3,8 @@ import { acquireLock, sweepOrphans, checkRamGate, releaseLock } from './guard';
 /**
  * Playwright globalSetup: enforce single-run resource discipline before ANY Joplin spawns.
  *
- *   1. Acquire the machine-wide lock (fail fast if another run is active).
+ *   1. Acquire the machine-wide lock, queueing behind another live run until it finishes (the
+ *      sibling repos share this lock, so a cockpit/ridgeline run is waited out, not raced).
  *   2. Deterministic orphan sweep — reap leftovers from previous dead runs.
  *   3. Soft RAM gate — abort locally if memory is too low (warn-only under CI).
  *
@@ -11,7 +12,8 @@ import { acquireLock, sweepOrphans, checkRamGate, releaseLock } from './guard';
  * nothing, and the RAM gate only warns.
  */
 export default async function globalSetup(): Promise<void> {
-  acquireLock(); // throws immediately if another run holds the lock
+  // Waits out a live run (E2E_LOCK_WAIT_MS, default 10 min); throws only if it never gets the lock.
+  await acquireLock();
   try {
     await sweepOrphans();
     checkRamGate();

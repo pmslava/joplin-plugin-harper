@@ -1,4 +1,5 @@
 import { defineConfig } from '@playwright/test';
+import { LOCK_WAIT_MS } from './e2e/guard';
 
 /**
  * Playwright config for the real-app Joplin end-to-end tests.
@@ -13,8 +14,9 @@ import { defineConfig } from '@playwright/test';
 export default defineConfig({
   testDir: './e2e',
   // Resource discipline (see e2e/guard.ts): globalSetup takes a machine-wide lock so only one Joplin
-  // E2E run happens at a time, sweeps orphaned processes/profiles/Xvfb left by previous dead runs,
-  // and soft-gates on available RAM; globalTeardown releases the lock. Runs before anything spawns.
+  // E2E run happens at a time — across every sibling plugin repo, queueing behind a run that is
+  // already going — sweeps orphaned processes/profiles/Xvfb left by previous dead runs, and
+  // soft-gates on available RAM; globalTeardown releases the lock. Runs before anything spawns.
   globalSetup: './e2e/global-setup.ts',
   globalTeardown: './e2e/global-teardown.ts',
   // Launching Joplin + waiting for the plugin to register can take a while on a cold profile, and
@@ -23,7 +25,12 @@ export default defineConfig({
   // A stuck suite must stop itself before the CI job's timeout-minutes hard-cancels it: a global
   // timeout ends the run gracefully and still writes the HTML report and traces (a hard cancel does
   // not), so failures stay diagnosable. Kept comfortably under the workflow's 20-minute job cap.
-  globalTimeout: 18 * 60_000,
+  //
+  // globalTimeout covers globalSetup too, so time spent queueing for the machine-wide lock would
+  // otherwise come out of the suite's budget. Locally the lock-wait budget is therefore ADDED on top
+  // (the suite still gets its full 18 minutes after its turn comes); on CI each repo has its own VM,
+  // the lock is never contended, and the cap stays exactly where the job's 20-minute limit needs it.
+  globalTimeout: 18 * 60_000 + (process.env.CI ? 0 : LOCK_WAIT_MS),
   expect: { timeout: 20_000 },
   // A single Joplin instance at a time.
   fullyParallel: false,

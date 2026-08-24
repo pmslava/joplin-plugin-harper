@@ -146,6 +146,13 @@ npm run test:e2e  # full end-to-end suite: launches a real Joplin desktop under 
 npm run dist      # build only -> publish/io.github.pmslava.harper.jpl
 ```
 
+`test:e2e` starts a real Joplin, so it first takes a machine-wide lock
+(`~/.cache/joplin-plugin-e2e.lock`) shared with the author's sibling Joplin plugin repos: exactly one
+E2E run exists at a time, and a run that finds the lock held waits its turn rather than piling a
+second Joplin onto the machine (`E2E_LOCK_WAIT_MS` sets the budget, default 10 minutes; `0` fails
+fast). The rest of the resource discipline — orphan sweep, RAM gate, signal teardown — lives in
+[`e2e/guard.ts`](e2e/guard.ts).
+
 **Architecture in one line:** the grammar checker (harper.js `LocalLinter`, WASM) runs in the
 plugin main process, and a CodeMirror 6 content script draws the underlines and the suggestion card,
 talking to it over Joplin's `postMessage` bridge.

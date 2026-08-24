@@ -1,4 +1,5 @@
 import { defineConfig } from '@playwright/test';
+import { LOCK_WAIT_MS } from '../e2e/guard';
 
 /**
  * Playwright config for the Harper mobile-spike DESKTOP pre-flight gate.
@@ -20,7 +21,9 @@ export default defineConfig({
   globalSetup: '../e2e/global-setup.ts',
   globalTeardown: '../e2e/global-teardown.ts',
   timeout: 300_000,
-  globalTimeout: 18 * 60_000,
+  // As in the parent config: globalTimeout covers globalSetup, so the machine-wide lock's wait
+  // budget is added on top locally and left off under CI, where the lock is never contended.
+  globalTimeout: 18 * 60_000 + (process.env.CI ? 0 : LOCK_WAIT_MS),
   expect: { timeout: 20_000 },
   fullyParallel: false,
   workers: 1,
