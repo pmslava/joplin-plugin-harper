@@ -310,14 +310,18 @@ async function main() {
 
 	// ---- config handshake ---------------------------------------------------
 	const handler = state.contentScriptMessageHandlers['harperCm'];
-	await test('getConfig returns {enabled, debounceMs, underlineStyle, platform} for the content script', async () => {
+	await test('getConfig returns {enabled, debounceMs, underlineStyle, platform, generation} for the content script', async () => {
 		const config = await handler({ type: 'getConfig' });
-		assert.deepStrictEqual(config, {
+		// The generation counter moves with every poke (warm-up, settings, dictionary), so assert its
+		// TYPE here and its exact behavior in the waitForRefresh tests below.
+		const { generation, ...rest } = config;
+		assert.deepStrictEqual(rest, {
 			enabled: true,
 			debounceMs: 500,
 			underlineStyle: 'squiggly',
 			platform: 'desktop',
 		});
+		assert.strictEqual(typeof generation, 'number', 'getConfig carries the config generation (multi-window refresh)');
 	});
 
 	// ---- live underline-style apply (v1.2.0) --------------------------------
@@ -438,6 +442,55 @@ async function main() {
 				assert.strictEqual(typeof sug.replacementText, 'string', 'replacementText is a string');
 			}
 		}
+	});
+
+	// ---- multi-window refresh subscription --------------------------
+	// `editor.execCommand` reaches only the FOCUSED window's editor (Joplin executes exactly one
+	// highest-priority per-editor runtime), so every other window's content script keeps a
+	// 'waitForRefresh' long-poll parked in the main process: the reply parks while the client is up
+	// to date and resolves the instant the config generation bumps (any pokeForceLint). These tests
+	// drive the main half of that contract through the real message handler. They run AFTER the
+	// first lint above, so the background warm-up's own one-shot poke has already landed and cannot
+	// release a parked reply mid-test.
+	await test('waitForRefresh parks while current and resolves on the next settings-change poke', async () => {
+		await new Promise((r) => setTimeout(r, 200)); // let any warm-up straggler poke settle
+		const pokesBefore = state.commandExecutions.length;
+		const gen = (await handler({ type: 'getConfig' })).generation;
+		const parked = handler({ type: 'waitForRefresh', generation: gen });
+		let settled = false;
+		void parked.then(() => { settled = true; });
+		// DETERMINISTIC pending check (no timing sleep): the immediate-answer path is Promise.resolve,
+		// so flushing the microtask queue is enough to observe it; and the generation only moves via
+		// pokes, all visible in commandExecutions — an unchanged count proves the park precondition
+		// held between reading `gen` and parking.
+		await new Promise((r) => setImmediate(r));
+		assert.strictEqual(
+			state.commandExecutions.length,
+			pokesBefore,
+			'no poke landed between reading the generation and parking',
+		);
+		assert.strictEqual(settled, false, 'an up-to-date waitForRefresh parks (no immediate reply)');
+		// Any settings change pokes; writing the current value back keeps every later test untouched.
+		await state.setSetting('debounceMs', 500);
+		const released = await parked;
+		assert.ok(
+			released.generation > gen,
+			`the parked reply resolves with a bumped generation (${released.generation} > ${gen})`,
+		);
+	});
+
+	await test('waitForRefresh answers a stale client immediately with the current generation', async () => {
+		const gen = (await handler({ type: 'getConfig' })).generation;
+		const replyPromise = handler({ type: 'waitForRefresh', generation: gen - 1 });
+		// The immediate-answer path is pure microtask (Promise.resolve), so a setImmediate flush must
+		// observe it settled — a regression to PARKING would fail HERE rather than silently passing
+		// 25s later off the heartbeat (which resolves with the very same generation).
+		let settled = false;
+		void replyPromise.then(() => { settled = true; });
+		await new Promise((r) => setImmediate(r));
+		assert.strictEqual(settled, true, 'a stale generation is answered immediately, not by the heartbeat');
+		const reply = await replyPromise;
+		assert.strictEqual(reply.generation, gen, 'answered with the current generation');
 	});
 
 	// ---- external dictionary + poll budget ----------------------------------
@@ -810,6 +863,24 @@ async function main() {
 			// (no getConfig), so the start flush + polls may write freely.
 			initialSettings: { dictionaryPath: mirrorFile, dictionaryNoteId: 'mnote' },
 			notes: nnotes,
+		});
+
+		await test('waitForRefresh is NOT the editor-open handshake (the start flush below still writes the note)', async () => {
+			// Sent BEFORE the start flush lands: getConfig marks the editor open (L3) and would defer
+			// every note write, so if waitForRefresh wrongly did the same, the mirror convergence test
+			// below could never see its note write. The settled-flag + setImmediate flush makes the
+			// "answered immediately" half falsifiable too (a regression to parking would otherwise
+			// pass 25s later off the heartbeat).
+			const replyPromise = nstate.contentScriptMessageHandlers['harperCm']({
+				type: 'waitForRefresh',
+				generation: -1,
+			});
+			let settled = false;
+			void replyPromise.then(() => { settled = true; });
+			await new Promise((r) => setImmediate(r));
+			assert.strictEqual(settled, true, 'stale waitForRefresh answered immediately, not parked');
+			const reply = await replyPromise;
+			assert.strictEqual(typeof reply.generation, 'number', 'reply carries the current generation');
 		});
 
 		await test('mirror: file word lands in the note and note word lands in the file (both directions)', async () => {
