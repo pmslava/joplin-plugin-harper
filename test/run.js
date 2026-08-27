@@ -757,6 +757,24 @@ async function main() {
 		);
 	});
 
+	/** Type into a lifted textarea the way a user does: set the value AND fire `input`. */
+	function type(area, value) {
+		area.value = value;
+		area.fire('input');
+	}
+
+	// Seeds the lifted dialog's dictionary state. Uses seedDictionary when it exists (INV-C), and
+	// falls back to writing the fields by hand so the same test also runs against the pre-fix source.
+	function seed(lifted, words) {
+		if (lifted.seedDictionary) {
+			lifted.seedDictionary(words);
+			return;
+		}
+		lifted.state.dictionaryWords = words.slice();
+		lifted.state.dictionaryBaseline = words.slice();
+		lifted.state.dictionaryText = words.join('\n');
+	}
+
 	await test('a dictionary save lands on the CURRENT nodes, not the ones the save started on', async () => {
 		const document = makeFakeDom();
 		const sent = [];
@@ -766,20 +784,20 @@ async function main() {
 			`var document = arguments[0];
 			 var sent = arguments[1];
 			 var hold = arguments[2];
-			 var state = { dictionaryWords: [] };
+			 var state = { dictionaryWords: [], dictionaryBaseline: [], dictionaryText: '' };
 			 function send(message) { sent.push(message); return hold(); }`,
 			['state'],
 			[document, sent, () => new Promise((resolve) => { resolveSave = resolve; })],
-			['setDictionaryStatus', 'paintDictionary'],
+			['setDictionaryStatus', 'paintDictionary', 'seedDictionary'],
 		);
-		lifted.state.dictionaryWords = ['alpha'];
+		seed(lifted, ['alpha']);
 
 		const root = document.createElement('div');
 		document.root = root;
 		lifted.renderDictionary(root);
 
 		const firstArea = document.getElementById('hs-dictionary');
-		firstArea.value = 'alpha\nbeta';
+		type(firstArea, 'alpha\nbeta');
 		document.getElementById('hs-save-dictionary').fire('click');
 
 		// The save posts the BASELINE it was rendered from, so the service can tell a deletion from a
@@ -996,18 +1014,18 @@ async function main() {
 			`var document = arguments[0];
 			 var sent = arguments[1];
 			 var hold = arguments[2];
-			 var state = { dictionaryWords: [] };
+			 var state = { dictionaryWords: [], dictionaryBaseline: [], dictionaryText: '' };
 			 function send(message) { sent.push(message); return hold(); }`,
 			['state'],
 			[document, sent, () => new Promise((resolve) => { resolveSave = resolve; })],
-			['setDictionaryStatus', 'paintDictionary'],
+			['setDictionaryStatus', 'paintDictionary', 'seedDictionary'],
 		);
-		lifted.state.dictionaryWords = ['alpha'];
+		seed(lifted, ['alpha']);
 
 		const root = document.createElement('div');
 		document.root = root;
 		lifted.renderDictionary(root);
-		document.getElementById('hs-dictionary').value = 'alpha\nbeta';
+		type(document.getElementById('hs-dictionary'), 'alpha\nbeta');
 		document.getElementById('hs-save-dictionary').fire('click');
 
 		// The round trip is seconds long. The Save button is disabled but the TEXTAREA never is, and a
@@ -1015,7 +1033,7 @@ async function main() {
 		lifted.clear(root);
 		lifted.renderDictionary(root);
 		const area = document.getElementById('hs-dictionary');
-		area.value = 'alpha\ngamma\ndelta'; // the user keeps typing
+		type(area, 'alpha\ngamma\ndelta'); // the user keeps typing
 
 		resolveSave({ ok: true, adds: ['beta'], removes: [], words: ['alpha', 'beta'] });
 		await settle();
@@ -1042,17 +1060,17 @@ async function main() {
 			`var document = arguments[0];
 			 var sent = arguments[1];
 			 var hold = arguments[2];
-			 var state = { dictionaryWords: [] };
+			 var state = { dictionaryWords: [], dictionaryBaseline: [], dictionaryText: '' };
 			 function send(message) { sent.push(message); return hold(); }`,
 			['state'],
 			[document, sent, () => new Promise((resolve) => { resolveSave = resolve; })],
-			['setDictionaryStatus', 'paintDictionary'],
+			['setDictionaryStatus', 'paintDictionary', 'seedDictionary'],
 		);
-		lifted.state.dictionaryWords = ['alpha'];
+		seed(lifted, ['alpha']);
 		const root = document.createElement('div');
 		document.root = root;
 		lifted.renderDictionary(root);
-		document.getElementById('hs-dictionary').value = 'alpha\nbeta';
+		type(document.getElementById('hs-dictionary'), 'alpha\nbeta');
 		document.getElementById('hs-save-dictionary').fire('click');
 
 		// Re-entered tab, seeded from the still-stale list, and NOT typed into. The guard has to
@@ -1082,6 +1100,215 @@ async function main() {
 		assert.strictEqual(describeCleared({ dismissals: 3, legacy: 0 }), 'Cleared 3 dismissals.');
 		assert.strictEqual(describeCleared({ dismissals: 1, legacy: 1 }), 'Cleared 1 dismissal and 1 legacy finding.');
 		assert.strictEqual(describeCleared({ dismissals: 0, legacy: 0 }), 'Nothing to clear.');
+	});
+
+	await test('a refused repaint never hands the next save a baseline the box has not shown', async () => {
+		// INV-C. The baseline is what the service is ALLOWED TO DELETE, so it must always describe the
+		// words the textarea actually showed. Advancing it to the reconciled truth while a refused
+		// repaint left the user's own text on screen made the next save ask for the difference to be
+		// deleted — words that only ever existed off-screen, wiped from the note, the user's external
+		// file and every synced device.
+		const document = makeFakeDom();
+		const sent = [];
+		let resolveSave = null;
+		const lifted = extractDialogFunctions(
+			['el', 'clear', 'renderDictionary'],
+			`var document = arguments[0];
+			 var sent = arguments[1];
+			 var hold = arguments[2];
+			 var state = { dictionaryWords: [], dictionaryBaseline: [], dictionaryText: '' };
+			 function send(message) { sent.push(message); return hold(); }`,
+			['state'],
+			[document, sent, () => new Promise((resolve) => { resolveSave = resolve; })],
+			['setDictionaryStatus', 'paintDictionary', 'seedDictionary'],
+		);
+		seed(lifted, ['alpha']);
+		const root = document.createElement('div');
+		document.root = root;
+		lifted.renderDictionary(root);
+
+		type(document.getElementById('hs-dictionary'), 'alpha\nbeta');
+		document.getElementById('hs-save-dictionary').fire('click');
+		assert.deepStrictEqual(sent[0].baseline, ['alpha'], 'first save sends the seeded list');
+
+		// The user keeps typing during the round trip, so the repaint will be refused...
+		type(document.getElementById('hs-dictionary'), 'alpha\ngamma');
+		// ...and the reply carries a word that arrived from somewhere else entirely (a sync, or the
+		// external file the user just configured on the General tab).
+		resolveSave({ ok: true, adds: ['beta'], removes: [], words: ['alpha', 'beta', 'zebra'] });
+		await settle();
+
+		assert.strictEqual(document.getElementById('hs-dictionary').value, 'alpha\ngamma', 'typing kept');
+
+		// The second save. Its baseline must still be the list the box was seeded from.
+		document.getElementById('hs-save-dictionary').fire('click');
+		const second = sent[1];
+		assert.deepStrictEqual(second.words, ['alpha', 'gamma'], 'it posts what the box shows');
+		assert.ok(
+			second.baseline.indexOf('zebra') === -1,
+			`the baseline never names a word the box has not shown: ${JSON.stringify(second.baseline)}`,
+		);
+
+		// And prove the consequence with the REAL diff the service runs: nothing gets deleted.
+		const svc = loadTsModule('src/settingsService.ts', (id) =>
+			id === './dismissedLog' ? loadTsModule('src/dismissedLog.ts') : require(id),
+		);
+		const diff = svc.diffWords(['alpha', 'beta', 'zebra'], second.words, second.baseline);
+		assert.deepStrictEqual(diff.removes, [], 'so the save asks for no deletions at all');
+		assert.deepStrictEqual(diff.adds, ['gamma'], 'only the word the user typed is added');
+	});
+
+	await test('switching tabs keeps the unsaved dictionary draft', () => {
+		// INV-C. The Dictionary textarea is the dialog's only unsaved buffer — every other control
+		// commits on change or on click — and re-seeding it from the reconciled list meant one click on
+		// "Rules" destroyed everything typed into it, with no prompt and no way back.
+		const document = makeFakeDom();
+		const lifted = extractDialogFunctions(
+			['el', 'clear', 'renderDictionary'],
+			`var document = arguments[0];
+			 var state = { dictionaryWords: [], dictionaryBaseline: [], dictionaryText: '' };
+			 function send() { return Promise.resolve({ ok: true, adds: [], removes: [], words: [] }); }`,
+			['state'],
+			[document],
+			['setDictionaryStatus', 'paintDictionary', 'seedDictionary'],
+		);
+		seed(lifted, ['alpha']);
+		const root = document.createElement('div');
+		document.root = root;
+		lifted.renderDictionary(root);
+
+		type(document.getElementById('hs-dictionary'), 'alpha\nbeta\ngamma\ndelta');
+
+		// The tab bounce: render() clears the root and rebuilds the section from scratch.
+		lifted.clear(root);
+		lifted.renderDictionary(root);
+
+		assert.strictEqual(
+			document.getElementById('hs-dictionary').value,
+			'alpha\nbeta\ngamma\ndelta',
+			'the draft survives a trip to another tab and back',
+		);
+		// ...and the baseline still describes the SEED, not the draft, so a save from here can only
+		// delete what was actually displayed to begin with.
+		assert.deepStrictEqual(lifted.state.dictionaryBaseline, ['alpha']);
+	});
+
+	await test('a group arrow collapses what is on screen, whatever the needle has since become', () => {
+		// INV-D. The toggle used to derive its new value from the CURRENT needle rather than from what
+		// was painted, so in the 140 ms debounce window the two disagreed and the arrow fired the wrong
+		// way: a group force-opened by a search, clicked after the search was cleared, computed
+		// `!undefined === true` and stayed open — leaving a stored expansion nobody asked for.
+		const document = makeFakeDom();
+		const lifted = extractDialogFunctions(
+			[
+				'el',
+				'clear',
+				'makeSelect',
+				'ruleDisplayLabel',
+				'ruleMatches',
+				'matchingRules',
+				'ruleState',
+				'groupState',
+				'defaultLabelFor',
+				'cssEscape',
+				'renderRuleRow',
+				'renderGroup',
+			],
+			`var document = arguments[0];
+			 var state = {
+				overrides: Object.create(null),
+				defaults: { ModalOf: true, Spaces: true },
+				descriptionText: Object.create(null),
+				descriptions: null,
+				search: '',
+				expandedGroups: Object.create(null),
+				searchExpanded: Object.create(null),
+				expandedRules: Object.create(null),
+			 };
+			 var searchTimer = null;
+			 function renderRules() {}
+			 function setRuleState() {}
+			 function pushOverrides() {}
+			 function refreshGroupHeader() {}
+			 function refreshRulesSummary() {}`,
+			['state'],
+			[document],
+			['groupExpanded', 'toggleGroupExpanded', 'currentNeedle'],
+		);
+		const group = { id: 'Misc', label: 'Miscellaneous', description: '', rules: ['ModalOf', 'Spaces'] };
+		const root = document.createElement('div');
+		document.root = root;
+		const paint = (needle) => {
+			lifted.state.search = needle;
+			lifted.clear(root);
+			root.appendChild(lifted.renderGroup(group, needle));
+			return {
+				listed: document.byClass('hs-rule-list').length > 0,
+				arrow: document.byClass('hs-disclosure')[0],
+			};
+		};
+
+		// The group was NEVER opened by the user; only the search is holding it open.
+		const searching = paint('modal');
+		assert.strictEqual(searching.listed, true, 'the search force-opened it');
+
+		// The user clears the box. `state.search` updates at once; the repaint is 140 ms out, so the
+		// arrow on screen still belongs to the searched painting.
+		lifted.state.search = '';
+		searching.arrow.fire('click');
+
+		assert.strictEqual(
+			lifted.state.expandedGroups.Misc,
+			false,
+			'a collapse arrow stores a COLLAPSE, not an expansion nobody asked for',
+		);
+		lifted.clear(root);
+		root.appendChild(lifted.renderGroup(group, ''));
+		assert.strictEqual(
+			document.byClass('hs-rule-list').length > 0,
+			false,
+			'and the group really is collapsed after the click',
+		);
+
+		// The mirror: painted collapsed with no needle, clicked once a needle exists, must EXPAND.
+		lifted.state.expandedGroups = Object.create(null);
+		lifted.state.searchExpanded = Object.create(null);
+		const plain = paint('');
+		assert.strictEqual(plain.listed, false, 'precondition: collapsed, no search');
+		lifted.state.search = 'modal';
+		plain.arrow.fire('click');
+		lifted.clear(root);
+		root.appendChild(lifted.renderGroup(group, 'modal'));
+		assert.strictEqual(
+			document.byClass('hs-rule-list').length > 0,
+			true,
+			'an expand arrow expands, in the other direction too',
+		);
+	});
+
+	await test('a search edit that leaves the needle unchanged keeps the groups collapsed during it', () => {
+		// INV-D. `currentNeedle()` trims and lowercases, so a trailing space typed while composing a
+		// two-word query fires `input` without changing a single match — and wiping the per-search
+		// collapses there sprang every group the user had just collapsed back open under a result list
+		// that had not moved.
+		const lifted = extractDialogFunctions(
+			['currentNeedle', 'setSearchValue', 'groupExpanded'],
+			'var state = { search: \'\', expandedGroups: Object.create(null), searchExpanded: Object.create(null) };',
+			['state'],
+		);
+		lifted.setSearchValue('modal');
+		lifted.state.searchExpanded.Misc = false; // the user collapsed a noisy group during the search
+		lifted.state.searchExpanded.Other = false;
+
+		assert.strictEqual(lifted.setSearchValue('modal '), false, 'a trailing space is not a new query');
+		assert.strictEqual(lifted.groupExpanded('Misc', 'modal'), false, 'the collapse survives it');
+		assert.strictEqual(lifted.setSearchValue('  MODAL  '), false, 'nor is padding or case');
+		assert.strictEqual(lifted.groupExpanded('Other', 'modal'), false, 'still collapsed');
+
+		// A genuinely different query IS a new set of matches, so the collapses stop describing
+		// anything and are dropped — the behaviour searchExpanded exists for.
+		assert.strictEqual(lifted.setSearchValue('modality'), true, 'a real edit is a new query');
+		assert.strictEqual(lifted.groupExpanded('Misc', 'modality'), true, 'and re-opens the matches');
 	});
 
 	await test('a group disclosure stays live during a search, and a search never rewrites the stored state', () => {
@@ -3671,6 +3898,198 @@ async function main() {
 			);
 		});
 
+	}
+
+	// ---- integration: INV-A, no durable write may outlive its configuration ----
+	// The identity guard that shipped was a check-then-act: evaluated once, with four suspension points
+	// (the note put, its updated_time get, the file rewrite, the base read) between it and the commit.
+	// These two tests park a pass on either side of that guard.
+	{
+		const mkRepoint = async (name) => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), `harper-${name}-`));
+			const dictFile = path.join(dir, 'dict.txt');
+			fs.writeFileSync(dictFile, 'Alpharp\nBetarp\n', 'utf8');
+			const st = await run({
+				dataDir: dir,
+				installationDir: DIST_DIR,
+				require: requireStub,
+				versionInfo: { version: '3.6.14', platform: 'desktop' },
+				initialSettings: { dictionaryNoteId: 'note1', dictionaryPath: dictFile },
+				notes: {
+					note1: { id: 'note1', body: '# h\n\nAlpharp\nBetarp\n', updated_time: 100 },
+					note2: { id: 'note2', body: '# other\n\nMyveryownwordrp\n', updated_time: 200 },
+				},
+			});
+			assert.ok(
+				await waitFor(() => (st.settings.syncBase || '').includes('Alpharp')),
+				'precondition: converged',
+			);
+			await st.contentScriptMessageHandlers['harperCm']({ type: 'lint', text: 'warm' });
+			return { st, dictFile };
+		};
+		const gate = () => {
+			let release = null;
+			let onParked = null;
+			const parked = new Promise((r) => {
+				onParked = r;
+			});
+			const open = new Promise((r) => {
+				release = r;
+			});
+			return { parked, open, onParked, release: () => release() };
+		};
+
+		await test('a pass repointed AFTER its guard still writes nothing (the check is at each write)', async () => {
+			const { st, dictFile } = await mkRepoint('postguard');
+			// Give the pass a note write to perform, then park it AT that write — i.e. already past any
+			// up-front guard, with the file rewrite and the base commit still ahead of it.
+			await st.setSetting('pendingWords', ['Buffrp']);
+			const g = gate();
+			st.beforeNotePut = async (noteId) => {
+				if (noteId !== 'note1') return;
+				st.beforeNotePut = null;
+				g.onParked();
+				await g.open;
+			};
+			const pass = st.noteSelectionChangeHandler();
+			await g.parked;
+
+			// The user repoints the dictionary note while the pass sits on its write. Given real time to
+			// land, so the pass really is resumed into a world that has already moved.
+			const repoint = st.setSetting('dictionaryNoteId', 'note2');
+			await waitFor(() => false, 60);
+			g.release();
+			await Promise.all([pass, repoint]);
+			await waitFor(() => false, 300);
+
+			// Un-gated, the pass sailed on: it rewrote the user's external file to the new note's single
+			// word and committed its stale base over the '' resetSyncBase had just written, so the next
+			// reconcile read every missing word as a deletion.
+			const fileNow = fs.readFileSync(dictFile, 'utf8');
+			assert.ok(
+				fileNow.includes('Alpharp') && fileNow.includes('Betarp'),
+				`the external dictionary file keeps its words: ${JSON.stringify(fileNow)}`,
+			);
+			assert.ok(fileNow.includes('Myveryownwordrp'), 'and gains the newly-pointed note\'s word');
+			const base = st.settings.syncBase || '';
+			assert.ok(base.includes('Alpharp') && base.includes('Myveryownwordrp'), `base is the union: ${base}`);
+		});
+
+		await test('a pass that STARTS mid-repoint is born stale and writes nothing', async () => {
+			const { st, dictFile } = await mkRepoint('basewindow');
+			// Park the repoint INSIDE resetSyncBase, right before it writes ''. `cfg` already names
+			// note2 while the base on disk still describes note1 — a world no snapshot can be
+			// consistent with, and one no epoch comparison can detect, because nothing changes for the
+			// duration of a pass that both starts and finishes inside it.
+			const g = gate();
+			st.beforeSettingWrite = async (key, value) => {
+				if (key !== 'syncBase' || value !== '') return;
+				st.beforeSettingWrite = null;
+				g.onParked();
+				await g.open;
+			};
+			const repoint = st.setSetting('dictionaryNoteId', 'note2');
+			await g.parked;
+
+			// Anything can start a reconcile here: the 60 s poll, or — as here — a note selection change.
+			const pass = st.noteSelectionChangeHandler();
+			await waitFor(() => false, 60); // let it run to completion inside the window
+			g.release();
+			await Promise.all([pass, repoint]);
+			await waitFor(() => false, 300);
+
+			const fileNow = fs.readFileSync(dictFile, 'utf8');
+			assert.ok(
+				fileNow.includes('Alpharp') && fileNow.includes('Betarp'),
+				`the external dictionary file keeps its words: ${JSON.stringify(fileNow)}`,
+			);
+		});
+	}
+
+	// ---- integration: INV-B, destroying the engine's ignore set is transactional ----
+	{
+		const dlDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-dialectwipe-'));
+		const dwState = await run({
+			dataDir: dlDir2,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryNoteId: 'dwnote' },
+			notes: { dwnote: { id: 'dwnote', body: '# h\n\nKeepdw\n', updated_time: 100 } },
+		});
+		const dwh = dwState.contentScriptMessageHandlers['harperCm'];
+		const dwIgnore = path.join(dlDir2, 'ignoredLints.json');
+		const dwRaw = () => {
+			try {
+				return fs.readFileSync(dwIgnore, 'utf8');
+			} catch {
+				return '';
+			}
+		};
+
+		await test('a Dismiss during a dialect change cannot wipe the dismissals already persisted', async () => {
+			const TEXT_A = 'I saw teh cat.';
+			const TEXT_B = 'We should of gone.';
+			const first = (await dwh({ type: 'lint', text: TEXT_A })).find((l) => l.problemText === 'teh');
+			assert.ok(first, 'precondition: "teh" is flagged');
+			await dwh({ type: 'ignoreLint', text: TEXT_A, start: first.start, end: first.end, ruleName: first.ruleName });
+			const before = dismissedLog.extractHashes(dwRaw());
+			assert.ok(before.length >= 1, 'precondition: the first dismissal is persisted');
+
+			const second = (await dwh({ type: 'lint', text: TEXT_B })).find((l) => l.problemText === 'should of');
+			assert.ok(second, 'precondition: "should of" is flagged');
+
+			// setDialect frees the WASM instance and builds a new one, so it destroys the engine's
+			// IGNORE SET too. Park the reconcile that follows it, which is where applyConfiguration used
+			// to re-hydrate — leaving a long window with an empty engine and a full payload.
+			let release = null;
+			let onParked = null;
+			const parked = new Promise((r) => {
+				onParked = r;
+			});
+			const open = new Promise((r) => {
+				release = r;
+			});
+			dwState.beforeNoteGet = async (noteId) => {
+				if (noteId !== 'dwnote') return;
+				dwState.beforeNoteGet = null;
+				onParked();
+				await open;
+			};
+			const dialect = dwState.setSetting('dialect', 'British');
+			await parked;
+
+			// A Dismiss from the content-script channel, in that window.
+			const dismiss = dwh({
+				type: 'ignoreLint',
+				text: TEXT_B,
+				start: second.start,
+				end: second.end,
+				ruleName: second.ruleName,
+			});
+			await waitFor(() => false, 60);
+			release();
+			await Promise.all([dialect, dismiss]);
+			await waitFor(() => false, 200);
+
+			// Persisting used to MIRROR the engine, so a Dismiss meeting a gutted engine wrote back only
+			// its own hash and destroyed every earlier dismissal — permanently, across restarts, while
+			// the side table went on listing rows for findings harper no longer ignores.
+			const after = new Set(dismissedLog.extractHashes(dwRaw()));
+			for (const hash of before) {
+				assert.ok(hash && after.has(hash), `the earlier dismissal's hash ${hash} is still persisted`);
+			}
+			assert.strictEqual(
+				dismissedLog.legacyCount(dwRaw(), dismissedLog.parseEntries(fs.readFileSync(path.join(dlDir2, 'dismissedMeta.json'), 'utf8'))),
+				0,
+				'and the side table and the payload still agree',
+			);
+			assert.strictEqual(
+				(await dwh({ type: 'lint', text: TEXT_A })).filter((l) => l.problemText === 'teh').length,
+				0,
+				'the first dismissal is still in force',
+			);
+		});
 	}
 
 	// ---- integration: a dismissal is ONE transaction over all three of its pieces ----
