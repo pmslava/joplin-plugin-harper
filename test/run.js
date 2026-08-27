@@ -4006,6 +4006,189 @@ async function main() {
 		});
 	}
 
+	// ---- integration: the epoch covers identity and base, and NOTHING else ----
+	{
+		const nrDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-narrow-'));
+		const nrFile = path.join(nrDir, 'dict.txt');
+		fs.writeFileSync(nrFile, 'Zorbulon\nQuixnar\n', 'utf8');
+		const nrState = await run({
+			dataDir: nrDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryNoteId: 'nrnote', dictionaryPath: nrFile },
+			notes: { nrnote: { id: 'nrnote', body: '# h\n\nZorbulon\nQuixnar\n', updated_time: 100 } },
+		});
+		const nrh = nrState.contentScriptMessageHandlers['harperCm'];
+
+		await test('a settings change that moves neither the dictionary nor the base does not abandon a pass', async () => {
+			assert.ok(
+				await waitFor(() => (nrState.settings.syncBase || '').includes('Zorbulon')),
+				'precondition: converged',
+			);
+			await nrh({ type: 'lint', text: 'warm' });
+
+			// The dictionary editor saves a new word; park its reconcile at the note read — one of the
+			// suspension points the write gates exist for.
+			let release = null;
+			let onParked = null;
+			const parked = new Promise((r) => {
+				onParked = r;
+			});
+			const open = new Promise((r) => {
+				release = r;
+			});
+			// A save reconciles TWICE: once to read the current list for the diff, then again inside
+			// applyWordEdits to land the edit. It is the SECOND one that reaches the write gates, so
+			// that is the one to park.
+			let noteReads = 0;
+			nrState.beforeNoteGet = async (noteId) => {
+				if (noteId !== 'nrnote') return;
+				noteReads += 1;
+				if (noteReads < 2) return;
+				nrState.beforeNoteGet = null;
+				onParked();
+				await open;
+			};
+			const save = nrh({
+				type: 'settings:saveDictionary',
+				words: ['Zorbulon', 'Quixnar', 'Newword'],
+				baseline: ['Quixnar', 'Zorbulon'],
+			});
+			await parked;
+
+			// Joplin's debounced onChange for an unrelated General-tab toggle lands in that window. It
+			// moves no dictionary side and no merge base, so it has no business invalidating anything —
+			// but the epoch bracket used to wrap every settings key, so the pass was abandoned and the
+			// save replied with a word list missing the word it had just added. The dialog then re-seeded
+			// its textarea AND its baseline from that reply, under "Saved. 1 added, 0 removed."
+			const unrelated = nrState.setSetting('ignoreNonEnglish', true);
+			await waitFor(() => false, 40);
+			release();
+			const reply = await save;
+			await unrelated;
+			await waitFor(() => false, 200);
+
+			assert.deepStrictEqual(reply.adds, ['Newword'], 'the save reports the addition');
+			assert.ok(
+				reply.words.includes('Newword'),
+				`and its word list contains it: ${JSON.stringify(reply.words)}`,
+			);
+			assert.ok(nrState.notes.nrnote.body.includes('Newword'), 'the note really has it');
+			assert.ok(fs.readFileSync(nrFile, 'utf8').includes('Newword'), 'and so does the file');
+
+			await nrState.setSetting('ignoreNonEnglish', false);
+		});
+
+		await test('a repoint still abandons: narrowing the epoch did not narrow the protection', async () => {
+			// The other direction of the same condition — the keys that DO move identity must still
+			// invalidate a pass in flight.
+			nrState.notes.nrnote2 = { id: 'nrnote2', body: '# other\n\nOwnwordnr\n', updated_time: 300 };
+			await nrState.setSetting('pendingWords', ['Buffnr']);
+			let release = null;
+			let onParked = null;
+			const parked = new Promise((r) => {
+				onParked = r;
+			});
+			const open = new Promise((r) => {
+				release = r;
+			});
+			nrState.beforeNotePut = async (noteId) => {
+				if (noteId !== 'nrnote') return;
+				nrState.beforeNotePut = null;
+				onParked();
+				await open;
+			};
+			const pass = nrState.noteSelectionChangeHandler();
+			await parked;
+			const repoint = nrState.setSetting('dictionaryNoteId', 'nrnote2');
+			await waitFor(() => false, 60);
+			release();
+			await Promise.all([pass, repoint]);
+			await waitFor(() => false, 300);
+
+			assert.ok(
+				nrState.notes.nrnote2.body.includes('Ownwordnr'),
+				`the newly-pointed note keeps its own word: ${JSON.stringify(nrState.notes.nrnote2.body)}`,
+			);
+		});
+	}
+
+	// ---- integration: a stale pass publishes NOTHING, engine state included ----
+	{
+		const spDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-stalepub-'));
+		const spFile = path.join(spDir, 'dict.txt');
+		fs.writeFileSync(spFile, 'Alphasp\nBetasp\n', 'utf8');
+		const spState = await run({
+			dataDir: spDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryNoteId: 'spnote', dictionaryPath: spFile },
+			notes: { spnote: { id: 'spnote', body: '# h\n\nAlphasp\nBetasp\n', updated_time: 100 } },
+		});
+		const sph = spState.contentScriptMessageHandlers['harperCm'];
+
+		await test('a born-stale pass does not push its phantom word set into the live engine', async () => {
+			assert.ok(
+				await waitFor(() => (spState.settings.syncBase || '').includes('Alphasp')),
+				'precondition: converged',
+			);
+			// An editor is open — the normal state, and what makes the note write L3-deferred so that
+			// NONE of the durable-write gates is reached. The pass then used to fall straight through
+			// and clear-then-import a merge computed against a configuration that no longer exists.
+			await sph({ type: 'getConfig' });
+			assert.strictEqual(
+				(await sph({ type: 'lint', text: 'Alphasp and Betasp are fine.' })).length,
+				0,
+				'precondition: both custom words are accepted',
+			);
+
+			// Repoint the external file to one holding only Alphasp, parked inside resetSyncBase — the
+			// documented born-stale window.
+			const otherFile = path.join(spDir, 'other.txt');
+			fs.writeFileSync(otherFile, 'Alphasp\n', 'utf8');
+			let release = null;
+			let onParked = null;
+			const parked = new Promise((r) => {
+				onParked = r;
+			});
+			const open = new Promise((r) => {
+				release = r;
+			});
+			spState.beforeSettingWrite = async (key, value) => {
+				if (key !== 'syncBase' || value !== '') return;
+				spState.beforeSettingWrite = null;
+				onParked();
+				await open;
+			};
+			const repoint = spState.setSetting('dictionaryPath', otherFile);
+			await parked;
+
+			// The 60 s poll ticks inside the window and reconciles.
+			const tick = spState.intervals.find((i) => i.ms === 60000 && !i.cleared);
+			tick.fn();
+			await waitFor(() => false, 80);
+
+			// The phantom: a deletion inferred from a base belonging to the configuration that has just
+			// gone away. Nothing durable moved — but the engine used to be handed it anyway, so a lint
+			// landing here flagged a word nobody had deleted.
+			const flagged = (await sph({ type: 'lint', text: 'Alphasp and Betasp are fine.' })).map(
+				(l) => l.problemText,
+			);
+			assert.deepStrictEqual(
+				flagged,
+				[],
+				`the engine still accepts every word it did before the window: ${JSON.stringify(flagged)}`,
+			);
+
+			release();
+			await repoint;
+			await waitFor(() => false, 300);
+			assert.strictEqual(spState.notePuts.length, 0, 'and the stale pass wrote nothing durable either');
+		});
+	}
+
 	// ---- integration: INV-B, destroying the engine's ignore set is transactional ----
 	{
 		const dlDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-dialectwipe-'));

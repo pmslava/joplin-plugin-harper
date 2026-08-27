@@ -1076,18 +1076,6 @@
 	}
 
 	/**
-	 * Repaint the dictionary section from `state.dictionaryWords`, BY ID.
-	 *
-	 * A save is a seconds-scale round trip (a note read, an L3-gated note write, an atomic external
-	 * file rewrite), and nothing stops the user switching tabs inside it. Writing the reply into the
-	 * `area` / `count` / `save` nodes the save handler closed over put it into DETACHED nodes: the
-	 * re-entered tab still showed the pre-save list, the old count and a blank status, so the word
-	 * looked like it had vanished — and saving again from that stale textarea deleted it for real.
-	 * Every other async writer in this file already re-resolves by id (setRulesStatus,
-	 * setGeneralStatus, setDismissedStatus); this one now does too, so it lands on whatever nodes are
-	 * currently on screen, and harmlessly on none when the tab is elsewhere.
-	 */
-	/**
 	 * THE ONLY place the editor's baseline and its text change. See INV-C on `state`.
 	 *
 	 * Everything a save is allowed to delete comes from `dictionaryBaseline`, and everything the user
@@ -1100,7 +1088,16 @@
 		state.dictionaryText = state.dictionaryWords.join('\n');
 	}
 
-	/** Push `state.dictionaryText` and the count onto whatever nodes are mounted right now. */
+	/**
+	 * Push `state.dictionaryText` and the count onto whatever nodes are mounted right now, BY ID.
+	 *
+	 * A save is a seconds-scale round trip, and nothing stops the user switching tabs inside it.
+	 * Writing the reply into the nodes the save handler closed over put it into DETACHED ones: the
+	 * re-entered tab kept showing the pre-save list, the old count and a blank status. Every other
+	 * async writer in this file already re-resolves by id (setRulesStatus, setGeneralStatus,
+	 * setDismissedStatus); this one does too, so it lands on whatever is currently on screen, and
+	 * harmlessly on nothing when the tab is elsewhere.
+	 */
 	function paintDictionary() {
 		var area = document.getElementById('hs-dictionary');
 		if (area && area.value !== state.dictionaryText) area.value = state.dictionaryText;

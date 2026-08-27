@@ -593,14 +593,19 @@ function passIsStale(pass: PassSnapshot, what: string): boolean {
 	) {
 		return false;
 	}
-	const key = `${pass.reason}:${pass.epoch}`;
+	// Say what actually happened. "Repointed mid-pass" was printed for every abandon, including ones
+	// where the identity never moved at all, which sent anyone reading the log after the wrong cause.
+	let why: string;
+	if (pass.epoch < 0) why = 'it started while the dictionary was being repointed';
+	else if (cfg.dictionaryNoteId !== pass.noteId) why = 'the dictionary note was repointed mid-pass';
+	else if (!isMobile() && cfg.dictionaryPath !== pass.dictPath) {
+		why = 'the external dictionary file was repointed mid-pass';
+	} else why = 'the dictionary configuration changed mid-pass';
+	const key = `${pass.reason}:${pass.epoch}:${why}`;
 	if (warnedStalePass !== key) {
 		warnedStalePass = key;
 		// eslint-disable-next-line no-console
-		console.info(
-			`[harper] dictionary reconcile (${pass.reason}) abandoned before ${what}: ` +
-				'the dictionary was repointed mid-pass',
-		);
+		console.info(`[harper] dictionary reconcile (${pass.reason}) abandoned before ${what}: ${why}`);
 	}
 	return true;
 }
@@ -762,7 +767,6 @@ async function buildLinter(): Promise<LocalLinter> {
 	return linter;
 }
 
-/** (Re)apply dictionary words, rule overrides and ignored lints to a linter instance. */
 /**
  * Make the engine's ignore set exactly the persisted payload. CALLER MUST HOLD the dismissal
  * transaction — this both destroys and rebuilds the state that transaction protects.
@@ -783,6 +787,8 @@ async function rehydrateIgnoredLints(linter: LocalLinter): Promise<void> {
 }
 
 /**
+ * (Re)apply dictionary words, rule overrides and ignored lints to a linter instance.
+ *
  * `fresh` carries the same contract as `reconcileAndApply`'s: a caller that has just CHANGED state
  * the reconcile reads — the settings onChange handler, which rewrites `cfg` and resets the merge
  * base before it gets here — must not be answered by a pass that snapshotted the old state. See
@@ -929,7 +935,20 @@ async function pokeForceLint(): Promise<void> {
 //
 // Concurrent callers join the in-flight pass instead of racing it, and `lastEngineWords` keeps the
 // last good result so a failed pass leaves the engine's word set alone rather than emptying it.
-let reconcilePromise: Promise<string[]> | null = null;
+/**
+ * What a pass produced, and whether it is ENTITLED TO BE APPLIED.
+ *
+ * A stale pass publishes nothing — the live engine included. Returning only the word list was not
+ * enough to express that: `reconcileAndApply` clear-then-imports whatever it is handed, so an
+ * abandoned pass still reshaped the engine (dropping a word `addWord` had just imported directly).
+ * `published: false` means "this pass changed nothing; leave the engine exactly as it is".
+ */
+interface ReconcileResult {
+	words: string[];
+	published: boolean;
+}
+
+let reconcilePromise: Promise<ReconcileResult> | null = null;
 let lastEngineWords: string[] = [];
 
 /**
@@ -962,12 +981,17 @@ async function importWordsIntoLinter(linter: LocalLinter, words: string[]): Prom
  * settings this writes (`syncBase`, `pendingWords`, `pendingRemovals`) are filtered out of the
  * settings onChange handler, so a write from inside a reconcile can never call back into one.
  */
-function reconcileDictionary(reason: string): Promise<string[]> {
+function reconcileDictionaryResult(reason: string): Promise<ReconcileResult> {
 	if (reconcilePromise) return reconcilePromise;
 	reconcilePromise = runReconcile(reason).finally(() => {
 		reconcilePromise = null;
 	});
 	return reconcilePromise;
+}
+
+/** The reconciled word set. Callers that only want the list, not whether it may be applied. */
+function reconcileDictionary(reason: string): Promise<string[]> {
+	return reconcileDictionaryResult(reason).then((result) => result.words);
 }
 
 /**
@@ -984,7 +1008,7 @@ function reconcileDictionary(reason: string): Promise<string[]> {
  * So: drain whatever is in flight, then reconcile. A pass that starts while we wait began strictly
  * after this caller's writes, so joining THAT one is correct.
  */
-async function reconcileFresh(reason: string): Promise<string[]> {
+async function reconcileFreshResult(reason: string): Promise<ReconcileResult> {
 	const inFlight = reconcilePromise;
 	if (inFlight) {
 		// runReconcile catches its own errors and never rejects; the guard is belt-and-braces so a
@@ -995,10 +1019,16 @@ async function reconcileFresh(reason: string): Promise<string[]> {
 			/* the pass logged it itself */
 		}
 	}
-	return reconcileDictionary(reason);
+	// Anything that started while we waited began AFTER this caller's writes, so joining it is correct.
+	return reconcileDictionaryResult(reason);
 }
 
-async function runReconcile(reason: string): Promise<string[]> {
+/** As reconcileFreshResult, for callers that only want the list. */
+async function reconcileFresh(reason: string): Promise<string[]> {
+	return (await reconcileFreshResult(reason)).words;
+}
+
+async function runReconcile(reason: string): Promise<ReconcileResult> {
 	try {
 		if (!isMobile() && !cachedLocalWordsPath) cachedLocalWordsPath = await localWordsPath();
 		// The desktop plugin-local list (userWords.txt) is written ONLY when neither an external file
@@ -1045,6 +1075,12 @@ async function runReconcile(reason: string): Promise<string[]> {
 		if (note === null && file === null) {
 			// Nothing durable to reconcile against: keep buffering (exactly as v1.2.0 did) and feed the
 			// engine the local fallback plus whatever is in the pending buffer.
+			// A STALE PASS PUBLISHES NOTHING — engine state included. The durable-write gates alone do
+			// not cover this: they are all on writes this branch never reaches, so a born-stale pass
+			// used to fall straight through and hand its merge to the live engine anyway.
+			if (passIsStale(pass, 'publishing the word set to the engine')) {
+				return { words: lastEngineWords, published: false };
+			}
 			const removed = new Set(removals);
 			lastEngineWords = [...new Set([...pending, ...local])].filter((w) => !removed.has(w));
 			// A removal is only DONE once the sides that could resurrect the word have absorbed it.
@@ -1059,7 +1095,7 @@ async function runReconcile(reason: string): Promise<string[]> {
 				// anything yet and must survive.
 				await retirePendingEntries(PENDING_REMOVALS_KEY, removals, readPendingRemovals);
 			}
-			return lastEngineWords;
+			return { words: lastEngineWords, published: true };
 		}
 
 		const base = await readSyncBase();
@@ -1097,7 +1133,7 @@ async function runReconcile(reason: string): Promise<string[]> {
 			if (editorOpen) {
 				noteWritten = false; // deferred: an editor is open, so a note write is forbidden
 			} else {
-				if (passIsStale(pass, 'the dictionary-note write')) return lastEngineWords;
+				if (passIsStale(pass, 'the dictionary-note write')) return { words: lastEngineWords, published: false };
 				await joplin.data.put(['notes', noteId], null, {
 					body: canonicalDictionaryBody(merged.result),
 				});
@@ -1115,7 +1151,7 @@ async function runReconcile(reason: string): Promise<string[]> {
 		// --- FILE side (desktop; order-preserving atomic rewrite) -------------------------------
 		let fileWritten = true;
 		if (merged.fileChanged && file) {
-			if (passIsStale(pass, 'the external-file rewrite')) return lastEngineWords;
+			if (passIsStale(pass, 'the external-file rewrite')) return { words: lastEngineWords, published: false };
 			fileWritten = rewriteExternalFile(file, merged.result);
 		}
 
@@ -1147,7 +1183,7 @@ async function runReconcile(reason: string): Promise<string[]> {
 			// while the pass was in flight (the note read, the note write, the file rewrite are all
 			// awaits the user's "Add to dictionary" can land inside) is kept for the next pass, which
 			// is idempotent and will merge it exactly as if it had arrived a tick later.
-			if (passIsStale(pass, 'retiring the pending buffers')) return lastEngineWords;
+			if (passIsStale(pass, 'retiring the pending buffers')) return { words: lastEngineWords, published: false };
 			await retirePendingEntries('pendingWords', pending, readPendingWords);
 			// Removals retire on exactly the same condition as pending additions: every side that
 			// needed writing was written, and every configured side was present. Until then the buffer
@@ -1166,13 +1202,24 @@ async function runReconcile(reason: string): Promise<string[]> {
 		// The desktop-local fallback is unioned in, so an explicit removal is subtracted again here:
 		// persistRemovedWord already prunes userWords.txt, and this keeps the engine correct even if
 		// that prune could not be written (read-only dir, missing file).
+		// A STALE PASS PUBLISHES NOTHING — engine state included, which the durable-write gates above
+		// do not reach. With the note write L3-deferred (an editor is open: the normal state) and no
+		// file side changing, none of those gates is evaluated, and the pass fell through to here and
+		// clear-then-imported a merge computed against a configuration that no longer exists — so a
+		// lint landing in that window flagged words nothing had deleted, and `getEffectiveWords`
+		// handed the same phantom list to the settings dialog. Keeping the previous good list costs
+		// nothing: the repoint runs its own fresh reconcile immediately afterwards.
+		if (passIsStale(pass, 'publishing the word set to the engine')) {
+			return { words: lastEngineWords, published: false };
+		}
 		const removed = new Set(removals);
 		lastEngineWords = [...new Set([...merged.result, ...local])].filter((w) => !removed.has(w));
-		return lastEngineWords;
+		return { words: lastEngineWords, published: true };
 	} catch (error) {
 		// eslint-disable-next-line no-console
 		console.warn(`[harper] dictionary reconcile (${reason}) failed:`, error);
-		return lastEngineWords;
+		// A failed pass computed nothing, so it may not reshape the engine either.
+		return { words: lastEngineWords, published: false };
 	}
 }
 
@@ -1183,8 +1230,13 @@ async function runReconcile(reason: string): Promise<string[]> {
  * reflected — see reconcileFresh. Returns the reconciled word set so such a caller can report it.
  */
 async function reconcileAndApply(reason: string, fresh = false): Promise<string[]> {
-	const words = fresh ? await reconcileFresh(reason) : await reconcileDictionary(reason);
+	const result = fresh ? await reconcileFreshResult(reason) : await reconcileDictionaryResult(reason);
+	const words = result.words;
 	if (!linterPromise) return words; // engine not built yet; its own init will reconcile
+	// A stale pass publishes NOTHING, and the engine is state like any other. Importing its list
+	// anyway would clear-then-import a word set computed against a configuration that no longer
+	// exists — dropping, among other things, a word `addWord` had just imported directly.
+	if (!result.published) return words;
 	let changed = false;
 	try {
 		changed = await importWordsIntoLinter(await linterPromise, words);
@@ -2205,7 +2257,21 @@ joplin.plugins.register({
 			// that inconsistent pair without anything changing for its duration — so no epoch
 			// comparison can catch it. Held as a single transition, any pass beginning anywhere inside
 			// is born stale and writes nothing.
-			await withDictionaryEpochBump(async () => {
+			//
+			// ONLY FOR KEYS THAT ACTUALLY MOVE IDENTITY OR BASE, though. The epoch exists to protect one
+			// thing: a pass's answer is computed from {note, file, base}, and it must not write once any
+			// of those has moved. Bracketing every settings write instead abandoned in-flight passes on
+			// changes that touch none of them — a dictionary save racing an `underlineStyle` toggle came
+			// back reporting success with the new word missing from its own reply, and the dialog then
+			// re-seeded the editor from that. `dialect` is deliberately NOT here: it resets ENGINE state
+			// (the WASM instance, its words and its ignore set) but moves no side and no base, so a pass
+			// in flight across it is still computing the right answer from the right sources. Its own
+			// hazards have their own guards — `importedWordsKey = null` forces the word re-import, and
+			// INV-B keeps the ignore-set rebuild inside the dismissal transaction.
+			const movesDictionaryIdentity =
+				external.includes('dictionaryNoteId') ||
+				(!isMobile() && external.includes('dictionaryPath'));
+			const applySettingsChange = async () => {
 				await loadSettings();
 				if (!isMobile() && (cfg.dictionaryPath === '' || external.includes('dictionaryPath'))) {
 					// A changed path invalidates the cached mtime / missing-file warning.
@@ -2226,7 +2292,11 @@ joplin.plugins.register({
 				) {
 					await resetSyncBase();
 				}
-			});
+			};
+			// Every key that can reach `resetSyncBase` above is inside `movesDictionaryIdentity`, so the
+			// flip and the reset are still one bracketed transition whenever either can happen.
+			if (movesDictionaryIdentity) await withDictionaryEpochBump(applySettingsChange);
+			else await applySettingsChange();
 			if (linterPromise) {
 				const linter = await linterPromise;
 				if (external.includes('dialect') && cfg.dialect !== before) {
