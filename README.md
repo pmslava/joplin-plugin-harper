@@ -41,6 +41,9 @@ suggestion:
 - **Disable a rule.** The toggle in the card header turns off the rule that produced the finding,
   everywhere, from then on.
 - **Dialects.** Check against American, British, Australian, Canadian, or Indian English.
+- **A settings screen for everything else.** **Harper: Settings…** opens a searchable browser for all
+  823 rules, a dictionary editor, and the list of findings you dismissed — with a Restore button on
+  each. Desktop and mobile (see [The settings dialog](#the-settings-dialog) below).
 
 ## Your dictionary
 
@@ -82,6 +85,29 @@ VS Code.
 the plugin keeps them in sync with each other. A word added on your phone reaches the note through
 Joplin sync, then the file — and from there any external tool that reads it. Deletions travel the
 same way, in every direction.
+
+## The settings dialog
+
+Run the command **Harper: Settings…** for the full settings screen. On desktop it is in
+**Tools → Harper: Settings…**, or type it into the command palette (`Ctrl+P`, then `:`). On mobile
+it is in the note's **…** menu. It works the same on both.
+
+It has four sections:
+
+- **General.** The everyday options — the master switch, dialect, debounce, underline style, and the
+  two dictionary sources. The same settings as the Joplin options page, in one place.
+- **Rules.** All 823 of Harper's checks, in the 15 groups Harper ships them in. Search by rule name
+  or by what a rule does, expand a rule to read its description, and set any rule to **On**, **Off**,
+  or **Default**. Set a whole group at once from the selector in its header. **Reset to Default
+  Rules** and **Disable All Rules** do what they say. Changes apply straight away — there is nothing
+  to save.
+- **Dictionary.** Your whole word list in one text box, one word per line. Edit it, press **Save
+  dictionary**, and the changes go wherever your dictionary lives — the note, the file, or both.
+- **Dismissed.** Every finding you dismissed from a suggestion card, with the rule, the flagged text
+  and the date. **Restore** puts one back. **Clear all** clears the lot.
+
+The Joplin options page below still works, and both stay in step — change something in either and
+the other reflects it.
 
 ## Settings
 

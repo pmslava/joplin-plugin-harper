@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test';
 import * as fs from 'fs';
 import * as path from 'path';
+import { artifactPath } from './artifacts';
 import { launchJoplin, closeJoplin, JoplinInstance } from './launch';
 import {
   createNotebook,
@@ -13,8 +14,6 @@ import {
   screenshotCard,
 } from './helpers';
 
-const SHOTS_DIR =
-  '/tmp/claude-1000/-home-mrsir-Lab-joplin-plugin-harper/f70ff77f-1ceb-407e-9024-9da9993b0b91/scratchpad/ui-screens';
 
 /** Recursively search under `dir` for a file named `name`; returns its path or null. */
 function findFile(dir: string, name: string): string | null {
@@ -84,12 +83,11 @@ test.describe('Harper ignore/dismiss (card)', () => {
       .toBeGreaterThan(0);
 
     // Light-theme evidence for the manager: the multi-kind underlines, then the open card.
-    fs.mkdirSync(SHOTS_DIR, { recursive: true });
     await win.locator('.cm-content').first().screenshot({
-      path: path.join(SHOTS_DIR, 'underlines-light.png'),
+      path: artifactPath('underlines-light.png'),
     });
     const cardForShot = await openHarperCardByClick(win, 'should of');
-    await screenshotCard(win, cardForShot, path.join(SHOTS_DIR, 'card-light.png'));
+    await screenshotCard(win, cardForShot, artifactPath('card-light.png'));
 
     // Capture the ignore-state file BEFORE dismissing (fresh profile => normally absent, count 0).
     const readIgnoreFile = (): string | null => {

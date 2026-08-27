@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test';
 import * as fs from 'fs';
 import * as path from 'path';
+import { artifactPath } from './artifacts';
 import { launchJoplin, closeJoplin, createProfile, JoplinInstance } from './launch';
 import {
   createNotebook,
@@ -13,8 +14,6 @@ import {
   screenshotCard,
 } from './helpers';
 
-const SHOTS_DIR =
-  '/tmp/claude-1000/-home-mrsir-Lab-joplin-plugin-harper/f70ff77f-1ceb-407e-9024-9da9993b0b91/scratchpad/ui-screens';
 
 // Harper's canonical per-kind palette (the three kinds this doc produces).
 const EXPECTED = {
@@ -67,9 +66,8 @@ test.describe('Harper UI conformance (dark theme)', () => {
         .toBeGreaterThan(0);
     }
 
-    fs.mkdirSync(SHOTS_DIR, { recursive: true });
     await win.locator('.cm-content').first().screenshot({
-      path: path.join(SHOTS_DIR, 'underlines-dark.png'),
+      path: artifactPath('underlines-dark.png'),
     });
 
     // Each kind's squiggle stroke color equals the canonical palette hex, and all three differ.
@@ -115,6 +113,6 @@ test.describe('Harper UI conformance (dark theme)', () => {
 
     // Dark-theme card screenshot for the manager (re-open in case the assertions' timing closed it).
     const cardForShot = await openHarperCardByClick(win, 'beleive');
-    await screenshotCard(win, cardForShot, path.join(SHOTS_DIR, 'card-dark.png'));
+    await screenshotCard(win, cardForShot, artifactPath('card-dark.png'));
   });
 });
