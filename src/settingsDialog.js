@@ -1,0 +1,1171 @@
+/**
+ * HARPER SETTINGS DIALOG — the webview half.
+ *
+ * Plain ES5-ish JavaScript on purpose. Webpack's CopyPlugin copies every non-TS file under src/ into
+ * dist/ VERBATIM, so this file ships as-is and `dialogs.addScript(handle, 'settingsDialog.js')` loads
+ * it as a classic script. It must NOT go through plugin.config.json's extraScripts: that pipeline
+ * emits a commonjs bundle, and `module.exports = ...` in a webview throws before a line of ours runs.
+ *
+ * Everything here is client-side rendering off ONE JSON snapshot. The main process never re-renders
+ * us: `setHtml` does not re-run scripts, so a server-side re-render would paint dead HTML. The shell
+ * in index.ts is a single empty root; this script builds all four sections into it.
+ *
+ * Four rules this file lives by:
+ *
+ *   1. VALUES NEVER COME FROM `structured`. That tree is grouping/order/labels only — its `Bool.state`
+ *      is `flatConfig[name] ?? false`, so reading it would render ~814 default-on rules as "off" on a
+ *      fresh install. A rule's tri-state is `flatConfig[name]` if the key EXISTS, else "Default", and
+ *      what Default resolves to is `defaults[name]`.
+ *   2. "DEFAULT" IS THE ABSENCE OF A KEY, not a null. The UI keeps a sparse override map and posts it
+ *      whole; the service drops non-booleans and writes the sparse result.
+ *   3. USER-DERIVED TEXT IS NEVER innerHTML. Dismissed problem text and dictionary words go in via
+ *      textContent. The single exception is harper's own rule descriptions (trusted p/code HTML).
+ *   4. NO JOPLIN ICON FONTS. They exist in desktop webviews only, so every glyph here is a text
+ *      character or inline SVG, and every var() carries a fallback (mobile injects fewer variables).
+ */
+(function () {
+	'use strict';
+
+	// =============================================================================
+	// Transport.
+	// =============================================================================
+
+	/**
+	 * One round-trip to the plugin. index.ts wraps the service dispatcher so a THROWN error comes back
+	 * as `{__error}` rather than a silently-pending promise — `updateSetting` rejects by design (bad
+	 * dialect, dictionaryPath on mobile, non-allowlisted key), and the caller has to be able to see it.
+	 */
+	function send(message) {
+		return webviewApi.postMessage(message).then(function (reply) {
+			if (reply && reply.__error) throw new Error(reply.__error);
+			return reply;
+		});
+	}
+
+	// =============================================================================
+	// Tiny DOM helpers.
+	// =============================================================================
+
+	function el(tag, className, text) {
+		var node = document.createElement(tag);
+		if (className) node.className = className;
+		if (text !== undefined && text !== null) node.textContent = String(text);
+		return node;
+	}
+
+	function clear(node) {
+		while (node.firstChild) node.removeChild(node.firstChild);
+	}
+
+	/** A <select> from [[value, label], ...]; `value` selects the current one. */
+	function makeSelect(options, value, className) {
+		var select = el('select', className || 'hs-select');
+		for (var i = 0; i < options.length; i++) {
+			var option = el('option', null, options[i][1]);
+			option.value = options[i][0];
+			select.appendChild(option);
+		}
+		select.value = value;
+		return select;
+	}
+
+	// =============================================================================
+	// Rule labels.
+	// =============================================================================
+
+	/**
+	 * "AmazonNames" -> "Amazon Names".
+	 *
+	 * MIRRORS `ruleDisplayLabel` in src/settingsService.ts, which cannot be imported here (that is
+	 * TypeScript compiled into the plugin bundle; this file is copied verbatim into the webview). The
+	 * unit suite asserts the two implementations agree character-for-character over a corpus, so the
+	 * copy cannot drift silently. Needed at all because harper 2.7.0 returns `label: null` for all 823
+	 * Bool nodes, leaving the PascalCase name as the only thing to show.
+	 */
+	function ruleDisplayLabel(name) {
+		if (!name) return '';
+		return name
+			.replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+			.replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+			.replace(/([A-Za-z])(\d)/g, '$1 $2')
+			.trim();
+	}
+
+	// =============================================================================
+	// State.
+	// =============================================================================
+
+	var state = {
+		loaded: false,
+		settings: null, // PrimarySettings
+		defaults: {}, // rule -> boolean (concrete, all ~823)
+		overrides: {}, // rule -> boolean (SPARSE; a missing key means "Default")
+		groups: [], // [{ id, label, description, rules: [ruleName, ...] }]
+		descriptions: null, // rule -> HTML, or null until the lazy fetch lands
+		descriptionText: {}, // rule -> plain text, for search
+		dictionaryWords: [],
+		dismissed: { entries: [], legacyCount: 0 },
+		search: '',
+		tab: 'general',
+		expandedGroups: {}, // group id -> true
+		expandedRules: {}, // rule name -> true
+		confirmClearAll: false,
+	};
+
+	var ADDITIONAL_GROUP_ID = '__additional__';
+
+	// =============================================================================
+	// Building the rules model from harper's structured tree.
+	// =============================================================================
+
+	/**
+	 * Flatten `structured` into a list of display groups.
+	 *
+	 * harper 2.7.0 emits a flat 15 x Group -> Bool[] shape, but `Group.child` is typed as a full
+	 * StructuredLintConfig, so nesting is handled here rather than assumed away: a nested Group becomes
+	 * its own entry with a breadcrumb label ("Parent > Child"), and Bools sitting directly beside it
+	 * stay with the parent. Bools at the very top level (no enclosing Group) land in "Other Rules".
+	 *
+	 * OneOfMany is expanded into its member names as ordinary tri-state rows. harper emits none today;
+	 * this keeps a future release visible and editable rather than invisible, which is the safer
+	 * degradation for a settings screen (the alternative — silently dropping the node — would hide
+	 * rules from the user with no clue anything was missing).
+	 */
+	function buildGroups(structured, defaults, overrides) {
+		var groups = [];
+		var seen = {};
+
+		function addGroup(id, label, description, rules) {
+			if (!rules.length) return;
+			groups.push({ id: id, label: label, description: description || '', rules: rules });
+		}
+
+		function walk(node, trail) {
+			if (!node || !node.settings || !node.settings.length) return;
+			var ownRules = [];
+			for (var i = 0; i < node.settings.length; i++) {
+				var entry = node.settings[i];
+				if (!entry || typeof entry !== 'object') continue;
+				if (entry.Bool && entry.Bool.name) {
+					ownRules.push(entry.Bool.name);
+					seen[entry.Bool.name] = true;
+				} else if (entry.OneOfMany && entry.OneOfMany.names && entry.OneOfMany.names.length) {
+					for (var j = 0; j < entry.OneOfMany.names.length; j++) {
+						var member = entry.OneOfMany.names[j];
+						if (!member) continue;
+						ownRules.push(member);
+						seen[member] = true;
+					}
+				} else if (entry.Group) {
+					var label = entry.Group.label || 'Rules';
+					var childTrail = trail.concat([label]);
+					// Depth-first, so a nested group lands right after the parent it belongs to.
+					var before = groups.length;
+					walk(entry.Group.child, childTrail);
+					// Keep the parent's own rules ahead of its children in the list.
+					if (ownRules.length && before === groups.length) {
+						/* nothing nested was emitted; the parent flush below covers it */
+					}
+					if (entry.Group.description) {
+						// Attach the description to whichever group the child produced under this label.
+						for (var k = before; k < groups.length; k++) {
+							if (groups[k].label === childTrail.join(' > ') && !groups[k].description) {
+								groups[k].description = entry.Group.description;
+							}
+						}
+					}
+				}
+			}
+			if (ownRules.length) {
+				var id = trail.length ? trail.join('/') : '__root__';
+				var groupLabel = trail.length ? trail.join(' > ') : 'Other Rules';
+				addGroup(id, groupLabel, '', ownRules);
+			}
+		}
+
+		walk(structured, []);
+
+		// Descriptions come off the Group node itself, so a second pass is simpler than threading them
+		// through the recursion: match each emitted group back to its source label.
+		function applyDescriptions(node, trail) {
+			if (!node || !node.settings) return;
+			for (var i = 0; i < node.settings.length; i++) {
+				var entry = node.settings[i];
+				if (!entry || !entry.Group) continue;
+				var label = entry.Group.label || 'Rules';
+				var childTrail = trail.concat([label]);
+				var id = childTrail.join('/');
+				for (var g = 0; g < groups.length; g++) {
+					if (groups[g].id === id && entry.Group.description) {
+						groups[g].description = entry.Group.description;
+					}
+				}
+				applyDescriptions(entry.Group.child, childTrail);
+			}
+		}
+		applyDescriptions(structured, []);
+
+		// ADDITIONAL RULES: anything the flat config or the defaults know about that the tree does not
+		// mention. Without this bucket a rule the user had already overridden by hand (the ruleOverrides
+		// JSON setting has existed since v1.0) could be invisible AND still in force.
+		var extras = [];
+		var names = Object.keys(defaults || {});
+		var overrideNames = Object.keys(overrides || {});
+		for (var n = 0; n < overrideNames.length; n++) {
+			if (names.indexOf(overrideNames[n]) === -1) names.push(overrideNames[n]);
+		}
+		for (var m = 0; m < names.length; m++) {
+			if (!seen[names[m]]) extras.push(names[m]);
+		}
+		extras.sort();
+		if (extras.length) {
+			addGroup(ADDITIONAL_GROUP_ID, 'Additional Rules', 'Rules Harper reports outside its grouped list.', extras);
+		}
+
+		return groups;
+	}
+
+	// =============================================================================
+	// Tri-state derivation.
+	// =============================================================================
+
+	/** 'on' | 'off' | 'default' for one rule. ABSENCE of the key is what "default" means. */
+	function ruleState(name) {
+		if (!Object.prototype.hasOwnProperty.call(state.overrides, name)) return 'default';
+		return state.overrides[name] ? 'on' : 'off';
+	}
+
+	/** 'on' | 'off' | 'default' | 'mixed' for a group, derived from its children. */
+	function groupState(group) {
+		var sawDefault = false;
+		var sawOn = false;
+		var sawOff = false;
+		for (var i = 0; i < group.rules.length; i++) {
+			var s = ruleState(group.rules[i]);
+			if (s === 'default') sawDefault = true;
+			else if (s === 'on') sawOn = true;
+			else sawOff = true;
+		}
+		if (sawDefault && !sawOn && !sawOff) return 'default';
+		if (sawOn && !sawDefault && !sawOff) return 'on';
+		if (sawOff && !sawDefault && !sawOn) return 'off';
+		return 'mixed';
+	}
+
+	function defaultLabelFor(name) {
+		var value = state.defaults[name];
+		if (value === true) return 'Default (on)';
+		if (value === false) return 'Default (off)';
+		return 'Default';
+	}
+
+	// =============================================================================
+	// Applying rule changes.
+	// =============================================================================
+
+	/**
+	 * Serialize override writes. Flipping a whole group is one message, but a user clicking several
+	 * rows fast would otherwise have two applyRuleOverrides in flight, and the second could be built
+	 * from a map the first had not finished persisting.
+	 */
+	var applyChain = Promise.resolve();
+	var applyPending = 0;
+
+	function setRuleState(name, next) {
+		if (next === 'default') delete state.overrides[name];
+		else state.overrides[name] = next === 'on';
+	}
+
+	function pushOverrides() {
+		applyPending++;
+		setRulesStatus('Saving…');
+		var snapshot = {};
+		var keys = Object.keys(state.overrides);
+		for (var i = 0; i < keys.length; i++) snapshot[keys[i]] = state.overrides[keys[i]];
+		applyChain = applyChain
+			.then(function () {
+				return send({ type: 'settings:applyRuleOverrides', overrides: snapshot });
+			})
+			.then(function (reply) {
+				applyPending--;
+				// Only the LAST write in a burst gets to repaint the status, so an intermediate "Saved"
+				// cannot flash over a still-running save.
+				if (applyPending === 0) setRulesStatus(describeOverrides(reply && reply.overrides));
+			})
+			.catch(function (error) {
+				applyPending--;
+				setRulesStatus('Could not save: ' + error.message, true);
+			});
+		return applyChain;
+	}
+
+	function describeOverrides(overrides) {
+		var count = overrides ? Object.keys(overrides).length : 0;
+		if (!count) return 'Saved. No rules overridden — all defaults.';
+		return 'Saved. ' + count + (count === 1 ? ' rule overridden.' : ' rules overridden.');
+	}
+
+	function setRulesStatus(text, isError) {
+		var node = document.getElementById('hs-rules-status');
+		if (!node) return;
+		node.textContent = text || '';
+		node.className = 'hs-status' + (isError ? ' hs-status-error' : '');
+	}
+
+	// =============================================================================
+	// Search.
+	// =============================================================================
+
+	function stripHtml(html) {
+		var tmp = document.createElement('div');
+		tmp.innerHTML = html || '';
+		return (tmp.textContent || '').toLowerCase();
+	}
+
+	/** Rule name, display label, group label and (once loaded) the rule description all match. */
+	function ruleMatches(name, group, needle) {
+		if (!needle) return true;
+		if (name.toLowerCase().indexOf(needle) !== -1) return true;
+		if (ruleDisplayLabel(name).toLowerCase().indexOf(needle) !== -1) return true;
+		if (group.label.toLowerCase().indexOf(needle) !== -1) return true;
+		var text = state.descriptionText[name];
+		if (text && text.indexOf(needle) !== -1) return true;
+		return false;
+	}
+
+	function matchingRules(group, needle) {
+		if (!needle) return group.rules;
+		var out = [];
+		for (var i = 0; i < group.rules.length; i++) {
+			if (ruleMatches(group.rules[i], group, needle)) out.push(group.rules[i]);
+		}
+		return out;
+	}
+
+	// =============================================================================
+	// Section: General.
+	// =============================================================================
+
+	function field(labelText, control, help) {
+		var row = el('div', 'hs-field');
+		var label = el('label', 'hs-field-label', labelText);
+		row.appendChild(label);
+		var body = el('div', 'hs-field-body');
+		body.appendChild(control);
+		if (help) body.appendChild(el('div', 'hs-help', help));
+		row.appendChild(body);
+		return row;
+	}
+
+	function setGeneralStatus(text, isError) {
+		var node = document.getElementById('hs-general-status');
+		if (!node) return;
+		node.textContent = text || '';
+		node.className = 'hs-status' + (isError ? ' hs-status-error' : '');
+	}
+
+	/** Write one primary setting, reverting the control if the service refuses the value. */
+	function updateSetting(key, value, revert) {
+		setGeneralStatus('Saving…');
+		return send({ type: 'settings:updateSetting', key: key, value: value })
+			.then(function () {
+				state.settings[key] = value;
+				setGeneralStatus('Saved.');
+			})
+			.catch(function (error) {
+				setGeneralStatus('Could not save ' + key + ': ' + error.message, true);
+				if (revert) revert();
+			});
+	}
+
+	function renderGeneral(root) {
+		var section = el('div', 'hs-section');
+		section.appendChild(el('p', 'hs-section-intro', 'How Harper checks your notes.'));
+
+		var s = state.settings;
+
+		// Enable Harper
+		var enabled = el('input');
+		enabled.type = 'checkbox';
+		enabled.checked = s.enabled === true;
+		enabled.id = 'hs-enabled';
+		enabled.addEventListener('change', function () {
+			var value = enabled.checked;
+			updateSetting('enabled', value, function () {
+				enabled.checked = !value;
+			});
+		});
+		var enabledWrap = el('div', 'hs-checkbox');
+		enabledWrap.appendChild(enabled);
+		enabledWrap.appendChild(el('span', null, 'Check grammar and spelling'));
+		section.appendChild(field('Enable Harper', enabledWrap, 'When off, no underlines are shown.'));
+
+		// Dialect
+		var dialect = makeSelect(
+			[
+				['American', 'American'],
+				['British', 'British'],
+				['Australian', 'Australian'],
+				['Canadian', 'Canadian'],
+				['Indian', 'Indian'],
+			],
+			s.dialect || 'American',
+		);
+		dialect.id = 'hs-dialect';
+		var dialectBefore = dialect.value;
+		dialect.addEventListener('change', function () {
+			var value = dialect.value;
+			updateSetting('dialect', value, function () {
+				dialect.value = dialectBefore;
+			}).then(function () {
+				dialectBefore = dialect.value;
+			});
+		});
+		section.appendChild(field('English dialect', dialect, 'Changes which spellings Harper accepts.'));
+
+		// Debounce
+		var debounce = el('input', 'hs-input');
+		debounce.type = 'number';
+		debounce.min = '0';
+		debounce.max = '10000';
+		debounce.step = '50';
+		debounce.id = 'hs-debounce';
+		// `0` is a real value (lint immediately), so this cannot use `|| 500`.
+		debounce.value = String(typeof s.debounceMs === 'number' ? s.debounceMs : 500);
+		var debounceBefore = debounce.value;
+		debounce.addEventListener('change', function () {
+			var value = Number(debounce.value);
+			if (!isFinite(value)) {
+				debounce.value = debounceBefore;
+				return;
+			}
+			updateSetting('debounceMs', value, function () {
+				debounce.value = debounceBefore;
+			}).then(function () {
+				debounceBefore = debounce.value;
+			});
+		});
+		section.appendChild(field('Lint debounce (ms)', debounce, 'Idle delay after typing before Harper re-checks. 0 to 10000.'));
+
+		// Underline style
+		var underline = makeSelect(
+			[
+				['squiggly', 'Squiggly (default)'],
+				['solid', 'Solid line'],
+			],
+			s.underlineStyle === 'solid' ? 'solid' : 'squiggly',
+		);
+		underline.id = 'hs-underline';
+		var underlineBefore = underline.value;
+		underline.addEventListener('change', function () {
+			var value = underline.value;
+			updateSetting('underlineStyle', value, function () {
+				underline.value = underlineBefore;
+			}).then(function () {
+				underlineBefore = underline.value;
+			});
+		});
+		section.appendChild(field('Underline style', underline, 'How findings are marked in the editor.'));
+
+		// Ignore non-English
+		var ignore = el('input');
+		ignore.type = 'checkbox';
+		ignore.id = 'hs-ignore-non-english';
+		ignore.checked = s.ignoreNonEnglish === true;
+		ignore.addEventListener('change', function () {
+			var value = ignore.checked;
+			updateSetting('ignoreNonEnglish', value, function () {
+				ignore.checked = !value;
+			});
+		});
+		var ignoreWrap = el('div', 'hs-checkbox');
+		ignoreWrap.appendChild(ignore);
+		ignoreWrap.appendChild(el('span', null, 'Skip text that is not English'));
+		section.appendChild(field('Ignore non-English text', ignoreWrap, 'Useful for multilingual notes.'));
+
+		// Dictionary note id
+		var noteId = el('input', 'hs-input hs-input-wide');
+		noteId.type = 'text';
+		noteId.id = 'hs-dictionary-note-id';
+		noteId.value = s.dictionaryNoteId || '';
+		var noteIdBefore = noteId.value;
+		noteId.addEventListener('change', function () {
+			var value = noteId.value.trim();
+			updateSetting('dictionaryNoteId', value, function () {
+				noteId.value = noteIdBefore;
+			}).then(function () {
+				noteIdBefore = noteId.value;
+			});
+		});
+		section.appendChild(
+			field(
+				'Dictionary note id',
+				noteId,
+				'A Joplin note used as your dictionary, one word per line. It syncs across devices. ' +
+					'Run "Harper: Create dictionary note" to make one. Leave empty to turn it off.',
+			),
+		);
+
+		// External dictionary file — DESKTOP ONLY. The setting is not registered on mobile, so the
+		// snapshot simply omits the key there and the row must not appear at all.
+		if (Object.prototype.hasOwnProperty.call(s, 'dictionaryPath')) {
+			var dictPath = el('input', 'hs-input hs-input-wide');
+			dictPath.type = 'text';
+			dictPath.id = 'hs-dictionary-path';
+			dictPath.value = s.dictionaryPath || '';
+			var dictPathBefore = dictPath.value;
+			dictPath.addEventListener('change', function () {
+				var value = dictPath.value;
+				updateSetting('dictionaryPath', value, function () {
+					dictPath.value = dictPathBefore;
+				}).then(function () {
+					dictPathBefore = dictPath.value;
+				});
+			});
+			section.appendChild(
+				field(
+					'External dictionary file',
+					dictPath,
+					'Absolute path to a plain-text dictionary, one word per line. Leave empty to skip it.',
+				),
+			);
+		}
+
+		var status = el('div', 'hs-status');
+		status.id = 'hs-general-status';
+		section.appendChild(status);
+		root.appendChild(section);
+	}
+
+	// =============================================================================
+	// Section: Rules.
+	// =============================================================================
+
+	function renderRuleRow(name, group) {
+		var row = el('div', 'hs-rule');
+		row.setAttribute('data-rule', name);
+
+		var toggle = el('button', 'hs-disclosure', state.expandedRules[name] ? '\u25BE' : '\u25B8');
+		toggle.type = 'button';
+		toggle.title = 'Show what this rule does';
+		toggle.setAttribute('aria-label', 'Show what this rule does');
+		toggle.addEventListener('click', function () {
+			state.expandedRules[name] = !state.expandedRules[name];
+			renderRules();
+			ensureDescriptions();
+		});
+		row.appendChild(toggle);
+
+		var main = el('div', 'hs-rule-main');
+		var nameWrap = el('div', 'hs-rule-name');
+		nameWrap.appendChild(el('span', 'hs-rule-label', ruleDisplayLabel(name)));
+		nameWrap.appendChild(el('code', 'hs-rule-id', name));
+		main.appendChild(nameWrap);
+
+		if (state.expandedRules[name]) {
+			var desc = el('div', 'hs-rule-desc');
+			if (state.descriptions && state.descriptions[name]) {
+				// TRUSTED HTML: harper's own rule descriptions (simple p/code markup). This is the ONLY
+				// innerHTML in this file — everything user-derived goes in via textContent.
+				desc.innerHTML = state.descriptions[name];
+			} else if (state.descriptions) {
+				desc.textContent = 'No description for this rule.';
+			} else {
+				desc.textContent = 'Loading description…';
+			}
+			main.appendChild(desc);
+		}
+		row.appendChild(main);
+
+		var select = makeSelect(
+			[
+				['default', defaultLabelFor(name)],
+				['on', 'On'],
+				['off', 'Off'],
+			],
+			ruleState(name),
+			'hs-select hs-rule-select',
+		);
+		select.setAttribute('data-rule-select', name);
+		select.addEventListener('change', function () {
+			setRuleState(name, select.value);
+			pushOverrides();
+			// The group header's derived state may have moved; repaint just the header rather than the
+			// whole (potentially 800-row) list.
+			refreshGroupHeader(group);
+		});
+		row.appendChild(select);
+		return row;
+	}
+
+	function refreshGroupHeader(group) {
+		var header = document.querySelector('[data-group-select="' + cssEscape(group.id) + '"]');
+		if (!header) return;
+		var value = groupState(group);
+		var mixed = header.querySelector('option[value="mixed"]');
+		if (value === 'mixed' && !mixed) {
+			var option = el('option', null, 'Default (mixed)');
+			option.value = 'mixed';
+			header.insertBefore(option, header.firstChild);
+		} else if (value !== 'mixed' && mixed) {
+			mixed.parentNode.removeChild(mixed);
+		}
+		header.value = value;
+	}
+
+	/** Minimal attribute-selector escaping — group ids are label paths, so they can hold spaces. */
+	function cssEscape(value) {
+		return String(value).replace(/["\\]/g, '\\$&');
+	}
+
+	function renderGroup(group, needle) {
+		var rules = matchingRules(group, needle);
+		if (needle && !rules.length) return null;
+
+		var box = el('div', 'hs-group');
+		box.setAttribute('data-group', group.id);
+
+		var header = el('div', 'hs-group-header');
+		// A search auto-opens the groups that matched: with a needle typed, hiding the hits behind a
+		// second click would make the search useless.
+		var expanded = needle ? true : !!state.expandedGroups[group.id];
+
+		var toggle = el('button', 'hs-disclosure', expanded ? '\u25BE' : '\u25B8');
+		toggle.type = 'button';
+		toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+		toggle.addEventListener('click', function () {
+			state.expandedGroups[group.id] = !expanded;
+			renderRules();
+		});
+		header.appendChild(toggle);
+
+		var titleWrap = el('div', 'hs-group-title-wrap');
+		var title = el('div', 'hs-group-title');
+		title.appendChild(el('span', 'hs-group-label', group.label));
+		var count = needle
+			? rules.length + ' of ' + group.rules.length
+			: String(group.rules.length);
+		title.appendChild(el('span', 'hs-group-count', count));
+		titleWrap.appendChild(title);
+		if (group.description) titleWrap.appendChild(el('div', 'hs-group-desc', group.description));
+		// Clicking the title is the same as clicking the arrow — a bigger tap target, which matters on
+		// mobile where the arrow alone is well under 44 px.
+		titleWrap.addEventListener('click', function () {
+			state.expandedGroups[group.id] = !expanded;
+			renderRules();
+		});
+		header.appendChild(titleWrap);
+
+		var value = groupState(group);
+		var options = [
+			['default', 'Default'],
+			['on', 'On'],
+			['off', 'Off'],
+		];
+		if (value === 'mixed') options.unshift(['mixed', 'Default (mixed)']);
+		var select = makeSelect(options, value, 'hs-select hs-group-select');
+		select.setAttribute('data-group-select', group.id);
+		select.title = 'Set every rule in this group';
+		select.addEventListener('change', function () {
+			if (select.value === 'mixed') return; // "mixed" is a readout, not a command
+			for (var i = 0; i < group.rules.length; i++) setRuleState(group.rules[i], select.value);
+			pushOverrides();
+			renderRules();
+		});
+		header.appendChild(select);
+		box.appendChild(header);
+
+		if (expanded) {
+			var list = el('div', 'hs-rule-list');
+			for (var i = 0; i < rules.length; i++) list.appendChild(renderRuleRow(rules[i], group));
+			box.appendChild(list);
+		}
+		return box;
+	}
+
+	function renderRules() {
+		var host = document.getElementById('hs-rules-groups');
+		if (!host) return;
+		clear(host);
+		var needle = state.search.trim().toLowerCase();
+		var shown = 0;
+		for (var i = 0; i < state.groups.length; i++) {
+			var node = renderGroup(state.groups[i], needle);
+			if (node) {
+				host.appendChild(node);
+				shown++;
+			}
+		}
+		if (!shown) host.appendChild(el('div', 'hs-empty', 'No rules match "' + state.search.trim() + '".'));
+		var summary = document.getElementById('hs-rules-summary');
+		if (summary) summary.textContent = rulesSummaryText();
+	}
+
+	function totalRuleCount() {
+		var total = 0;
+		for (var i = 0; i < state.groups.length; i++) total += state.groups[i].rules.length;
+		return total;
+	}
+
+	function rulesSummaryText() {
+		var overridden = Object.keys(state.overrides).length;
+		return (
+			totalRuleCount() +
+			' rules in ' +
+			state.groups.length +
+			' groups. ' +
+			(overridden ? overridden + ' overridden.' : 'All at their defaults.')
+		);
+	}
+
+	var searchTimer = null;
+
+	function renderRulesSection(root) {
+		var section = el('div', 'hs-section');
+		section.appendChild(
+			el(
+				'p',
+				'hs-section-intro',
+				'Turn individual checks on or off. "Default" leaves the choice to Harper. Changes apply straight away.',
+			),
+		);
+
+		var toolbar = el('div', 'hs-toolbar');
+		var search = el('input', 'hs-input hs-search');
+		search.type = 'search';
+		search.id = 'hs-rule-search';
+		search.placeholder = 'Search rules…';
+		search.value = state.search;
+		search.addEventListener('input', function () {
+			state.search = search.value;
+			// Debounced: a one-letter query can match hundreds of rules, and re-rendering on every
+			// keystroke would stutter on mobile.
+			if (searchTimer) clearTimeout(searchTimer);
+			searchTimer = setTimeout(function () {
+				searchTimer = null;
+				renderRules();
+			}, 140);
+		});
+		toolbar.appendChild(search);
+
+		var reset = el('button', 'hs-button', 'Reset to Default Rules');
+		reset.type = 'button';
+		reset.id = 'hs-reset-rules';
+		reset.addEventListener('click', function () {
+			setRulesStatus('Resetting…');
+			send({ type: 'settings:resetRules' })
+				.then(function (reply) {
+					state.overrides = reply && reply.overrides ? reply.overrides : {};
+					renderRules();
+					setRulesStatus(describeOverrides(state.overrides));
+				})
+				.catch(function (error) {
+					setRulesStatus('Could not reset: ' + error.message, true);
+				});
+		});
+		toolbar.appendChild(reset);
+
+		var disableAll = el('button', 'hs-button', 'Disable All Rules');
+		disableAll.type = 'button';
+		disableAll.id = 'hs-disable-all-rules';
+		disableAll.addEventListener('click', function () {
+			setRulesStatus('Disabling…');
+			send({ type: 'settings:disableAllRules' })
+				.then(function (reply) {
+					state.overrides = reply && reply.overrides ? reply.overrides : {};
+					renderRules();
+					setRulesStatus(describeOverrides(state.overrides));
+				})
+				.catch(function (error) {
+					setRulesStatus('Could not disable: ' + error.message, true);
+				});
+		});
+		toolbar.appendChild(disableAll);
+		section.appendChild(toolbar);
+
+		var summary = el('div', 'hs-summary');
+		summary.id = 'hs-rules-summary';
+		summary.textContent = rulesSummaryText();
+		section.appendChild(summary);
+
+		var status = el('div', 'hs-status');
+		status.id = 'hs-rules-status';
+		section.appendChild(status);
+
+		var groups = el('div', 'hs-groups');
+		groups.id = 'hs-rules-groups';
+		section.appendChild(groups);
+
+		root.appendChild(section);
+		renderRules();
+	}
+
+	// =============================================================================
+	// Section: Dictionary.
+	// =============================================================================
+
+	function renderDictionary(root) {
+		var section = el('div', 'hs-section');
+		section.appendChild(
+			el('p', 'hs-section-intro', 'Words Harper should always accept. One word per line.'),
+		);
+
+		var area = el('textarea', 'hs-textarea');
+		area.id = 'hs-dictionary';
+		area.spellcheck = false;
+		// textContent, not innerHTML: these are user words.
+		area.value = state.dictionaryWords.join('\n');
+		section.appendChild(area);
+
+		var status = el('div', 'hs-status');
+		status.id = 'hs-dictionary-status';
+
+		var bar = el('div', 'hs-toolbar');
+		var save = el('button', 'hs-button hs-button-primary', 'Save dictionary');
+		save.type = 'button';
+		save.id = 'hs-save-dictionary';
+		save.addEventListener('click', function () {
+			var words = [];
+			var lines = area.value.split('\n');
+			for (var i = 0; i < lines.length; i++) {
+				var word = lines[i].trim();
+				if (word) words.push(word);
+			}
+			status.textContent = 'Saving…';
+			status.className = 'hs-status';
+			save.disabled = true;
+			send({ type: 'settings:saveDictionary', words: words })
+				.then(function (reply) {
+					save.disabled = false;
+					var adds = (reply && reply.adds) || [];
+					var removes = (reply && reply.removes) || [];
+					state.dictionaryWords = words.slice().sort();
+					area.value = state.dictionaryWords.join('\n');
+					if (!adds.length && !removes.length) {
+						status.textContent = 'Saved. Nothing changed.';
+					} else {
+						status.textContent =
+							'Saved. ' + adds.length + ' added, ' + removes.length + ' removed.';
+					}
+					status.className = 'hs-status';
+				})
+				.catch(function (error) {
+					save.disabled = false;
+					status.textContent = 'Could not save: ' + error.message;
+					status.className = 'hs-status hs-status-error';
+				});
+		});
+		bar.appendChild(save);
+
+		var count = el('span', 'hs-summary');
+		count.textContent = state.dictionaryWords.length + ' words';
+		bar.appendChild(count);
+		section.appendChild(bar);
+		section.appendChild(status);
+		root.appendChild(section);
+	}
+
+	// =============================================================================
+	// Section: Dismissed findings.
+	// =============================================================================
+
+	function formatDate(iso) {
+		if (!iso) return '';
+		var date = new Date(iso);
+		if (isNaN(date.getTime())) return String(iso);
+		return date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
+	}
+
+	function setDismissedStatus(text, isError) {
+		var node = document.getElementById('hs-dismissed-status');
+		if (!node) return;
+		node.textContent = text || '';
+		node.className = 'hs-status' + (isError ? ' hs-status-error' : '');
+	}
+
+	function renderDismissedList() {
+		var host = document.getElementById('hs-dismissed-list');
+		if (!host) return;
+		clear(host);
+
+		var entries = state.dismissed.entries || [];
+		if (!entries.length && !state.dismissed.legacyCount) {
+			host.appendChild(el('div', 'hs-empty', 'Nothing dismissed yet.'));
+			return;
+		}
+
+		for (var i = 0; i < entries.length; i++) {
+			(function (entry) {
+				var row = el('div', 'hs-dismissed');
+				row.setAttribute('data-dismissed-id', entry.id);
+				var text = el('div', 'hs-dismissed-text');
+				// EVERY piece below is textContent: ruleName and problemText come from the user's note.
+				text.appendChild(el('span', 'hs-dismissed-rule', entry.ruleName || 'Unknown rule'));
+				text.appendChild(el('span', 'hs-dismissed-sep', ': '));
+				text.appendChild(el('span', 'hs-dismissed-quote', '\u2018' + (entry.problemText || '') + '\u2019'));
+				text.appendChild(el('span', 'hs-dismissed-date', ' \u2014 ' + formatDate(entry.dismissedAt)));
+				row.appendChild(text);
+
+				var restore = el('button', 'hs-button hs-button-small', 'Restore');
+				restore.type = 'button';
+				restore.setAttribute('data-restore', entry.id);
+				restore.addEventListener('click', function () {
+					restore.disabled = true;
+					setDismissedStatus('Restoring…');
+					send({ type: 'settings:restoreDismissed', id: entry.id })
+						.then(function (reply) {
+							if (reply && reply.ok) {
+								state.dismissed.entries = state.dismissed.entries.filter(function (candidate) {
+									return candidate.id !== entry.id;
+								});
+								renderDismissedList();
+								setDismissedStatus('Restored. The finding is underlined again.');
+							} else {
+								restore.disabled = false;
+								setDismissedStatus('That dismissal is no longer there.', true);
+							}
+						})
+						.catch(function (error) {
+							restore.disabled = false;
+							setDismissedStatus('Could not restore: ' + error.message, true);
+						});
+				});
+				row.appendChild(restore);
+				host.appendChild(row);
+			})(entries[i]);
+		}
+
+		// LEGACY ROW: hashes with no side-table entry, dismissed before the index existed. There is
+		// nothing readable to name them by and no way to map one back to a finding, so the only action
+		// offered is clearing them.
+		if (state.dismissed.legacyCount > 0) {
+			var legacy = el('div', 'hs-dismissed hs-dismissed-legacy');
+			legacy.id = 'hs-legacy-row';
+			var legacyText = el('div', 'hs-dismissed-text');
+			legacyText.appendChild(
+				el('span', 'hs-dismissed-rule', state.dismissed.legacyCount + ' legacy dismissals'),
+			);
+			legacyText.appendChild(
+				el('div', 'hs-help', 'Dismissed before Harper started recording what they were. They can only be cleared.'),
+			);
+			legacy.appendChild(legacyText);
+
+			var clearLegacy = el('button', 'hs-button hs-button-small', 'Clear');
+			clearLegacy.type = 'button';
+			clearLegacy.id = 'hs-clear-legacy';
+			clearLegacy.addEventListener('click', function () {
+				clearLegacy.disabled = true;
+				setDismissedStatus('Clearing…');
+				send({ type: 'settings:clearDismissed', scope: 'legacy' })
+					.then(function (reply) {
+						state.dismissed.legacyCount = 0;
+						renderDismissedList();
+						setDismissedStatus('Cleared ' + ((reply && reply.cleared) || 0) + ' legacy dismissals.');
+					})
+					.catch(function (error) {
+						clearLegacy.disabled = false;
+						setDismissedStatus('Could not clear: ' + error.message, true);
+					});
+			});
+			legacy.appendChild(clearLegacy);
+			host.appendChild(legacy);
+		}
+	}
+
+	function renderDismissed(root) {
+		var section = el('div', 'hs-section');
+		section.appendChild(
+			el(
+				'p',
+				'hs-section-intro',
+				'Findings you dismissed from the suggestion card. Restore one to have Harper flag it again.',
+			),
+		);
+
+		var bar = el('div', 'hs-toolbar');
+		var clearAll = el('button', 'hs-button', 'Clear all');
+		clearAll.type = 'button';
+		clearAll.id = 'hs-clear-all';
+		clearAll.addEventListener('click', function () {
+			// Inline confirm: the button becomes the question, so there is no modal-inside-a-modal (which
+			// Joplin dialogs handle badly) and no second click needed for the reversible actions.
+			if (!state.confirmClearAll) {
+				state.confirmClearAll = true;
+				clearAll.textContent = 'Really clear all?';
+				clearAll.className = 'hs-button hs-button-danger';
+				return;
+			}
+			state.confirmClearAll = false;
+			clearAll.textContent = 'Clear all';
+			clearAll.className = 'hs-button';
+			setDismissedStatus('Clearing…');
+			send({ type: 'settings:clearDismissed', scope: 'all' })
+				.then(function (reply) {
+					state.dismissed = { entries: [], legacyCount: 0 };
+					renderDismissedList();
+					setDismissedStatus('Cleared ' + ((reply && reply.cleared) || 0) + ' dismissals.');
+				})
+				.catch(function (error) {
+					setDismissedStatus('Could not clear: ' + error.message, true);
+				});
+		});
+		bar.appendChild(clearAll);
+		section.appendChild(bar);
+
+		var status = el('div', 'hs-status');
+		status.id = 'hs-dismissed-status';
+		section.appendChild(status);
+
+		var list = el('div', 'hs-dismissed-list');
+		list.id = 'hs-dismissed-list';
+		section.appendChild(list);
+
+		root.appendChild(section);
+		renderDismissedList();
+	}
+
+	// =============================================================================
+	// Shell.
+	// =============================================================================
+
+	var TABS = [
+		['general', 'General'],
+		['rules', 'Rules'],
+		['dictionary', 'Dictionary'],
+		['dismissed', 'Dismissed'],
+	];
+
+	function renderTabBody() {
+		var body = document.getElementById('hs-body');
+		if (!body) return;
+		clear(body);
+		if (state.tab === 'general') renderGeneral(body);
+		else if (state.tab === 'rules') renderRulesSection(body);
+		else if (state.tab === 'dictionary') renderDictionary(body);
+		else renderDismissed(body);
+	}
+
+	function render() {
+		var root = document.getElementById('harper-settings');
+		if (!root) return;
+		clear(root);
+
+		var scroll = el('div', 'hs-scroll');
+
+		var head = el('div', 'hs-head');
+		head.appendChild(el('h1', 'hs-title', 'Harper settings'));
+		scroll.appendChild(head);
+
+		var tabs = el('div', 'hs-tabs');
+		tabs.id = 'hs-tabs';
+		for (var i = 0; i < TABS.length; i++) {
+			(function (id, label) {
+				var button = el('button', 'hs-tab' + (state.tab === id ? ' hs-tab-active' : ''), label);
+				button.type = 'button';
+				button.setAttribute('data-tab', id);
+				button.addEventListener('click', function () {
+					if (state.tab === id) return;
+					state.tab = id;
+					render();
+					if (id === 'rules') ensureDescriptions();
+				});
+				tabs.appendChild(button);
+			})(TABS[i][0], TABS[i][1]);
+		}
+		scroll.appendChild(tabs);
+
+		var body = el('div', 'hs-body');
+		body.id = 'hs-body';
+		scroll.appendChild(body);
+		root.appendChild(scroll);
+
+		renderTabBody();
+	}
+
+	// =============================================================================
+	// Loading.
+	// =============================================================================
+
+	var descriptionsRequested = false;
+
+	/**
+	 * Pull the ~823 description strings ONCE, in the background.
+	 *
+	 * Deliberately not part of the first snapshot: that payload would roughly triple in size and delay
+	 * the first paint of a screen whose whole job is to feel instant. Anything already rendered picks
+	 * the text up on the next render pass.
+	 */
+	function ensureDescriptions() {
+		if (descriptionsRequested || state.descriptions) return;
+		descriptionsRequested = true;
+		send({ type: 'settings:descriptions' })
+			.then(function (map) {
+				state.descriptions = map || {};
+				var names = Object.keys(state.descriptions);
+				for (var i = 0; i < names.length; i++) {
+					state.descriptionText[names[i]] = stripHtml(state.descriptions[names[i]]);
+				}
+				if (state.tab === 'rules') renderRules();
+			})
+			.catch(function () {
+				// Descriptions are a nicety; the browser stays fully usable without them.
+				state.descriptions = {};
+				if (state.tab === 'rules') renderRules();
+			});
+	}
+
+	function showFatal(message) {
+		var root = document.getElementById('harper-settings');
+		if (!root) return;
+		clear(root);
+		var box = el('div', 'hs-scroll');
+		box.appendChild(el('h1', 'hs-title', 'Harper settings'));
+		box.appendChild(el('p', 'hs-status hs-status-error', 'Could not load settings: ' + message));
+		root.appendChild(box);
+	}
+
+	function load() {
+		// includeDescriptions:false — fast first paint. ensureDescriptions() fetches them right after.
+		return send({ type: 'settings:snapshot', includeDescriptions: false })
+			.then(function (snapshot) {
+				if (!snapshot) throw new Error('no snapshot');
+				state.settings = snapshot.settings || {};
+				state.defaults = snapshot.defaults || {};
+				state.overrides = {};
+				// Copy, not alias: the reply object is a one-shot structured clone and this map is edited
+				// in place on every toggle.
+				var flat = snapshot.flatConfig || {};
+				var keys = Object.keys(flat);
+				for (var i = 0; i < keys.length; i++) {
+					if (typeof flat[keys[i]] === 'boolean') state.overrides[keys[i]] = flat[keys[i]];
+				}
+				state.groups = buildGroups(snapshot.structured, state.defaults, state.overrides);
+				state.dictionaryWords = snapshot.dictionaryWords || [];
+				state.dismissed = snapshot.dismissed || { entries: [], legacyCount: 0 };
+				state.loaded = true;
+				render();
+				ensureDescriptions();
+			})
+			.catch(function (error) {
+				showFatal(error.message);
+			});
+	}
+
+	// A reopened dialog may reuse a still-mounted webview, in which case none of the above re-runs and
+	// the user would be looking at the state from the previous open. index.ts posts this right before
+	// every open(); when the webview really was torn down the message is dropped and the fresh script
+	// load below covers it instead. Reloading twice is harmless — it is the same idempotent fetch.
+	if (typeof webviewApi !== 'undefined' && webviewApi.onMessage) {
+		webviewApi.onMessage(function (event) {
+			// NOTE the wrapper: the payload arrives as `{ message }`, not as the message itself.
+			var message = event && event.message;
+			if (message && message.type === 'settings:refresh') load();
+		});
+	}
+
+	if (document.readyState === 'loading') {
+		document.addEventListener('DOMContentLoaded', load);
+	} else {
+		load();
+	}
+})();

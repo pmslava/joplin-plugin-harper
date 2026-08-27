@@ -36,6 +36,20 @@ function makeJoplin(options) {
         panelScripts: [],
         toolbarButtons: [],
         menus: [],
+        // HARPER v1.4.0 (settings dialog): the dialog's construction, recorded so a test can assert the
+        // pieces that make it usable at all — the CSS+JS assets, the single Close button, and
+        // setFitToContent(false) (without which the dialog has no real viewport).
+        dialogScripts: [],
+        dialogHtml: {},
+        dialogButtons: {},
+        dialogFitToContent: {},
+        menuItems: [],
+        // Every views.*.onMessage handler by view handle, so the DIALOG's endpoint can be driven
+        // directly (state.panelMessageHandler only ever holds the last one registered).
+        viewMessageHandlers: {},
+        // Every panels.postMessage(handle, message) — the reopen nudge is fire-and-forget, so this is
+        // the only way to see it happened.
+        viewPostedMessages: [],
         commands: [],
         // HARPER: every joplin.commands.execute(name, ...args), in order.
         commandExecutions: [],
@@ -47,6 +61,7 @@ function makeJoplin(options) {
         // Every settings.setValue, so a test can assert a render wrote no profile/setting (the outside-results peek is read-only).
         settingWrites: [],
         onStart: null,
+        sectionDescription: '',
         panelMessageHandler: null,
         // HARPER: every joplin.contentScripts.register(type, id, path) call, in order.
         contentScripts: [],
@@ -129,7 +144,9 @@ function makeJoplin(options) {
         },
         versionInfo: async () => options.versionInfo,
         settings: {
-            registerSection: async () => {},
+            // HARPER v1.4.0: keep the section's description — it is the only in-app pointer to the
+            // "Harper: Settings…" command, and Joplin renders it as literal text (no markup allowed).
+            registerSection: async (name, section) => { state.sectionDescription = (section || {}).description || '' },
             registerSettings: async (defs) => {
                 state.registeredSettings = defs
                 for (const key of Object.keys(defs)) {
@@ -180,21 +197,32 @@ function makeJoplin(options) {
             panels: {
                 create: async (id) => { state.panels.push(id); return `panel-${id}` },
                 addScript: async (handle, script) => { state.panelScripts.push(script) },
-                onMessage: async (handle, handler) => { state.panelMessageHandler = withTimerCapture(handler) },
+                // HARPER v1.4.0: the settings DIALOG registers its handler here too — panels.onMessage
+                // accepts a dialog handle (same WebviewController underneath), which is the only way to
+                // talk to a dialog webview. Keyed by handle so the panel and the dialog can coexist.
+                onMessage: async (handle, handler) => {
+                    state.panelMessageHandler = withTimerCapture(handler)
+                    state.viewMessageHandlers[handle] = withTimerCapture(handler)
+                },
+                postMessage: (handle, message) => { state.viewPostedMessages.push({ handle, message }) },
                 setHtml: async (handle, html) => { state.setHtmlCalls++; state.callLog.push('setHtml'); state.panelHtml[handle] = html },
                 show: async () => {},
                 visible: async () => true,
             },
             dialogs: {
                 create: async (id) => { state.dialogs.push(id); return `dialog-${id}` },
-                addScript: async () => {},
-                setHtml: async () => {},
-                setButtons: async () => {},
+                addScript: async (handle, script) => { state.dialogScripts.push({ handle, script }) },
+                setHtml: async (handle, html) => { state.dialogHtml[handle] = html },
+                setButtons: async (handle, buttons) => { state.dialogButtons[handle] = buttons },
+                setFitToContent: async (handle, status) => { state.dialogFitToContent[handle] = status },
                 open: async () => state.dialogResult || { id: 'cancel' },
                 showMessageBox: async (message) => { state.messageBoxes.push(message); return 0 },
             },
             toolbarButtons: {
                 create: async (id, command, location) => { state.toolbarButtons.push({ id, command, location }) },
+            },
+            menuItems: {
+                create: async (id, command, location, options) => { state.menuItems.push({ id, command, location, options }) },
             },
             menus: {
                 create: async (id, label, items, location) => { state.menus.push({ id, label, location }) },

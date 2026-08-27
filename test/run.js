@@ -312,6 +312,129 @@ async function main() {
 		assert.ok(/solid/i.test(def.options.solid), 'the solid option has a solid label');
 	});
 
+	// ---- settings DIALOG registration (v1.4.0, Phase 2) ----------------------
+	// The dialog is the plugin's only real settings surface for rules/dictionary/dismissals, and it is
+	// entirely postMessage-driven. These checks pin the four things that make it work at all — the
+	// command, the platform-correct entry point, the construction (assets + Close + fit-to-content),
+	// and a live round-trip over the DIALOG's own message channel rather than the content script's.
+	await test("command 'harper.openSettings' is registered with the Settings label and icon", () => {
+		const command = state.commands.find((c) => c.name === 'harper.openSettings');
+		assert.ok(command, 'harper.openSettings is registered');
+		assert.strictEqual(command.label, 'Harper: Settings…', 'label matches the documented command name');
+		assert.strictEqual(command.iconName, 'fas fa-spell-check', 'command carries the Harper icon');
+		assert.strictEqual(typeof command.execute, 'function', 'the command is executable');
+	});
+
+	await test('desktop: the settings command is put in the Tools menu (and NOT on the note toolbar)', () => {
+		const item = state.menuItems.find((m) => m.command === 'harper.openSettings');
+		assert.ok(item, 'a menu item was created for harper.openSettings');
+		assert.strictEqual(item.location, 'tools', 'it lives in the Tools menu');
+		assert.ok(
+			!state.toolbarButtons.some((b) => b.command === 'harper.openSettings'),
+			'desktop does not also add the mobile note-toolbar button',
+		);
+	});
+
+	await test('the settings section description points the user at the command (plain text, no markup)', () => {
+		// Joplin renders a section description as LITERAL text, so a link here would show as raw markup.
+		const description = state.sectionDescription;
+		assert.ok(description, 'the harper section registered a description');
+		assert.ok(description.includes('Harper: Settings…'), 'it names the command');
+		assert.ok(!/[<>]|\]\(/.test(description), `plain text only, got: ${description}`);
+	});
+
+	await test('opening the dialog builds it once: CSS + JS assets, a single Close button, fit-to-content off', async () => {
+		const command = state.commands.find((c) => c.name === 'harper.openSettings');
+		const dialogsBefore = state.dialogs.length;
+		await command.execute();
+
+		assert.strictEqual(state.dialogs.length, dialogsBefore + 1, 'exactly one dialog was created');
+		const handle = `dialog-${state.dialogs[state.dialogs.length - 1]}`;
+		const scripts = state.dialogScripts.filter((s) => s.handle === handle).map((s) => s.script);
+		assert.ok(scripts.includes('./settingsDialog.js'), `the webview script is loaded, got ${JSON.stringify(scripts)}`);
+		assert.ok(scripts.includes('./settingsDialog.css'), `the webview stylesheet is loaded, got ${JSON.stringify(scripts)}`);
+		// setFitToContent(false) is what gives the dialog a real 90vw x 90vh viewport. Without it the
+		// dialog shrinks to its (empty) initial HTML and the whole browser is invisible.
+		assert.strictEqual(state.dialogFitToContent[handle], false, 'fit-to-content is explicitly turned OFF');
+		assert.deepStrictEqual(
+			state.dialogButtons[handle],
+			[{ id: 'ok', title: 'Close' }],
+			'exactly one button, labelled Close (there is no form and no formData round-trip)',
+		);
+		// The shell is deliberately an EMPTY root: setHtml does not re-run scripts, so everything is
+		// rendered client-side from the snapshot.
+		assert.ok(/id="harper-settings"/.test(state.dialogHtml[handle] || ''), 'the shell exposes the render root');
+
+		// REOPENING must not build a second dialog, and must nudge a possibly-still-mounted webview to
+		// re-fetch rather than show the state from the previous open.
+		const postedBefore = state.viewPostedMessages.length;
+		await command.execute();
+		assert.strictEqual(state.dialogs.length, dialogsBefore + 1, 'a reopen reuses the same dialog');
+		const posted = state.viewPostedMessages.slice(postedBefore);
+		assert.ok(
+			posted.some((p) => p.handle === handle && p.message && p.message.type === 'settings:refresh'),
+			`the reopen posted a refresh nudge, saw ${JSON.stringify(posted)}`,
+		);
+	});
+
+	await test('the dialog channel answers settings:* over panels.onMessage (registered on a DIALOG handle)', async () => {
+		// joplin.views.dialogs has NO onMessage; panels.onMessage accepts a dialog handle because both
+		// are the same WebviewController underneath. If that ever stops being true, this test is where
+		// it shows up rather than in a silently dead settings screen.
+		const handle = `dialog-${state.dialogs[state.dialogs.length - 1]}`;
+		const dialogHandler = state.viewMessageHandlers[handle];
+		assert.strictEqual(typeof dialogHandler, 'function', 'a message handler is bound to the dialog handle');
+
+		const snapshot = await dialogHandler({ type: 'settings:snapshot', includeDescriptions: false });
+		assert.ok(snapshot && snapshot.settings, 'the dialog gets a settings snapshot');
+		assert.ok(snapshot.defaults && Object.keys(snapshot.defaults).length > 500, 'defaults cover the whole rule roster');
+		assert.strictEqual(snapshot.descriptionsHtml, null, 'includeDescriptions:false keeps the first paint small');
+		assert.ok(snapshot.structured && Array.isArray(snapshot.structured.settings), 'the grouping tree came through');
+
+		// A REJECTED write must arrive as a readable value, not as a promise that never settles: the
+		// webview has no other way to tell the user why nothing happened.
+		const refused = await dialogHandler({ type: 'settings:updateSetting', key: 'notARealKey', value: 1 });
+		assert.ok(refused && typeof refused.__error === 'string', `a rejected write returns {__error}, got ${JSON.stringify(refused)}`);
+		assert.ok(/not updatable/.test(refused.__error), `the reason is carried through: ${refused.__error}`);
+	});
+
+	// The webview is plain JS copied verbatim into dist/, so it cannot import the service's helper and
+	// keeps its own copy. This is the guard against the two drifting: same input, same output, or the
+	// rule browser starts labelling rules differently from everything else in the plugin.
+	await test('settingsDialog.js ruleDisplayLabel matches the settingsService implementation exactly', async () => {
+		// settingsService.ts imports './dismissedLog' for real, so hand it a loaded copy rather than
+		// letting require() try to resolve a .ts path relative to test/.
+		const { ruleDisplayLabel } = loadTsModule('src/settingsService.ts', (id) =>
+			id === './dismissedLog' ? loadTsModule('src/dismissedLog.ts') : require(id),
+		);
+		const source = fs.readFileSync(path.join(REPO_ROOT, 'src', 'settingsDialog.js'), 'utf8');
+		const match = source.match(/function ruleDisplayLabel\(name\)\s*\{[\s\S]*?\n\t\}/);
+		assert.ok(match, 'found ruleDisplayLabel in src/settingsDialog.js');
+		// eslint-disable-next-line no-new-func
+		const webviewLabel = new Function(`${match[0]}\nreturn ruleDisplayLabel;`)();
+
+		// Hand-picked edge cases (capital runs, digits, empties)...
+		const corpus = [
+			'AmazonNames', 'HTMLTags', 'Covid19', 'SpelledNumbers', 'ModalOf', 'A', '', 'lowercase',
+			'Iso8601Dates', 'OxfordComma', 'UNESCOWorldHeritage', 'Wordpress2Word', 'X9Y',
+		];
+		// ...plus every REAL rule name harper ships, so the guard is not limited to cases we imagined.
+		const handle = `dialog-${state.dialogs[state.dialogs.length - 1]}`;
+		const snapshot = await state.viewMessageHandlers[handle]({
+			type: 'settings:snapshot',
+			includeDescriptions: false,
+		});
+		const names = corpus.concat(Object.keys(snapshot.defaults || {}));
+		assert.ok(names.length > 500, `checking the whole roster, got ${names.length} names`);
+		for (const name of names) {
+			assert.strictEqual(
+				webviewLabel(name),
+				ruleDisplayLabel(name),
+				`ruleDisplayLabel drifted for "${name}"`,
+			);
+		}
+	});
+
 	// ---- config handshake ---------------------------------------------------
 	const handler = state.contentScriptMessageHandlers['harperCm'];
 	await test('getConfig returns {enabled, debounceMs, underlineStyle, platform, generation} for the content script', async () => {
@@ -719,6 +842,38 @@ async function main() {
 			assert.strictEqual(mstate.notePuts.length, putsBefore, 'an underlineStyle change writes NO note');
 			assert.strictEqual(mobileFsCalls.length, 0, 'still zero filesystem access on mobile');
 			await mstate.setSetting('underlineStyle', 'squiggly'); // restore for the later mobile tests
+		});
+
+		// v1.4.0: mobile Joplin has NO menus at all, so the note toolbar (which surfaces plugin buttons
+		// in the note's "..." overflow menu) is the only place the settings command can be reached from.
+		await test('mobile: the settings command is a note-toolbar button, not a menu item', () => {
+			const button = mstate.toolbarButtons.find((b) => b.command === 'harper.openSettings');
+			assert.ok(button, 'a toolbar button was created for harper.openSettings');
+			assert.strictEqual(button.location, 'noteToolbar', 'it sits on the note toolbar');
+			assert.ok(
+				!mstate.menuItems.some((m) => m.command === 'harper.openSettings'),
+				'mobile does not try to create a menu item (there are no menus there)',
+			);
+		});
+
+		await test('mobile: the settings dialog opens and its snapshot omits the desktop-only dictionaryPath', async () => {
+			const command = mstate.commands.find((c) => c.name === 'harper.openSettings');
+			assert.ok(command, 'the command is registered on mobile too');
+			await command.execute();
+			const handle = `dialog-${mstate.dialogs[mstate.dialogs.length - 1]}`;
+			const dialogHandler = mstate.viewMessageHandlers[handle];
+			assert.strictEqual(typeof dialogHandler, 'function', 'the dialog channel is wired on mobile');
+			const snapshot = await dialogHandler({ type: 'settings:snapshot', includeDescriptions: false });
+			// The setting is not REGISTERED on mobile, so reading it would throw "Unknown key" in real
+			// Joplin — the snapshot must simply not carry the key, and the dialog hides the whole row.
+			assert.ok(
+				!Object.prototype.hasOwnProperty.call(snapshot.settings, 'dictionaryPath'),
+				'the mobile snapshot has no dictionaryPath key at all',
+			);
+			// And a dialog that tried to write it anyway is refused with a readable reason.
+			const refused = await dialogHandler({ type: 'settings:updateSetting', key: 'dictionaryPath', value: '/tmp/x' });
+			assert.ok(refused && /desktop-only/.test(refused.__error || ''), `refused on mobile: ${JSON.stringify(refused)}`);
+			assert.strictEqual(mobileFsCalls.length, 0, 'opening the settings dialog touched ZERO filesystem');
 		});
 
 		await test('mobile: externalDictionaryPath is NOT registered; dictionaryNoteId + pendingWords ARE', () => {

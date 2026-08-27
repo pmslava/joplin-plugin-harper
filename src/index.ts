@@ -1,5 +1,11 @@
 import joplin from 'api';
-import { ContentScriptType, SettingItemType, SettingStorage } from 'api/types';
+import {
+	ContentScriptType,
+	MenuItemLocation,
+	SettingItemType,
+	SettingStorage,
+	ToolbarButtonLocation,
+} from 'api/types';
 import {
 	LocalLinter,
 	Dialect,
@@ -1254,6 +1260,111 @@ async function disableRule(ruleName: string): Promise<void> {
 	await pokeForceLint();
 }
 
+// =============================================================================
+// SETTINGS DIALOG (Phase 2) — the webview half lives in src/settingsDialog.{js,css}.
+// =============================================================================
+// The whole screen (general options, the ~823-rule browser, the dictionary editor and the dismissed
+// findings) is ONE dialog driven entirely by postMessage. Four things about this are non-obvious and
+// each one is load-bearing:
+//
+//   1. MESSAGING GOES THROUGH `views.panels`. `joplin.views.dialogs` has no onMessage/postMessage at
+//      all, but a dialog handle and a panel handle are the same WebviewController underneath, so
+//      `panels.onMessage(dialogHandle, cb)` is the supported way to talk to a dialog webview (the
+//      pattern Freehand Drawing, Jarvis and the Tagging plugin all use).
+//   2. THE WEBVIEW RENDERS ITSELF. `setHtml` does not re-run scripts, so a server-side re-render
+//      would paint HTML with no behaviour attached. The shell below is a single empty root; the
+//      script asks for `settings:snapshot` and builds everything client-side.
+//   3. `setFitToContent(false)` IS REQUIRED for the dialog to get a real viewport (90vw x 90vh on
+//      desktop), and the CSS then has to supply its own scroll box because desktop dialog documents
+//      set `html { overflow: hidden }`.
+//   4. THE DIALOG IS BUILT LAZILY. onStart's budget is guarded by a test; creating a view, setting
+//      its HTML and loading two assets is cheap but pointless until someone opens the thing.
+
+const SETTINGS_DIALOG_HTML = '<div id="harper-settings"></div>';
+
+/**
+ * The dialog's message endpoint.
+ *
+ * `settingsService.handleMessage` REJECTS for a bad value (unknown setting key, invalid dialect,
+ * dictionaryPath on mobile). A rejection here would leave the webview's `postMessage` promise pending
+ * forever with no way to tell the user why, so failures are converted into a value the webview can
+ * read and show: `{__error}`.
+ */
+async function handleSettingsDialogMessage(message: unknown): Promise<unknown> {
+	try {
+		return await settingsService.handleMessage(message);
+	} catch (error) {
+		return { __error: String((error as Error)?.message || error) };
+	}
+}
+
+let settingsDialogPromise: Promise<string> | null = null;
+
+async function buildSettingsDialog(): Promise<string> {
+	const handle = await joplin.views.dialogs.create('harperSettingsDialog');
+	await joplin.views.dialogs.setHtml(handle, SETTINGS_DIALOG_HTML);
+	await joplin.views.dialogs.addScript(handle, './settingsDialog.css');
+	await joplin.views.dialogs.addScript(handle, './settingsDialog.js');
+	// ONE button. There is no form and no formData round-trip — every change has already been saved by
+	// the time the user gets here, so "Close" is the only honest label.
+	await joplin.views.dialogs.setButtons(handle, [{ id: 'ok', title: 'Close' }]);
+	await joplin.views.dialogs.setFitToContent(handle, false);
+	await joplin.views.panels.onMessage(handle, handleSettingsDialogMessage);
+	return handle;
+}
+
+/** Build once, reuse forever. Concurrent opens await the same in-flight construction. */
+function getSettingsDialog(): Promise<string> {
+	if (!settingsDialogPromise) settingsDialogPromise = buildSettingsDialog();
+	return settingsDialogPromise;
+}
+
+async function openSettingsDialog(): Promise<void> {
+	const handle = await getSettingsDialog();
+	// A REOPEN may reuse a webview that was never torn down, in which case the script does not re-run
+	// and the user would be shown the state from the previous open. This nudge makes it re-fetch. When
+	// the webview really was unmounted the message is simply dropped and the script's own load covers
+	// it — reloading twice is the same idempotent fetch, so both paths are safe.
+	try {
+		joplin.views.panels.postMessage(handle, { type: 'settings:refresh' });
+	} catch {
+		/* older API without postMessage on a dialog handle — the script's own load still runs */
+	}
+	await joplin.views.dialogs.open(handle);
+}
+
+/**
+ * Wire the command and its two platform-specific entry points.
+ *
+ * DESKTOP gets a Tools menu item (and the command palette for free). MOBILE has no menus at all, so
+ * the note toolbar — which surfaces plugin buttons in the note's "..." overflow menu — is the only
+ * place a plugin can put a top-level action there.
+ */
+async function registerSettingsDialogCommand(): Promise<void> {
+	await joplin.commands.register({
+		name: 'harper.openSettings',
+		label: 'Harper: Settings…',
+		iconName: 'fas fa-spell-check',
+		execute: async () => {
+			await openSettingsDialog();
+		},
+	});
+
+	if (isMobile()) {
+		await joplin.views.toolbarButtons.create(
+			'harperSettingsButton',
+			'harper.openSettings',
+			ToolbarButtonLocation.NoteToolbar,
+		);
+	} else {
+		await joplin.views.menuItems.create(
+			'harperSettingsMenuItem',
+			'harper.openSettings',
+			MenuItemLocation.Tools,
+		);
+	}
+}
+
 // -----------------------------------------------------------------------------
 // Create-dictionary-note command (both platforms).
 // -----------------------------------------------------------------------------
@@ -1404,7 +1515,12 @@ async function handleMessage(message: IncomingMessage | unknown): Promise<unknow
 async function registerSettings(): Promise<void> {
 	await joplin.settings.registerSection(SECTION, {
 		label: 'Harper',
-		description: 'Harper grammar checker settings.',
+		// PLAIN TEXT ONLY — Joplin renders a section description as literal text, so a link here would
+		// show up as raw markup. The pointer is to the command name, which works on both platforms
+		// (command palette on desktop, the note "..." menu on mobile).
+		description:
+			'Harper grammar checker settings. To browse the full rule list, edit your dictionary or ' +
+			'restore dismissed findings, run the "Harper: Settings…" command.',
 		iconName: 'fas fa-spell-check',
 	});
 
@@ -1649,6 +1765,16 @@ joplin.plugins.register({
 				await createDictionaryNote();
 			},
 		});
+
+		// The settings dialog: command + Tools menu item (desktop) or note-toolbar button (mobile).
+		// Registration only — the dialog itself is built on first open, so onStart stays cheap. Guarded
+		// because a host without menuItems/toolbarButtons must not take the whole plugin down with it.
+		try {
+			await registerSettingsDialogCommand();
+		} catch (error) {
+			// eslint-disable-next-line no-console
+			console.warn('[harper] settings dialog registration failed:', error);
+		}
 
 		// Reconfigure + re-lint whenever settings change.
 		await joplin.settings.onChange(async ({ keys }) => {
