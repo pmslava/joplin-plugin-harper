@@ -114,7 +114,23 @@
 		// a rule with such a name would read as already-seen / already-expanded. harper's names are
 		// PascalCase today, but a lookup table keyed by external strings has no business inheriting.
 		descriptionText: Object.create(null), // rule -> plain text, for search
+		// INV-C — THE DICTIONARY EDITOR'S THREE FIELDS, and the rule that binds them.
+		//
+		//   dictionaryWords    the reconciled truth, for the word count
+		//   dictionaryBaseline the word list the visible box was last SEEDED from
+		//   dictionaryText     the exact text the box shows, including unsaved typing
+		//
+		// THE INVARIANT: `dictionaryBaseline` is always the list that was last rendered into the box.
+		// It is what a save sends as its baseline, and the service may only delete words that appear
+		// in it — so the moment it describes words the box never showed, the next save deletes them.
+		// Two shipped bugs came from exactly that gap: advancing the baseline to the reconciled truth
+		// while a refused repaint left the old text on screen, and re-seeding the box on a tab switch
+		// while the baseline stayed put. Both fields therefore move together, in `seedDictionary` and
+		// nowhere else. `dictionaryText` is the draft: only the user's own typing changes it without
+		// the baseline, which is correct, because typing does not change what the editor was SHOWN.
 		dictionaryWords: [],
+		dictionaryBaseline: [],
+		dictionaryText: '',
 		dismissed: { entries: [], legacyCount: 0 },
 		search: '',
 		tab: 'general',
@@ -793,13 +809,13 @@
 	 * Is this group's rule list shown right now?
 	 *
 	 * A search auto-opens the groups that matched: with a needle typed, hiding the hits behind a
-	 * second click would make the search useless. That is a DISPLAY override only \u2014 the stored
+	 * second click would make the search useless. That is a DISPLAY override only — the stored
 	 * expansion state (`expandedGroups`) is left alone, so clearing the search restores exactly what
 	 * the user had open.
 	 *
 	 * The override used to be unconditional, which made the arrow a DEAD CONTROL during a search while
 	 * still flipping the stored value underneath: nothing moved on screen, and the group turned out to
-	 * have silently collapsed once the search was cleared \u2014 by a click count the UI gave no feedback
+	 * have silently collapsed once the search was cleared — by a click count the UI gave no feedback
 	 * for. So a collapse made DURING a search is recorded separately, in `searchExpanded`, and is
 	 * honoured over the force-open while that search lasts.
 	 */
@@ -811,10 +827,21 @@
 		return true;
 	}
 
-	/** Flip the state `groupExpanded` reads \u2014 the per-search one during a search, the stored one otherwise. */
-	function toggleGroupExpanded(groupId, needle) {
-		if (needle) state.searchExpanded[groupId] = !groupExpanded(groupId, needle);
-		else state.expandedGroups[groupId] = !state.expandedGroups[groupId];
+	/**
+	 * INV-D: flip what is ON SCREEN; let the CURRENT needle choose only where the result is stored.
+	 *
+	 * `paintedExpanded` is the value this row was actually rendered with, so the arrow always does what
+	 * its glyph promises. Deriving the new value from the current needle instead made the toggle fire in
+	 * the wrong direction whenever the two disagreed — which is the whole 140 ms debounce window: with
+	 * no stored expansion, a group force-opened by a search and then clicked after the search was
+	 * cleared computed `!undefined === true` and stayed open, leaving behind a stored expansion the user
+	 * never asked for. The mirror case (painted collapsed at '', clicked once a needle exists) failed
+	 * the same way.
+	 */
+	function toggleGroupExpanded(groupId, needle, paintedExpanded) {
+		var next = !paintedExpanded;
+		if (needle) state.searchExpanded[groupId] = next;
+		else state.expandedGroups[groupId] = next;
 	}
 
 	function renderGroup(group, needle) {
@@ -839,7 +866,7 @@
 				clearTimeout(searchTimer);
 				searchTimer = null;
 			}
-			toggleGroupExpanded(group.id, currentNeedle());
+			toggleGroupExpanded(group.id, currentNeedle(), expanded);
 			renderRules();
 		}
 
@@ -901,6 +928,25 @@
 		return state.search.trim().toLowerCase();
 	}
 
+	/**
+	 * INV-D: adopt a new raw search value, and decide from the EFFECTIVE needle whether the
+	 * per-search collapses still describe anything. Returns true when the needle actually moved.
+	 *
+	 * The comparison has to be on `currentNeedle()`, not on the raw field: it trims and lowercases, so
+	 * a trailing space typed while composing a two-word query — or re-pasting the same text — fires
+	 * `input` without changing a single match. Wiping `searchExpanded` there sprang every group the
+	 * user had just collapsed back open under a result list that had not moved. A genuinely new query
+	 * IS a new set of matches, and dropping the collapses then is what keeps `expandedGroups` — the
+	 * state a cleared search restores — untouched by anything that happened during a search.
+	 */
+	function setSearchValue(raw) {
+		var before = currentNeedle();
+		state.search = raw;
+		if (currentNeedle() === before) return false;
+		state.searchExpanded = Object.create(null);
+		return true;
+	}
+
 	function renderRules() {
 		var host = document.getElementById('hs-rules-groups');
 		if (!host) return;
@@ -959,11 +1005,7 @@
 		search.placeholder = 'Search rules…';
 		search.value = state.search;
 		search.addEventListener('input', function () {
-			state.search = search.value;
-			// A new query is a new set of matches, so the collapses the user made against the OLD one no
-			// longer describe anything. Dropping them here is what keeps `expandedGroups` — the state a
-			// cleared search restores — untouched by anything that happened during a search.
-			state.searchExpanded = Object.create(null);
+			setSearchValue(search.value);
 			// Debounced: a one-letter query can match hundreds of rules, and re-rendering on every
 			// keystroke would stutter on mobile.
 			if (searchTimer) clearTimeout(searchTimer);
@@ -1045,22 +1087,27 @@
 	 * setGeneralStatus, setDismissedStatus); this one now does too, so it lands on whatever nodes are
 	 * currently on screen, and harmlessly on none when the tab is elsewhere.
 	 */
-	function paintDictionary(untouched) {
-		var next = state.dictionaryWords.join('\n');
+	/**
+	 * THE ONLY place the editor's baseline and its text change. See INV-C on `state`.
+	 *
+	 * Everything a save is allowed to delete comes from `dictionaryBaseline`, and everything the user
+	 * sees comes from `dictionaryText`. Letting either move without the other is what turns a stale
+	 * screen into a deletion, so there is one function and no other writer.
+	 */
+	function seedDictionary(words) {
+		state.dictionaryWords = words.slice();
+		state.dictionaryBaseline = words.slice();
+		state.dictionaryText = state.dictionaryWords.join('\n');
+	}
+
+	/** Push `state.dictionaryText` and the count onto whatever nodes are mounted right now. */
+	function paintDictionary() {
 		var area = document.getElementById('hs-dictionary');
-		// MERGE, DO NOT CLOBBER. The box is editable for the whole round trip — the Save button is
-		// disabled but the textarea never is, and a tab switch even brings back an enabled one — so
-		// overwriting it unconditionally throws away whatever the user typed while the save ran, with a
-		// cheerful "Saved." over the top and no hint anything was dropped. It is only ours to repaint
-		// while it still holds one of the values we last put there: what was on screen when Save was
-		// pressed, or what a re-render seeded it with. `untouched` carries both.
-		var mine = !area || !untouched || untouched.indexOf(area.value) !== -1;
-		if (area && mine) area.value = next;
+		if (area && area.value !== state.dictionaryText) area.value = state.dictionaryText;
 		var count = document.getElementById('hs-dictionary-count');
 		if (count) count.textContent = state.dictionaryWords.length + ' words';
 		var save = document.getElementById('hs-save-dictionary');
 		if (save) save.disabled = false;
-		return mine;
 	}
 
 	function renderDictionary(root) {
@@ -1072,8 +1119,17 @@
 		var area = el('textarea', 'hs-textarea');
 		area.id = 'hs-dictionary';
 		area.spellcheck = false;
-		// textContent, not innerHTML: these are user words.
-		area.value = state.dictionaryWords.join('\n');
+		// Seeded from the DRAFT, not from the reconciled list. This tab is the dialog's only unsaved
+		// buffer — every other control commits on change or on click — and re-seeding from
+		// `dictionaryWords` meant one click on "Rules" silently destroyed everything the user had
+		// typed, with no prompt and no way back. Preserving it is the conservative choice: nothing is
+		// lost, and the baseline the draft was seeded from travels with it.
+		area.value = state.dictionaryText;
+		// The draft IS the text, so it has to follow the box. Keeping it here (rather than reading the
+		// node when needed) is what lets the buffer survive a tab switch, which destroys the node.
+		area.addEventListener('input', function () {
+			state.dictionaryText = area.value;
+		});
 		section.appendChild(area);
 
 		var status = el('div', 'hs-status');
@@ -1096,35 +1152,44 @@
 				if (!word || word.indexOf('# ') === 0) continue;
 				if (words.indexOf(word) === -1) words.push(word);
 			}
-			// THE BASELINE: the list this textarea was seeded from, sent with the save so the service
-			// can tell "the user deleted this" from "the dialog never saw it". Without it, a save posts
-			// what is effectively a wholesale replace, and anything that entered the dictionary since
-			// the dialog loaded — a word synced from another device, the 500 words in an external file
-			// just configured on the General tab — reads as an explicit deletion.
-			var baseline = state.dictionaryWords.slice();
-			// The two values the box may legitimately hold when the reply lands: what was on screen at
-			// send time, and what a re-render would have seeded it with. Anything else is typing the
-			// user has done since, which the repaint must not eat.
-			var untouched = [area.value, baseline.join('\n')];
+			// THE BASELINE: the list this textarea was SEEDED from — never the reconciled truth. It is
+			// what the service is permitted to delete, so it must describe words the user could
+			// actually see and remove. Sending the truth instead is how a stale screen becomes a
+			// deletion: anything that entered the dictionary since the box was seeded (a word synced
+			// from another device, the 500 words in an external file just configured on the General
+			// tab) would be in the baseline, absent from the box, and read as an explicit removal.
+			var baseline = state.dictionaryBaseline.slice();
+			// The draft as it stood when Save was pressed. Compared against the draft — not against the
+			// DOM node — so the answer is the same whether or not the tab is still mounted.
+			var textAtSend = state.dictionaryText;
 			setDictionaryStatus('Saving…');
 			save.disabled = true;
 			send({ type: 'settings:saveDictionary', words: words, baseline: baseline })
 				.then(function (reply) {
 					var adds = (reply && reply.adds) || [];
 					var removes = (reply && reply.removes) || [];
-					// The reply carries the reconciled truth, not an echo of what was posted, so the
-					// editor shows what the dictionary actually holds — and the next save's baseline is
-					// that same truth rather than a list already out of date.
-					state.dictionaryWords =
-						reply && reply.words ? reply.words.slice() : words.slice().sort();
-					var repainted = paintDictionary(untouched);
+					// The reply carries the reconciled truth, including anything that arrived while the
+					// save ran.
+					var truth = reply && reply.words ? reply.words.slice() : words.slice().sort();
+					var untouched = state.dictionaryText === textAtSend;
+					if (untouched) {
+						// Nobody typed: adopt the truth wholesale — box, draft and baseline together.
+						seedDictionary(truth);
+					} else {
+						// The user typed during the round trip, so their text stays. The BASELINE STAYS
+						// WITH IT: advancing it to `truth` would describe words this box has never shown,
+						// and the next save would send them as a baseline the textarea contradicts — i.e.
+						// as deletions of content that only ever existed off-screen. Only the count moves.
+						state.dictionaryWords = truth;
+					}
+					paintDictionary();
 					var summary =
 						!adds.length && !removes.length
 							? 'Saved. Nothing changed.'
 							: 'Saved. ' + adds.length + ' added, ' + removes.length + ' removed.';
 					// Say so when the box was left alone, or the user is looking at their own unsaved
 					// text under a message that says everything is saved.
-					setDictionaryStatus(repainted ? summary : summary + ' Your unsaved edits were kept.');
+					setDictionaryStatus(untouched ? summary : summary + ' Your unsaved edits were kept.');
 				})
 				.catch(function (error) {
 					var current = document.getElementById('hs-save-dictionary');
@@ -1453,7 +1518,9 @@
 					if (typeof flat[keys[i]] === 'boolean') state.overrides[keys[i]] = flat[keys[i]];
 				}
 				state.groups = buildGroups(snapshot.structured, state.defaults, state.overrides);
-				state.dictionaryWords = snapshot.dictionaryWords || [];
+				// A fresh snapshot IS the truth and there is no draft to preserve across it, so box,
+				// draft and baseline are all seeded from it together.
+				seedDictionary(snapshot.dictionaryWords || []);
 				state.dismissed = snapshot.dismissed || { entries: [], legacyCount: 0 };
 				state.loaded = true;
 				render();

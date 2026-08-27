@@ -26,6 +26,8 @@ import { mergeDictionary } from './dictionaryMerge';
 import {
 	DismissedStore,
 	appendDismissedInTransaction,
+	buildIgnoredLintsPayload,
+	extractHashes,
 	makeEntryId,
 	withDismissalTransaction,
 } from './dismissedLog';
@@ -503,6 +505,106 @@ async function retirePendingEntries(
 // -----------------------------------------------------------------------------
 const SYNC_BASE_KEY = 'syncBase';
 
+// =============================================================================
+// INV-A — DICTIONARY EPOCH: no durable write may outlive the configuration it was computed from.
+// =============================================================================
+// Three pieces of state decide what a reconcile pass MEANS: the dictionary note id, the external
+// file path, and the merge base. A repoint changes all three, and a pass that computed its result
+// from the old ones must not write with them — it would put the old note's words into the newly
+// pointed note, truncate the newly pointed file, or commit a base over the `''` that `resetSyncBase`
+// writes precisely so the next pass adopts the new side instead of inferring deletions from it.
+//
+// Rounds of point-fixes taught the shape this has to take. Capturing the identity at pass start was
+// not enough (the base was still read live). Re-checking the identity ONCE before the write block was
+// not enough either — it is a check-then-act: four suspension points follow it before the commit, and
+// a repoint landing in any of them was never re-checked.
+//
+// So: ONE monotonic counter, bumped by EVERY mutation of dictionary identity or base; a pass captures
+// it atomically with the identity at pass start; and every durable write asserts it IMMEDIATELY
+// before mutating, with no await in between. A stale pass writes nothing at all. It is idempotent and
+// the repoint schedules its own reconcile, so the next pass simply redoes the work correctly.
+let dictionaryEpoch = 0;
+
+function bumpDictionaryEpoch(): void {
+	dictionaryEpoch++;
+}
+
+/**
+ * How many dictionary-identity / base mutations are in progress. See captureDictionaryEpoch.
+ */
+let dictionaryMutationDepth = 0;
+
+/**
+ * BRACKET a mutation of dictionary identity or base.
+ *
+ * Three things, and every one of them is load-bearing:
+ *
+ *   * the bump BEFORE invalidates every pass that already read the old value;
+ *   * the bump AFTER invalidates every pass that read while the mutation was landing;
+ *   * the DEPTH marks the whole span as a transition. Bumps alone cannot cover it, because these
+ *     mutations are several awaits long and an entire reconcile can begin AND finish inside one. Such
+ *     a pass sees a genuinely inconsistent world — the identity has already flipped to the new note
+ *     while the base still describes the old one — and no comparison of epochs before and after can
+ *     detect that, since nothing changed for the duration of the pass. It merges the new note against
+ *     the old base, turning every word the new side lacks into an inferred deletion and truncating
+ *     the user's own dictionary file.
+ *
+ * So a pass that STARTS inside a transition is born stale and may never write. The `finally` is
+ * deliberate: a mutation that threw part-way still leaves state no pass should trust.
+ */
+async function withDictionaryEpochBump<T>(mutate: () => Promise<T>): Promise<T> {
+	dictionaryMutationDepth++;
+	bumpDictionaryEpoch();
+	try {
+		return await mutate();
+	} finally {
+		bumpDictionaryEpoch();
+		dictionaryMutationDepth--;
+	}
+}
+
+/**
+ * The epoch a starting pass should carry — or a value that can never match, when the configuration is
+ * mid-transition and there is no consistent world to snapshot.
+ */
+function captureDictionaryEpoch(): number {
+	return dictionaryMutationDepth > 0 ? -1 : dictionaryEpoch;
+}
+
+/** What a pass is reconciling against: captured once, asserted at every durable write. */
+interface PassSnapshot {
+	epoch: number;
+	noteId: string;
+	dictPath: string;
+	reason: string;
+}
+
+let warnedStalePass: string | null = null;
+
+/**
+ * THE WRITE GATE. `true` means this pass no longer describes the live configuration and must not
+ * write. Called immediately before each durable write — never once for the whole block.
+ */
+function passIsStale(pass: PassSnapshot, what: string): boolean {
+	if (
+		dictionaryEpoch === pass.epoch &&
+		cfg.dictionaryNoteId === pass.noteId &&
+		(isMobile() || cfg.dictionaryPath === pass.dictPath)
+	) {
+		return false;
+	}
+	const key = `${pass.reason}:${pass.epoch}`;
+	if (warnedStalePass !== key) {
+		warnedStalePass = key;
+		// eslint-disable-next-line no-console
+		console.info(
+			`[harper] dictionary reconcile (${pass.reason}) abandoned before ${what}: ` +
+				'the dictionary was repointed mid-pass',
+		);
+	}
+	return true;
+}
+
 /** The persisted base, or null when none has been stored yet (fresh install / first run after upgrade). */
 async function readSyncBase(): Promise<string[] | null> {
 	try {
@@ -518,8 +620,14 @@ async function readSyncBase(): Promise<string[] | null> {
 	}
 }
 
-/** Persist the base. Writes nothing when the serialized value is unchanged (no settings churn). */
-async function writeSyncBase(words: string[]): Promise<void> {
+/**
+ * Persist the base. Writes nothing when the serialized value is unchanged (no settings churn).
+ *
+ * The staleness assert is INSIDE, immediately before the write: the unchanged-value read above is
+ * itself a suspension point, so checking in the caller would leave exactly the check-then-act window
+ * this gate exists to close.
+ */
+async function writeSyncBase(words: string[], pass: PassSnapshot): Promise<void> {
 	const next = JSON.stringify(words);
 	try {
 		const current = await joplin.settings.value(SYNC_BASE_KEY);
@@ -527,18 +635,23 @@ async function writeSyncBase(words: string[]): Promise<void> {
 	} catch {
 		/* fall through and write */
 	}
+	if (passIsStale(pass, 'the merge-base commit')) return;
 	await joplin.settings.setValue(SYNC_BASE_KEY, next);
 }
 
 /** Forget the base, so the NEXT reconcile is a first run (adopt the union, infer no deletions). */
 async function resetSyncBase(): Promise<void> {
-	try {
-		const current = await joplin.settings.value(SYNC_BASE_KEY);
-		if (current === '') return;
-	} catch {
-		/* fall through and write */
-	}
-	await joplin.settings.setValue(SYNC_BASE_KEY, '');
+	// Bracketed: this mutates state every in-flight pass computed against, and it spans two awaits a
+	// new pass can start inside. See withDictionaryEpochBump.
+	await withDictionaryEpochBump(async () => {
+		try {
+			const current = await joplin.settings.value(SYNC_BASE_KEY);
+			if (current === '') return;
+		} catch {
+			/* fall through and write */
+		}
+		await joplin.settings.setValue(SYNC_BASE_KEY, '');
+	});
 }
 
 // -----------------------------------------------------------------------------
@@ -651,6 +764,25 @@ async function buildLinter(): Promise<LocalLinter> {
 
 /** (Re)apply dictionary words, rule overrides and ignored lints to a linter instance. */
 /**
+ * Make the engine's ignore set exactly the persisted payload. CALLER MUST HOLD the dismissal
+ * transaction — this both destroys and rebuilds the state that transaction protects.
+ *
+ * Shared by engine (re)configuration and by the dialect switch, so there is exactly one description
+ * of "re-hydrate the ignore set" and no path that destroys it without immediately restoring it.
+ */
+async function rehydrateIgnoredLints(linter: LocalLinter): Promise<void> {
+	await linter.clearIgnoredLints();
+	const ignored = await loadIgnoredLintsJson();
+	if (ignored && ignored.trim()) {
+		try {
+			await linter.importIgnoredLints(ignored);
+		} catch {
+			/* corrupt persisted ignore-state — skip */
+		}
+	}
+}
+
+/**
  * `fresh` carries the same contract as `reconcileAndApply`'s: a caller that has just CHANGED state
  * the reconcile reads — the settings onChange handler, which rewrites `cfg` and resets the merge
  * base before it gets here — must not be answered by a pass that snapshotted the old state. See
@@ -688,17 +820,7 @@ async function applyConfiguration(
 	// restore is rebuilding, read from the very payload they are rewriting. Run against a restore in
 	// flight it would re-import the pre-restore payload into the engine, leaving the engine ignoring a
 	// hash the persisted mirror no longer lists — a divergence nothing heals until the next restart.
-	await withDismissalTransaction(dismissedStore, async () => {
-		await linter.clearIgnoredLints();
-		const ignored = await loadIgnoredLintsJson();
-		if (ignored && ignored.trim()) {
-			try {
-				await linter.importIgnoredLints(ignored);
-			} catch {
-				/* corrupt persisted ignore-state — skip */
-			}
-		}
-	});
+	await withDismissalTransaction(dismissedStore, () => rehydrateIgnoredLints(linter));
 }
 
 async function getLinter(): Promise<LocalLinter> {
@@ -884,16 +1006,18 @@ async function runReconcile(reason: string): Promise<string[]> {
 		// exactly what it was in v1.2.0: an additive-only local fallback, outside the merge.
 		const local = readLocalWords();
 
-		// THE CONFIGURATION THIS PASS IS RECONCILING AGAINST, captured ONCE, up front.
-		//
-		// `cfg` is a mutable module singleton that the settings onChange handler rewrites in place. Every
-		// read below and every write further down used to go back to it, so a pass that READ note N1
-		// could, several awaits later, `data.put` N1's merged body straight over note N2 after the user
-		// repointed the setting — destroying whatever the newly-pointed note held, and syncing that to
-		// every device. Reading the identity once makes the pass internally consistent; the guard before
-		// the writes then refuses to act at all if that identity has since moved.
-		const noteId = cfg.dictionaryNoteId;
-		const dictPath = isMobile() ? '' : cfg.dictionaryPath;
+		// THE SNAPSHOT THIS PASS IS RECONCILING AGAINST — identity AND epoch, captured together, with no
+		// await between them, before anything is read. See INV-A at bumpDictionaryEpoch: the epoch
+		// covers the merge base too, which is read further down and is not something identity alone can
+		// describe. Every durable write below asserts this snapshot immediately before mutating.
+		const pass: PassSnapshot = {
+			epoch: captureDictionaryEpoch(),
+			noteId: cfg.dictionaryNoteId,
+			dictPath: isMobile() ? '' : cfg.dictionaryPath,
+			reason,
+		};
+		const noteId = pass.noteId;
+		const dictPath = pass.dictPath;
 
 		const note = await readDictionaryNote(noteId); // null when there is no readable note side
 		const file = readExternalFile(dictPath); // null on mobile / no path / unreadable
@@ -929,7 +1053,7 @@ async function runReconcile(reason: string): Promise<string[]> {
 			// side IS configured and merely unreadable this pass (unsynced note, offline drive), the
 			// buffer must survive: clearing it would let that side put the word back when it returns.
 			const anyDurableSideConfigured = !!noteId || (!isMobile() && !!dictPath);
-			if (!anyDurableSideConfigured) {
+			if (!anyDurableSideConfigured && !passIsStale(pass, 'retiring the removals buffer')) {
 				// Only the removals THIS pass consumed are retired: a removal queued since the snapshot,
 				// or one this pass set aside as superseded by a pending add, has not been applied to
 				// anything yet and must survive.
@@ -954,29 +1078,18 @@ async function runReconcile(reason: string): Promise<string[]> {
 		const fileSidePresent = isMobile() || !dictPath || file !== null;
 		const allSidesPresent = noteSidePresent && fileSidePresent;
 
-		// --- ABANDON IF THE CONFIGURATION MOVED UNDER US ----------------------------------------
+		// --- DURABLE WRITES: each one asserts the pass snapshot IMMEDIATELY before mutating -----
 		//
-		// Everything above describes the note and the file this pass STARTED against. If the user has
-		// repointed either setting since, all of it is about a configuration that no longer exists, and
-		// each of the three writes below would do real damage with it:
+		// Not once for the whole block. Everything above describes the note, the file and the base this
+		// pass started against, and each write below would do real damage with a configuration that has
+		// since moved: the note put writes the OLD note's body over the NEWLY-POINTED note; the file
+		// rewrite reshapes a file that is no longer configured; the base commit overwrites the `''` that
+		// `resetSyncBase()` wrote, which is the entire reason a repoint is safe. Between these writes
+		// lie four suspension points (the put, its updated_time get, the file rewrite, and the base
+		// read), so a single check up front is a check-then-act with a window in every one of them.
 		//
-		//   * the note put would write the OLD note's merged body over the NEWLY-POINTED note,
-		//     destroying whatever that note held and syncing the loss everywhere;
-		//   * the file rewrite would reshape a file that is no longer the configured one;
-		//   * the base commit would overwrite the `''` that `resetSyncBase()` just wrote — and that
-		//     reset is the entire reason a repoint is safe, since it makes the next pass a FIRST RUN
-		//     that adopts the new side's union instead of inferring deletions from it. Committing a
-		//     base the new side has never seen turns every word it lacks into a deletion.
-		//
-		// So the pass stops here, having written nothing. It is idempotent and the repoint schedules its
-		// own reconcile, so the next pass simply redoes this correctly against the new configuration.
-		if (cfg.dictionaryNoteId !== noteId || (!isMobile() && cfg.dictionaryPath !== dictPath)) {
-			// eslint-disable-next-line no-console
-			console.info(
-				`[harper] dictionary reconcile (${reason}) abandoned: the dictionary was repointed mid-pass`,
-			);
-			return lastEngineWords;
-		}
+		// An abandoned pass has written nothing. It is idempotent and the repoint schedules its own
+		// reconcile, so the next pass redoes this correctly against the new configuration.
 
 		// --- NOTE side (L3-guarded; the plugin's only data.put) ---------------------------------
 		let noteWritten = true;
@@ -984,6 +1097,7 @@ async function runReconcile(reason: string): Promise<string[]> {
 			if (editorOpen) {
 				noteWritten = false; // deferred: an editor is open, so a note write is forbidden
 			} else {
+				if (passIsStale(pass, 'the dictionary-note write')) return lastEngineWords;
 				await joplin.data.put(['notes', noteId], null, {
 					body: canonicalDictionaryBody(merged.result),
 				});
@@ -1000,7 +1114,10 @@ async function runReconcile(reason: string): Promise<string[]> {
 
 		// --- FILE side (desktop; order-preserving atomic rewrite) -------------------------------
 		let fileWritten = true;
-		if (merged.fileChanged && file) fileWritten = rewriteExternalFile(file, merged.result);
+		if (merged.fileChanged && file) {
+			if (passIsStale(pass, 'the external-file rewrite')) return lastEngineWords;
+			fileWritten = rewriteExternalFile(file, merged.result);
+		}
 
 		// --- COMMIT: advance the base ONLY on a pass that saw the whole picture -----------------
 		//
@@ -1023,11 +1140,14 @@ async function runReconcile(reason: string): Promise<string[]> {
 		// the same result, so nothing is rewritten twice.
 		const committed = noteWritten && fileWritten && allSidesPresent;
 		if (committed) {
-			await writeSyncBase(merged.result);
+			// writeSyncBase asserts the snapshot inside itself, right before its setValue — its own
+			// unchanged-value read is a suspension point, so a check out here would not be "at the write".
+			await writeSyncBase(merged.result, pass);
 			// Retire only what THIS pass merged and wrote — see retirePendingEntries. Anything enqueued
 			// while the pass was in flight (the note read, the note write, the file rewrite are all
 			// awaits the user's "Add to dictionary" can land inside) is kept for the next pass, which
 			// is idempotent and will merge it exactly as if it had arrived a tick later.
+			if (passIsStale(pass, 'retiring the pending buffers')) return lastEngineWords;
 			await retirePendingEntries('pendingWords', pending, readPendingWords);
 			// Removals retire on exactly the same condition as pending additions: every side that
 			// needed writing was written, and every configured side was present. Until then the buffer
@@ -1429,9 +1549,20 @@ async function ignoreFindingInTransaction(
 	}
 	if (ignoredAny) {
 		try {
-			// VERBATIM: harper's payload holds u64s that a JSON round trip would corrupt.
-			const json = await linter.exportIgnoredLints();
-			await saveIgnoredLintsJson(json);
+			// ADDITIVE, NEVER A MIRROR. Dismissing only ever ADDS an ignore, so persisting must be a
+			// union of what is already stored with what this dismissal produced — not a wholesale copy
+			// of the engine. Mirroring the engine made this the one destructive writer of the payload:
+			// any moment the engine's ignore set was empty or partial (a dialect switch frees and
+			// rebuilds the WASM instance; a failed re-configure leaves it bare) turned the next Dismiss
+			// into a wipe of every earlier dismissal. Removal has exactly one owner — the dismissed
+			// manager's restore/clear, which rebuilds from the persisted payload — and this is not it.
+			//
+			// Both sides are lifted with `extractHashes` and rebuilt with `buildIgnoredLintsPayload`,
+			// the regex/string pair that exists because these are u64s a JSON round trip would corrupt.
+			const exported = await linter.exportIgnoredLints();
+			const stored = await loadIgnoredLintsJson();
+			const union = [...new Set([...extractHashes(stored), ...extractHashes(exported)])];
+			await saveIgnoredLintsJson(buildIgnoredLintsPayload(union));
 		} catch {
 			// eslint-disable-next-line no-console
 			console.warn('[harper] could not persist ignored lints');
@@ -2067,36 +2198,57 @@ joplin.plugins.register({
 			const before = cfg.dialect;
 			const noteIdBefore = cfg.dictionaryNoteId;
 			const pathBefore = cfg.dictionaryPath;
-			await loadSettings();
-			if (!isMobile() && (cfg.dictionaryPath === '' || external.includes('dictionaryPath'))) {
-				// A changed path invalidates the cached mtime / missing-file warning.
-				lastExternalMtimeMs = null;
-				warnedMissingDict = false;
-			}
-			if (external.includes('dictionaryNoteId') && cfg.dictionaryNoteId !== noteIdBefore) {
-				// New/changed dictionary note: force a fresh read next time.
-				lastNoteUpdatedTime = null;
-			}
-			// REPOINTING A SIDE RESETS THE MERGE BASE. A base describes the two sides it was computed
-			// from; against a different note or a different file its "missing" words are not deletions
-			// at all. Dropping it makes the next reconcile a first run: adopt the union, delete nothing.
-			if (
-				(external.includes('dictionaryNoteId') && cfg.dictionaryNoteId !== noteIdBefore) ||
-				(!isMobile() && external.includes('dictionaryPath') && cfg.dictionaryPath !== pathBefore)
-			) {
-				await resetSyncBase();
-			}
+			// INV-A: the identity flip and the base reset are ONE transition, bracketed together.
+			//
+			// Bracketing them separately is not enough. Between the two, `cfg` already names the new
+			// note while `syncBase` still describes the old one, and a reconcile that starts there reads
+			// that inconsistent pair without anything changing for its duration — so no epoch
+			// comparison can catch it. Held as a single transition, any pass beginning anywhere inside
+			// is born stale and writes nothing.
+			await withDictionaryEpochBump(async () => {
+				await loadSettings();
+				if (!isMobile() && (cfg.dictionaryPath === '' || external.includes('dictionaryPath'))) {
+					// A changed path invalidates the cached mtime / missing-file warning.
+					lastExternalMtimeMs = null;
+					warnedMissingDict = false;
+				}
+				if (external.includes('dictionaryNoteId') && cfg.dictionaryNoteId !== noteIdBefore) {
+					// New/changed dictionary note: force a fresh read next time.
+					lastNoteUpdatedTime = null;
+				}
+				// REPOINTING A SIDE RESETS THE MERGE BASE. A base describes the two sides it was computed
+				// from; against a different note or a different file its "missing" words are not
+				// deletions at all. Dropping it makes the next reconcile a first run: adopt the union,
+				// delete nothing.
+				if (
+					(external.includes('dictionaryNoteId') && cfg.dictionaryNoteId !== noteIdBefore) ||
+					(!isMobile() && external.includes('dictionaryPath') && cfg.dictionaryPath !== pathBefore)
+				) {
+					await resetSyncBase();
+				}
+			});
 			if (linterPromise) {
 				const linter = await linterPromise;
 				if (external.includes('dialect') && cfg.dialect !== before) {
-					await linter.setDialect(dialectEnum());
-					// setDialect FREES the WASM instance and builds a new one, so every word imported into
-					// the engine went with it. The memo that skips an unchanged re-import has to be
-					// invalidated here or `applyConfiguration` below would compare the reconciled list
-					// against the key from BEFORE the rebuild, find it unchanged, skip the import — and
-					// leave the engine with an EMPTY custom dictionary for the rest of the session, so
-					// every one of the user's own words underlines as a spelling error in every note.
-					importedWordsKey = null;
+					// INV-B: setDialect FREES the WASM instance and builds a new one, so it destroys the
+					// engine's IGNORE SET as well as its words — and `applyConfiguration` only re-hydrates
+					// the ignore set at the very end of its body, after a full reconcile. For that whole
+					// stretch the engine ignores nothing while the persisted payload is full, and a Dismiss
+					// arriving from the content-script channel mirrors that empty engine back over the
+					// payload, wiping every earlier dismissal.
+					//
+					// So the destroy and the re-hydration are ONE step, inside the dismissal transaction,
+					// which is what makes a concurrent Dismiss queue behind them instead of observing the
+					// gap. The linter is already resolved here, so the documented lock-ordering rule
+					// (resolve the linter before entering) holds.
+					await withDismissalTransaction(dismissedStore, async () => {
+						await linter.setDialect(dialectEnum());
+						// The memo that skips an unchanged word re-import must be invalidated too, or
+						// `applyConfiguration` would find the reconciled list unchanged, skip the import, and
+						// leave the engine with an EMPTY custom dictionary for the rest of the session.
+						importedWordsKey = null;
+						await rehydrateIgnoredLints(linter);
+					});
 				}
 				// FRESH: this handler has just rewritten `cfg` and, on a repoint, reset the merge base.
 				// A pass already in flight snapshotted the state before all of that, so joining it would
