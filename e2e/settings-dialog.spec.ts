@@ -116,14 +116,19 @@ async function searchRules(frame: Frame, needle: string): Promise<void> {
   await frame.waitForTimeout(500);
 }
 
-/** The `ruleOverrides` setting as the plugin persisted it (a JSON string inside settings.json). */
-function readRuleOverrides(profileDir: string): string {
+/** One of this plugin's settings, as the app persisted it into the profile's settings.json. */
+function readHarperSetting(profileDir: string, key: string): unknown {
   try {
     const settings = JSON.parse(fs.readFileSync(path.join(profileDir, 'settings.json'), 'utf8'));
-    return settings[pluginSettingKey('ruleOverrides')] ?? '';
+    return settings[pluginSettingKey(key)];
   } catch {
-    return '';
+    return undefined;
   }
+}
+
+/** The `ruleOverrides` setting as the plugin persisted it (a JSON string inside settings.json). */
+function readRuleOverrides(profileDir: string): string {
+  return (readHarperSetting(profileDir, 'ruleOverrides') as string) ?? '';
 }
 
 // -----------------------------------------------------------------------------
@@ -388,5 +393,166 @@ test.describe.serial('Harper settings dialog', () => {
 
     await expect.poll(() => lintRangeCountForWord(win, word), { timeout: 30_000 }).toBe(0);
     expect(await lintRangeCountForWord(win, SURVIVOR)).toBeGreaterThan(0);
+  });
+
+  /**
+   * The General tab was rendered by one test and CHANGED by none, so each of its seven controls
+   * could have been wired to the wrong setting key and both suites would still have passed green:
+   * the service rejects an unknown key, the dialog quietly reverts the control and shows "Could not
+   * save …", and nothing anywhere looked. Every control is driven here and confirmed OUTSIDE the
+   * dialog, in the profile's settings.json — the promise this spec's header makes.
+   *
+   * Last in the group, and every write is reverted, so nothing it touches can leak into a rerun.
+   */
+  test('every General-tab control writes its own setting, confirmed in settings.json', async () => {
+    const { win, profileDir } = joplin;
+    const frame = await openSettings(win);
+    // General is the landing tab, so no navigation is needed to reach it.
+    await expect(frame.locator('.hs-tab[data-tab="general"].hs-tab-active')).toHaveCount(1);
+
+    const saved = async (key: string, value: unknown, what: string) => {
+      await expect(frame.locator('#hs-general-status')).not.toContainText('Could not save', {
+        timeout: 20_000,
+      });
+      await expect
+        .poll(() => readHarperSetting(profileDir, key), { timeout: 20_000 })
+        .toEqual(value);
+      // eslint-disable-next-line no-console
+      console.log(`[harper-e2e] ${what}: ${key} = ${JSON.stringify(value)}`);
+    };
+
+    // 1. Underline style.
+    await frame.locator('#hs-underline').selectOption('solid');
+    await saved('underlineStyle', 'solid', 'underline select');
+    await frame.locator('#hs-underline').selectOption('squiggly');
+    await saved('underlineStyle', 'squiggly', 'underline revert');
+
+    // 2. Dialect. (dialect.spec.ts pre-seeds this into settings.json; nothing drove the control.)
+    await frame.locator('#hs-dialect').selectOption('British');
+    await saved('dialect', 'British', 'dialect select');
+    await frame.locator('#hs-dialect').selectOption('American');
+    await saved('dialect', 'American', 'dialect revert');
+
+    // 3. Debounce, including the client-side clamp: a number input enforces min/max only on FORM
+    //    validation and there is no form here, so an out-of-range value arrives untouched. The field
+    //    must show what was actually stored rather than the number the user typed.
+    await frame.locator('#hs-debounce').fill('250');
+    await frame.locator('#hs-debounce').blur();
+    await saved('debounceMs', 250, 'debounce');
+    await frame.locator('#hs-debounce').fill('99999');
+    await frame.locator('#hs-debounce').blur();
+    await expect(frame.locator('#hs-debounce')).toHaveValue('10000');
+    await saved('debounceMs', 10000, 'debounce clamp');
+    await frame.locator('#hs-debounce').fill('500');
+    await frame.locator('#hs-debounce').blur();
+    await saved('debounceMs', 500, 'debounce revert');
+
+    // 4. Ignore non-English.
+    await frame.locator('#hs-ignore-non-english').check();
+    await saved('ignoreNonEnglish', true, 'ignore-non-english check');
+    await frame.locator('#hs-ignore-non-english').uncheck();
+    await saved('ignoreNonEnglish', false, 'ignore-non-english uncheck');
+
+    // 5. Dictionary note id (an id that resolves to no note is harmless — there is simply no note
+    //    side — and it is cleared again immediately).
+    await frame.locator('#hs-dictionary-note-id').fill('0123456789abcdef0123456789abcdef');
+    await frame.locator('#hs-dictionary-note-id').blur();
+    await saved('dictionaryNoteId', '0123456789abcdef0123456789abcdef', 'dictionary note id');
+    await frame.locator('#hs-dictionary-note-id').fill('');
+    await frame.locator('#hs-dictionary-note-id').blur();
+    await saved('dictionaryNoteId', '', 'dictionary note id cleared');
+
+    // 6. External dictionary file — desktop only, so the row exists here.
+    const dictPath = path.join(joplin.profileDir, 'e2e-dictionary.txt');
+    await frame.locator('#hs-dictionary-path').fill(dictPath);
+    await frame.locator('#hs-dictionary-path').blur();
+    await saved('dictionaryPath', dictPath, 'dictionary path');
+    await frame.locator('#hs-dictionary-path').fill('');
+    await frame.locator('#hs-dictionary-path').blur();
+    await saved('dictionaryPath', '', 'dictionary path cleared');
+
+    // 7. Enable Harper — reverted immediately, then confirmed in the editor rather than only in the
+    //    file, since this is the one control whose whole job is outside the dialog.
+    await frame.locator('#hs-enabled').uncheck();
+    await saved('enabled', false, 'enabled off');
+    await frame.locator('#hs-enabled').check();
+    await saved('enabled', true, 'enabled on');
+
+    await closeSettings(win);
+    await expect.poll(() => lintRangeCountForWord(win, SURVIVOR), { timeout: 30_000 }).toBeGreaterThan(0);
+  });
+
+  /**
+   * Joplin's webview bootstrap turns Enter in an `INPUT[type=text]` into a form submit, and the
+   * dialog's onSubmit clicks the first button whose id is one of ok/yes/submit/confirm — which is
+   * this dialog's only button. So pressing Enter to commit a note id dismissed the whole settings
+   * screen, every time. Only reproducible inside real Joplin, since the listener is the app's.
+   */
+  test('Enter in a text field commits the value instead of closing the settings screen', async () => {
+    const { win, profileDir } = joplin;
+    const frame = await openSettings(win);
+
+    const noteId = frame.locator('#hs-dictionary-note-id');
+    await noteId.fill('fedcba9876543210fedcba9876543210');
+    await noteId.press('Enter');
+    await win.waitForTimeout(1500);
+
+    expect(await findSettingsFrame(win)).not.toBeNull(); // the dialog is still there
+    // ...and Enter still did what the user pressed it for: the `change` event fired and saved.
+    await expect
+      .poll(() => readHarperSetting(profileDir, 'dictionaryNoteId'), { timeout: 20_000 })
+      .toBe('fedcba9876543210fedcba9876543210');
+
+    // The desktop-only path field is the other `type=text` input, and behaves the same.
+    await frame.locator('#hs-dictionary-path').press('Enter');
+    await win.waitForTimeout(1000);
+    expect(await findSettingsFrame(win)).not.toBeNull();
+
+    // Leave the profile as we found it.
+    await noteId.fill('');
+    await noteId.press('Enter');
+    await expect.poll(() => readHarperSetting(profileDir, 'dictionaryNoteId'), { timeout: 20_000 }).toBe('');
+
+    await closeSettings(win);
+  });
+
+  /**
+   * The dismissed manager's only destructive action. Its confirmation used to be armed in module
+   * state while the button showing it was rebuilt by every render — so leaving the tab, the natural
+   * way to back out, left a button reading "Clear all" one click from wiping every dismissal.
+   */
+  test('"Clear all" re-arms after a tab switch instead of firing unconfirmed', async () => {
+    const { win } = joplin;
+
+    // Something to lose.
+    const card = await openHarperCardByClick(win, PHRASE);
+    await clickDismiss(win, card);
+    await expect.poll(() => lintRangeCountForWord(win, PHRASE), { timeout: 30_000 }).toBe(0);
+
+    const frame = await openSettings(win);
+    await openTab(frame, 'dismissed');
+    const rows = frame.locator('#hs-dismissed-list .hs-dismissed').filter({ hasText: PHRASE });
+    await expect(rows).toHaveCount(1, { timeout: 30_000 });
+
+    // Arm it, then change your mind and navigate away.
+    await frame.locator('#hs-clear-all').click();
+    await expect(frame.locator('#hs-clear-all')).toHaveText('Really clear all?');
+    await openTab(frame, 'general');
+    await openTab(frame, 'dismissed');
+
+    // The rebuilt button looks unarmed, so it must BE unarmed.
+    await expect(frame.locator('#hs-clear-all')).toHaveText('Clear all');
+    await frame.locator('#hs-clear-all').click();
+    await expect(frame.locator('#hs-clear-all')).toHaveText('Really clear all?');
+    await expect(frame.locator('#hs-dismissed-status')).not.toContainText('Cleared');
+    await expect(rows).toHaveCount(1); // nothing was cleared by that click
+
+    // Confirming still works, and really does clear.
+    await frame.locator('#hs-clear-all').click();
+    await expect(frame.locator('#hs-dismissed-status')).toContainText('Cleared', { timeout: 30_000 });
+    await expect(frame.locator('#hs-dismissed-list .hs-dismissed')).toHaveCount(0);
+
+    await closeSettings(win);
+    await expect.poll(() => lintRangeCountForWord(win, PHRASE), { timeout: 30_000 }).toBeGreaterThan(0);
   });
 });
