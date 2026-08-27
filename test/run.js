@@ -704,9 +704,10 @@ async function main() {
 			`var document = arguments[0];
 			 var sent = arguments[1];
 			 var state = { dismissed: { entries: [], legacyCount: 0 } };
-			 function send(message) { sent.push(message); return Promise.resolve({ ok: true, cleared: 1 }); }`,
+			 function send(message) { sent.push(message); return Promise.resolve({ ok: true, dismissals: 1, legacy: 0 }); }`,
 			['state'],
 			[document, sent],
+			['describeCleared'],
 		);
 		lifted.state.dismissed = {
 			entries: [
@@ -751,8 +752,8 @@ async function main() {
 		await settle();
 		assert.strictEqual(
 			document.getElementById('hs-dismissed-status').textContent,
-			'Cleared 1 dismissals.',
-			'and reports the count the service returned',
+			'Cleared 1 dismissal.',
+			'and reports the count the service returned, in dismissal units',
 		);
 	});
 
@@ -826,13 +827,21 @@ async function main() {
 		const sent = [];
 		const resolvers = [];
 		const lifted = extractDialogFunctions(
-			['setRuleState', 'errorText', 'queueRuleWrite', 'pushOverrides', 'describeOverrides', 'setRulesStatus'],
+			[
+				'setRuleState',
+				'errorText',
+				'queueRuleWrite',
+				'pushOverrides',
+				'describeOverrides',
+				'setRulesStatus',
+			],
 			`var sent = arguments[0];
 			 var resolvers = arguments[1];
 			 var state = { overrides: {} };
 			 var applyChain = Promise.resolve();
 			 var applyPending = 0;
 			 var queuedEdits = [];
+			 var editSeq = 0;
 			 var renders = 0;
 			 var document = { getElementById: function () { return null; } };
 			 function send(message) {
@@ -842,7 +851,7 @@ async function main() {
 			 function renderRules() { renders++; }`,
 			['state'],
 			[sent, resolvers],
-			['copyOverrides', 'withQueuedEdits'],
+			['copyOverrides', 'withQueuedEdits', 'retireEditsThrough'],
 		);
 		return { ...lifted, sent, resolvers };
 	}
@@ -919,6 +928,162 @@ async function main() {
 		assert.deepStrictEqual(rules.state.overrides, { Aye: false, Bee: false, Cee: true });
 	});
 
+	await test('rule writes: a bulk action queued behind a slow write keeps the toggles made after it', async () => {
+		const rules = liftRuleWrites();
+
+		// 1) An ordinary toggle goes out first and is slow. This is the only difference from the test
+		//    above, and it is what puts the bulk action in the QUEUE rather than on the wire.
+		rules.setRuleState('Aye', 'off');
+		rules.pushOverrides();
+		await settle();
+		assert.strictEqual(rules.sent.length, 1, 'the toggle is in flight');
+
+		// 2) The user clicks "Disable All Rules". It cannot dispatch yet — the chain is busy.
+		rules.queueRuleWrite(() => ({ type: 'settings:disableAllRules' }), 'Disabling…', true);
+		await settle();
+		assert.strictEqual(rules.sent.length, 1, 'the bulk write is queued, not sent');
+
+		// 3) While it waits its turn — a full round trip, behind a status line that just reads
+		//    "Disabling…" — the user turns one rule back On.
+		rules.setRuleState('Cee', 'on');
+		rules.pushOverrides();
+
+		// 4) The first toggle lands, then the bulk write finally goes out and replies.
+		rules.resolvers[0].resolve({ ok: true, overrides: { Aye: false } });
+		await settle();
+		rules.resolvers[1].resolve({ ok: true, overrides: { Aye: false, Bee: false, Cee: false } });
+		await settle();
+
+		// Retiring by SEND-time position discarded Cee here: the bulk write had waited a whole round
+		// trip, so the edit made during that wait looked like one it had carried. The user's explicit
+		// re-enable vanished from the model and from every later payload, and the row flipped back.
+		assert.strictEqual(
+			rules.state.overrides.Cee,
+			true,
+			'a toggle made after the bulk was CLICKED survives it',
+		);
+		assert.strictEqual(rules.state.overrides.Bee, false, 'and the bulk action itself still applied');
+		assert.deepStrictEqual(
+			rules.sent[2],
+			{ type: 'settings:applyRuleOverrides', overrides: { Aye: false, Bee: false, Cee: true } },
+			'the toggle\'s own write carries the bulk roster with the toggle on top',
+		);
+	});
+
+	await test('rule writes: a bulk action still supersedes the edits made BEFORE it was clicked', async () => {
+		const rules = liftRuleWrites();
+
+		// The other direction of the same linearization: everything queued before the click is the
+		// user asking for a clean slate, and the bulk action is entitled to overwrite it.
+		rules.setRuleState('Aye', 'off');
+		rules.pushOverrides();
+		await settle();
+		rules.queueRuleWrite(() => ({ type: 'settings:resetRules' }), 'Resetting…', true);
+		rules.resolvers[0].resolve({ ok: true, overrides: { Aye: false } });
+		await settle();
+		rules.resolvers[1].resolve({ ok: true, overrides: {} });
+		await settle();
+
+		assert.deepStrictEqual(rules.state.overrides, {}, 'the reset wins over the toggle that preceded it');
+	});
+
+	await test('a dictionary save keeps words typed while it was in flight', async () => {
+		const document = makeFakeDom();
+		const sent = [];
+		let resolveSave = null;
+		const lifted = extractDialogFunctions(
+			['el', 'clear', 'renderDictionary'],
+			`var document = arguments[0];
+			 var sent = arguments[1];
+			 var hold = arguments[2];
+			 var state = { dictionaryWords: [] };
+			 function send(message) { sent.push(message); return hold(); }`,
+			['state'],
+			[document, sent, () => new Promise((resolve) => { resolveSave = resolve; })],
+			['setDictionaryStatus', 'paintDictionary'],
+		);
+		lifted.state.dictionaryWords = ['alpha'];
+
+		const root = document.createElement('div');
+		document.root = root;
+		lifted.renderDictionary(root);
+		document.getElementById('hs-dictionary').value = 'alpha\nbeta';
+		document.getElementById('hs-save-dictionary').fire('click');
+
+		// The round trip is seconds long. The Save button is disabled but the TEXTAREA never is, and a
+		// tab switch even brings back an enabled button over a box that looks completely idle.
+		lifted.clear(root);
+		lifted.renderDictionary(root);
+		const area = document.getElementById('hs-dictionary');
+		area.value = 'alpha\ngamma\ndelta'; // the user keeps typing
+
+		resolveSave({ ok: true, adds: ['beta'], removes: [], words: ['alpha', 'beta'] });
+		await settle();
+
+		// Repainting unconditionally threw the typing away under a cheerful "Saved.", with nothing to
+		// say anything had been dropped.
+		assert.strictEqual(area.value, 'alpha\ngamma\ndelta', 'the words typed during the save are still there');
+		assert.strictEqual(
+			document.getElementById('hs-dictionary-status').textContent,
+			'Saved. 1 added, 0 removed. Your unsaved edits were kept.',
+			'and the status says so, instead of implying everything is stored',
+		);
+		// The stored truth still advanced, so the next save diffs against the right baseline.
+		assert.deepStrictEqual(lifted.state.dictionaryWords, ['alpha', 'beta']);
+		assert.strictEqual(document.getElementById('hs-dictionary-count').textContent, '2 words');
+	});
+
+	await test('a dictionary save DOES repaint a box the user has not touched', async () => {
+		const document = makeFakeDom();
+		const sent = [];
+		let resolveSave = null;
+		const lifted = extractDialogFunctions(
+			['el', 'clear', 'renderDictionary'],
+			`var document = arguments[0];
+			 var sent = arguments[1];
+			 var hold = arguments[2];
+			 var state = { dictionaryWords: [] };
+			 function send(message) { sent.push(message); return hold(); }`,
+			['state'],
+			[document, sent, () => new Promise((resolve) => { resolveSave = resolve; })],
+			['setDictionaryStatus', 'paintDictionary'],
+		);
+		lifted.state.dictionaryWords = ['alpha'];
+		const root = document.createElement('div');
+		document.root = root;
+		lifted.renderDictionary(root);
+		document.getElementById('hs-dictionary').value = 'alpha\nbeta';
+		document.getElementById('hs-save-dictionary').fire('click');
+
+		// Re-entered tab, seeded from the still-stale list, and NOT typed into. The guard has to
+		// recognise both this value and the send-time one as "still ours", or it would reintroduce the
+		// staleness the by-id repaint was added to fix.
+		lifted.clear(root);
+		lifted.renderDictionary(root);
+		resolveSave({ ok: true, adds: ['beta'], removes: [], words: ['alpha', 'beta'] });
+		await settle();
+		assert.strictEqual(document.getElementById('hs-dictionary').value, 'alpha\nbeta', 'repainted');
+		assert.strictEqual(
+			document.getElementById('hs-dictionary-status').textContent,
+			'Saved. 1 added, 0 removed.',
+			'with no "edits were kept" note, because there were none',
+		);
+	});
+
+	await test('clear-status copy keeps dismissals and legacy findings in their own units', () => {
+		const { describeCleared } = extractDialogFunctions(['describeCleared'], '');
+		// One Dismiss makes several ignore hashes, so summing rows and legacy hashes and calling the
+		// total "dismissals" tells a pre-v1.4.0 user who dismissed 3 things that 7 were cleared.
+		assert.strictEqual(
+			describeCleared({ dismissals: 2, legacy: 5 }),
+			'Cleared 2 dismissals and 5 legacy findings.',
+		);
+		assert.strictEqual(describeCleared({ dismissals: 0, legacy: 7 }), 'Cleared 7 legacy findings.');
+		assert.strictEqual(describeCleared({ dismissals: 3, legacy: 0 }), 'Cleared 3 dismissals.');
+		assert.strictEqual(describeCleared({ dismissals: 1, legacy: 1 }), 'Cleared 1 dismissal and 1 legacy finding.');
+		assert.strictEqual(describeCleared({ dismissals: 0, legacy: 0 }), 'Nothing to clear.');
+	});
+
 	await test('a group disclosure stays live during a search, and a search never rewrites the stored state', () => {
 		const document = makeFakeDom();
 		const lifted = extractDialogFunctions(
@@ -942,10 +1107,12 @@ async function main() {
 				defaults: { ModalOf: true, Spaces: true },
 				descriptionText: Object.create(null),
 				descriptions: null,
+				search: '',
 				expandedGroups: Object.create(null),
 				searchExpanded: Object.create(null),
 				expandedRules: Object.create(null),
 			 };
+			 var searchTimer = null;
 			 function renderRules() {}
 			 function setRuleState() {}
 			 function pushOverrides() {}
@@ -953,12 +1120,15 @@ async function main() {
 			 function refreshRulesSummary() {}`,
 			['state'],
 			[document],
-			['groupExpanded', 'toggleGroupExpanded'],
+			['groupExpanded', 'toggleGroupExpanded', 'currentNeedle'],
 		);
 		const group = { id: 'Misc', label: 'Miscellaneous', description: '', rules: ['ModalOf', 'Spaces'] };
 		const root = document.createElement('div');
 		document.root = root;
+		// Renders the way renderRules() does — off `state.search`, the one source of truth — so the
+		// closures a click later runs against carry whatever needle was live at RENDER time.
 		const paint = (needle) => {
+			lifted.state.search = needle;
 			lifted.clear(root);
 			root.appendChild(lifted.renderGroup(group, needle));
 			return {
@@ -993,6 +1163,32 @@ async function main() {
 		document.byClass('hs-disclosure')[0].fire('click');
 		assert.strictEqual(lifted.state.expandedGroups.Misc, false, 'no search => the stored value flips');
 		assert.strictEqual(paint('').listed, false);
+
+		// THE DEBOUNCE WINDOW. The search box updates `state.search` synchronously but defers the
+		// re-render by 140 ms, so for that whole window the rows on screen were painted with the
+		// PREVIOUS needle. A click routed by that stale needle went into the wrong map: it flipped the
+		// STORED expansion, the immediate repaint force-opened the group anyway so nothing moved, and
+		// the collapse only surfaced once the search was cleared — the invisible side effect that
+		// searchExpanded exists to remove, back again through a different door.
+		lifted.state.expandedGroups.Misc = true;
+		lifted.state.searchExpanded = Object.create(null);
+		const stale = paint(''); // painted with no search: the closures hold ''
+		assert.strictEqual(stale.listed, true, 'precondition: open, unfiltered');
+		lifted.state.search = 'modal'; // the user types; renderRules() is 140 ms away
+		stale.arrow.fire('click');
+
+		assert.strictEqual(
+			lifted.state.expandedGroups.Misc,
+			true,
+			'a click during the debounce window must not touch the STORED expansion',
+		);
+		lifted.clear(root);
+		root.appendChild(lifted.renderGroup(group, 'modal'));
+		assert.strictEqual(
+			document.byClass('hs-rule-list').length > 0,
+			false,
+			'and it collapses the group visibly, instead of doing nothing on screen',
+		);
 	});
 
 	// ---- config handshake ---------------------------------------------------
@@ -3326,7 +3522,8 @@ async function main() {
 			assert.strictEqual(snap.dismissed.legacyCount, orphaned.hashes.length, 'the rest count as legacy');
 
 			const res = await mixh({ type: 'settings:clearDismissed', scope: 'legacy' });
-			assert.strictEqual(res.cleared, orphaned.hashes.length, 'exactly the unaccounted hashes are dropped');
+			assert.strictEqual(res.legacy, orphaned.hashes.length, 'exactly the unaccounted hashes are dropped');
+			assert.strictEqual(res.dismissals, 0, 'and no named dismissal is counted');
 
 			// The direction is the whole point: inverting the keep-filter would un-suppress every
 			// dismissal the user can see and name, while leaving the un-nameable ones in force forever.
@@ -3367,13 +3564,348 @@ async function main() {
 			);
 
 			const res = await mixh({ type: 'settings:clearDismissed', scope: 'all' });
-			assert.strictEqual(
-				res.cleared,
-				rows.length + legacy,
-				'the dialog prints this under a list of rows, so it has to count rows',
-			);
+			// TWO units, reported separately — no invented total. A row is one Dismiss; a legacy hash is
+			// one ignored finding, and several of them can come from a single Dismiss.
+			assert.strictEqual(res.dismissals, rows.length, 'rows are counted as dismissals');
+			assert.strictEqual(res.legacy, legacy, 'unattributed hashes are counted as legacy findings');
 			assert.deepStrictEqual(dismissedLog.extractHashes(mixRaw()), [], 'and everything really was cleared');
 			assert.deepStrictEqual(mixEntries(), [], 'side table included');
+		});
+	}
+
+	// ---- integration: repointing the dictionary mid-pass must not corrupt the new note ----
+	// `cfg` is a mutable module singleton the settings onChange handler rewrites in place. A pass used
+	// to read the note id at READ time and again at WRITE time, so a repoint landing in between put the
+	// OLD note's merged body straight over the NEWLY-POINTED note — and then committed a merge base
+	// over the `''` that resetSyncBase had just written, which is the one thing making a repoint safe.
+	{
+		const rpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-repoint-'));
+		const rpState = await run({
+			dataDir: rpDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryNoteId: 'note1' },
+			notes: {
+				note1: { id: 'note1', body: '# h\n\nAlpharp\nBetarp\n', updated_time: 100 },
+				// The user's OTHER note, which they are about to point the setting at. Its body is
+				// ordinary prose — this is the content the old pass used to destroy.
+				note2: {
+					id: 'note2',
+					body: '# My other dictionary note\n\nMyveryownwordrp\nSecondownwordrp\n',
+					updated_time: 200,
+				},
+			},
+		});
+		const rph = rpState.contentScriptMessageHandlers['harperCm'];
+
+		await test('repointing the dictionary note mid-pass writes nothing to the newly-pointed note', async () => {
+			assert.ok(
+				await waitFor(() => (rpState.settings.syncBase || '').includes('Alpharp')),
+				'precondition: converged against note1',
+			);
+			await rph({ type: 'lint', text: 'warm the engine' });
+			const note2Before = rpState.notes.note2.body;
+
+			// A word buffered but not yet folded in, so the pass in flight has a note write to perform.
+			await rpState.setSetting('pendingWords', ['Buffrp']);
+
+			// Park a pass at its dictionary-note read — a real suspension point, and the one the whole
+			// window hangs off. It has already resolved note1 as its side; everything after this is the
+			// user repointing the setting underneath it.
+			let release = null;
+			let onParked = null;
+			const parked = new Promise((resolve) => {
+				onParked = resolve;
+			});
+			const gate = new Promise((resolve) => {
+				release = resolve;
+			});
+			rpState.beforeNoteGet = async (noteId) => {
+				if (noteId !== 'note1') return;
+				rpState.beforeNoteGet = null;
+				onParked();
+				await gate;
+			};
+			const pass = rpState.noteSelectionChangeHandler();
+			await parked;
+
+			// The user pastes the new note id on the General tab. This fires the plugin's own onChange:
+			// cfg flips to note2 and resetSyncBase() writes '' so the next pass adopts note2's words
+			// instead of reading them as deletions.
+			const repoint = rpState.setSetting('dictionaryNoteId', 'note2');
+			await settle();
+			release();
+			await Promise.all([pass, repoint]);
+			await waitFor(() => false, 60); // let any follow-up pass settle
+
+			// The parked pass was reconciling against note1, so none of ITS writes may land on note2.
+			// (note2 legitimately gets rewritten afterwards by the repoint's own fresh pass, which
+			// adopts note2's words as a first run — that pass is correct and expected. What must never
+			// happen is note1's content arriving here.)
+			assert.ok(
+				rpState.notes.note2.body.includes('Myveryownwordrp') &&
+					rpState.notes.note2.body.includes('Secondownwordrp'),
+				'the newly-pointed note keeps its OWN words: ' + JSON.stringify(rpState.notes.note2.body),
+			);
+			assert.ok(
+				!rpState.notes.note2.body.includes('Alpharp') && !rpState.notes.note2.body.includes('Betarp'),
+				'and note1\'s words were never written over it: ' + JSON.stringify(rpState.notes.note2.body),
+			);
+			assert.ok(note2Before.includes('Myveryownwordrp'), 'sanity: the fixture had its own content');
+
+			// The base is the other half of the damage. `resetSyncBase()` writes '' on a repoint so the
+			// next pass is a FIRST RUN that adopts the new side's words instead of inferring deletions
+			// from them; an abandoned pass committing its note1 base over that would make every word
+			// note2 lacks look deleted on the very next reconcile.
+			const base = rpState.settings.syncBase || '';
+			assert.ok(
+				!base.includes('Alpharp') && !base.includes('Betarp'),
+				'the merge base describes the new note, never the old one: ' + JSON.stringify(base),
+			);
+			// And the buffered word was not silently retired by a pass that never landed it.
+			assert.ok(
+				(rpState.settings.pendingWords || []).includes('Buffrp') ||
+					rpState.notes.note2.body.includes('Buffrp'),
+				'the buffered word is still queued (or was legitimately folded into the new note)',
+			);
+		});
+
+	}
+
+	// ---- integration: a dismissal is ONE transaction over all three of its pieces ----
+	// harper's in-engine ignore set, the persisted payload mirroring it, and the side table only mean
+	// anything together. Locking just the side table left the payload half racing, which reproduced the
+	// very failure the lock was added to stop.
+	{
+		const txDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-tx-'));
+		const txState = await run({
+			dataDir: txDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+		});
+		const txh = txState.contentScriptMessageHandlers['harperCm'];
+		const txMeta = path.join(txDir, 'dismissedMeta.json');
+		const txIgnore = path.join(txDir, 'ignoredLints.json');
+		const txEntries = () => {
+			try {
+				return JSON.parse(fs.readFileSync(txMeta, 'utf8')).entries;
+			} catch {
+				return [];
+			}
+		};
+		const txRaw = () => {
+			try {
+				return fs.readFileSync(txIgnore, 'utf8');
+			} catch {
+				return '';
+			}
+		};
+		const TX_A = 'I saw teh cat.';
+		const TX_B = 'We should of gone.';
+		const txDismiss = async (text, problem) => {
+			const lint = (await txh({ type: 'lint', text })).find((l) => l.problemText === problem);
+			assert.ok(lint, 'precondition: "' + problem + '" is flagged');
+			await txh({ type: 'ignoreLint', text, start: lint.start, end: lint.end, ruleName: lint.ruleName });
+			return lint;
+		};
+
+		await test('two Restores at once both land: neither leaves an orphaned, un-restorable hash', async () => {
+			await txDismiss(TX_A, 'teh');
+			await txDismiss(TX_B, 'should of');
+			const rows = txEntries();
+			assert.strictEqual(rows.length, 2, 'precondition: two named dismissals');
+
+			// Each Restore button disables only ITSELF, so two rows really are independently clickable —
+			// and nothing upstream serializes the dialog channel.
+			const replies = await Promise.all([
+				txh({ type: 'settings:restoreDismissed', id: rows[0].id }),
+				txh({ type: 'settings:restoreDismissed', id: rows[1].id }),
+			]);
+			assert.ok(replies[0].ok && replies[1].ok, 'both restores report success');
+
+			// Both read the payload before either persisted, so the second rebuilt the ignore set from
+			// ITS stale copy and put the first entry's hash back — while both rows were correctly removed
+			// under the side-table lock. The finding stayed suppressed forever, no longer restorable, and
+			// resurfaced as an unnameable "legacy" entry only the destructive bulk clear can remove.
+			assert.deepStrictEqual(
+				dismissedLog.extractHashes(txRaw()),
+				[],
+				'no hash survives a restore that reported success',
+			);
+			assert.deepStrictEqual(txEntries(), [], 'and both rows are gone');
+			assert.strictEqual(
+				dismissedLog.legacyCount(txRaw(), txEntries()),
+				0,
+				'nothing was orphaned into an un-restorable legacy entry',
+			);
+			assert.ok(
+				(await txh({ type: 'lint', text: TX_A })).some((l) => l.problemText === 'teh'),
+				'"teh" is flagged again, as its restore promised',
+			);
+			assert.ok(
+				(await txh({ type: 'lint', text: TX_B })).some((l) => l.problemText === 'should of'),
+				'"should of" is flagged again too',
+			);
+		});
+
+		await test('a dismissal racing a Restore does not lose its brand-new hash', async () => {
+			// CROSS-CHANNEL. `ignoreFinding` writes the very payload the dialog's Restore rewrites, but
+			// from the content-script channel, so a lock that covered only the dialog's own sends would
+			// not touch this. The mobile fixture is used because there the payload lives in a SETTING,
+			// which lets the restore be parked between reading it and writing it back — the window the
+			// whole failure lives in.
+			const xDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-xchan-'));
+			const xState = await run({
+				dataDir: xDir,
+				installationDir: DIST_DIR,
+				require: (name) => {
+					throw new Error(`mobile must not require(${name})`);
+				},
+				versionInfo: { version: '3.7.2', platform: 'mobile' },
+			});
+			const xh = xState.contentScriptMessageHandlers['harperCm'];
+			const TEXT_A = 'I saw teh cat.';
+			const TEXT_B = 'We should of gone.';
+
+			const first = (await xh({ type: 'lint', text: TEXT_A })).find((l) => l.problemText === 'teh');
+			assert.ok(first, 'precondition: "teh" is flagged');
+			await xh({ type: 'ignoreLint', text: TEXT_A, start: first.start, end: first.end, ruleName: first.ruleName });
+			const row = dismissedLog.parseEntries(xState.settings.dismissedMeta)[0];
+			assert.ok(row, 'precondition: the dismissal was recorded');
+
+			const second = (await xh({ type: 'lint', text: TEXT_B })).find((l) => l.problemText === 'should of');
+			assert.ok(second, 'precondition: "should of" is flagged');
+
+			// Park the Restore with its keep-set already computed but not yet written back.
+			let release = null;
+			let onParked = null;
+			const parked = new Promise((resolve) => {
+				onParked = resolve;
+			});
+			const gate = new Promise((resolve) => {
+				release = resolve;
+			});
+			xState.beforeSettingWrite = async (key) => {
+				if (key !== 'ignoredLints') return;
+				xState.beforeSettingWrite = null;
+				onParked();
+				await gate;
+			};
+			const restore = xh({ type: 'settings:restoreDismissed', id: row.id });
+			await parked;
+
+			// The user dismisses something else right then. Against a correct implementation it CANNOT
+			// complete here — it has to queue behind the restore's transaction.
+			// A single Dismiss can produce SEVERAL hashes, so this watches for a hash that was not
+			// there before rather than for a count.
+			const beforeHashes = new Set(dismissedLog.extractHashes(xState.settings.ignoredLints || ''));
+			const dismiss = xh({
+				type: 'ignoreLint',
+				text: TEXT_B,
+				start: second.start,
+				end: second.end,
+				ruleName: second.ruleName,
+			});
+			const raced = await waitFor(
+				() =>
+					dismissedLog
+						.extractHashes(xState.settings.ignoredLints || '')
+						.some((h) => !beforeHashes.has(h)),
+				300,
+			);
+
+			release();
+			await Promise.all([restore, dismiss]);
+
+			// Un-serialized, the restore exported harper's state BEFORE the park and wrote that stale
+			// string afterwards, straight over the payload the dismissal had just persisted. The engine
+			// still holds the hash for the rest of the session, so nothing looks wrong until the next
+			// start — when the dismissal simply is not there any more. So the invariant to assert is
+			// that the side table and the PERSISTED payload still agree.
+			const persisted = new Set(dismissedLog.extractHashes(xState.settings.ignoredLints || ''));
+			for (const entry of dismissedLog.parseEntries(xState.settings.dismissedMeta)) {
+				for (const hash of entry.hashes) {
+					assert.ok(
+						persisted.has(hash),
+						`the row for "${entry.problemText}" still has its hash in the persisted payload ` +
+							`(it would be silently un-dismissed on the next start)`,
+					);
+				}
+			}
+
+			assert.strictEqual(
+				(await xh({ type: 'lint', text: TEXT_B })).filter((l) => l.problemText === 'should of').length,
+				0,
+				'the dismissal made during the restore actually took effect',
+			);
+			assert.ok(
+				(await xh({ type: 'lint', text: TEXT_A })).some((l) => l.problemText === 'teh'),
+				'and the restore did too',
+			);
+			assert.strictEqual(
+				dismissedLog.legacyCount(
+					xState.settings.ignoredLints || '',
+					dismissedLog.parseEntries(xState.settings.dismissedMeta),
+				),
+				0,
+				'every surviving hash is still named by a row, and every row still has its hash',
+			);
+			// Asserted last, so the reported failure is the lost dismissal rather than the mechanism.
+			assert.strictEqual(raced, false, 'the dismissal queued behind the restore instead of racing it');
+		});
+	}
+
+	// ---- integration: a stale dialog cannot resurrect a word deleted elsewhere ----
+	{
+		const rsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-resurrect-'));
+		const rsState = await run({
+			dataDir: rsDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryNoteId: 'rsnote' },
+			notes: { rsnote: { id: 'rsnote', body: '# h\n\nAlpharx\nBetarx\nCharlirx\n', updated_time: 100 } },
+		});
+		const rsh = rsState.contentScriptMessageHandlers['harperCm'];
+		const rspoll = () => rsState.intervals.find((i) => i.ms === 60000 && !i.cleared).fn();
+
+		await test('dictionary editor: a save does not re-add a word deleted elsewhere since the editor was seeded', async () => {
+			assert.ok(
+				await waitFor(() => (rsState.settings.syncBase || '').includes('Charlirx')),
+				'precondition: converged',
+			);
+			// What the dialog cached when it loaded. Nothing pushes dictionary changes into an open
+			// dialog, so this stays on screen for as long as the dialog is open.
+			const baseline = (await rsh({ type: 'settings:snapshot', includeDescriptions: false })).dictionaryWords;
+			assert.ok(baseline.includes('Charlirx'), 'precondition: the editor was seeded with Charlirx');
+
+			// Another device deletes Charlirx; the 60 s poll folds the sync in. No race, just an open
+			// dialog and wall-clock time.
+			rsState.notes.rsnote.body = '# h\n\nAlpharx\nBetarx\n';
+			rsState.notes.rsnote.updated_time += 100;
+			rspoll();
+			assert.ok(await waitFor(() => !(rsState.settings.syncBase || '').includes('Charlirx')));
+
+			// The user types one new word into the still-stale textarea and saves.
+			const res = await rsh({
+				type: 'settings:saveDictionary',
+				words: baseline.concat(['Deltarx']),
+				baseline: baseline,
+			});
+
+			// An add is NOT the harmless direction: a pendingWords entry outranks an inferred deletion
+			// by design and cancels a queued removal outright, so Charlirx would be written back into
+			// the note and synced to every device — silently undoing the deletion.
+			assert.deepStrictEqual(res.adds, ['Deltarx'], 'only the word the user actually typed is added');
+			assert.ok(!res.words.includes('Charlirx'), 'the deleted word stays deleted');
+			assert.ok(!rsState.notes.rsnote.body.includes('Charlirx'), 'and is not written back into the note');
+			assert.ok(rsState.notes.rsnote.body.includes('Deltarx'), 'while the real addition lands');
+			assert.ok(
+				(await rsh({ type: 'lint', text: 'I said Charlirx today.' })).some((l) => l.problemText === 'Charlirx'),
+				'the engine flags it again, as the deletion asked',
+			);
 		});
 	}
 
