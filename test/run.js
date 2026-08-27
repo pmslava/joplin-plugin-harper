@@ -435,6 +435,159 @@ async function main() {
 		}
 	});
 
+	// ---- the dialog's pure rendering core -----------------------------------
+	// buildGroups() and the tri-state derivation decide what the whole rules browser shows, and they
+	// live in a webview IIFE that cannot be imported. Rather than leave them covered only by e2e (which
+	// can exercise the ONE shape harper 2.7.0 happens to emit), the functions are lifted out by source
+	// and driven against the shapes harper's own types permit but its current release never produces:
+	// nested groups, OneOfMany, and rules missing from the tree.
+	function extractDialogFunctions(names, preamble, extraExports) {
+		const source = fs.readFileSync(path.join(REPO_ROOT, 'src', 'settingsDialog.js'), 'utf8');
+		const parts = [];
+		for (const name of names) {
+			// Top-level functions in the IIFE are indented one tab, so their closing brace is the first
+			// "\n\t}" — nested helpers close at "\n\t\t}" and cannot terminate the match early.
+			const match = source.match(new RegExp(`\\n\\tfunction ${name}\\([\\s\\S]*?\\n\\t\\}`));
+			assert.ok(match, `found ${name}() in src/settingsDialog.js`);
+			parts.push(match[0]);
+		}
+		const exported = names.concat(extraExports || []);
+		// eslint-disable-next-line no-new-func
+		return new Function(`${preamble || ''}\n${parts.join('\n')}\nreturn { ${exported.join(', ')} };`)();
+	}
+
+	await test('buildGroups: flat harper shape -> one display group per Group node, rules in tree order', () => {
+		const { buildGroups } = extractDialogFunctions(
+			['buildGroups'],
+			"var ADDITIONAL_GROUP_ID = '__additional__';",
+		);
+		const structured = {
+			settings: [
+				{
+					Group: {
+						label: 'Proper Nouns',
+						description: 'Names that keep their capitalisation.',
+						child: { settings: [{ Bool: { name: 'Bravo' } }, { Bool: { name: 'Alpha' } }] },
+					},
+				},
+				{ Group: { label: 'Initialisms', description: '', child: { settings: [{ Bool: { name: 'Charlie' } }] } } },
+			],
+		};
+		const groups = buildGroups(structured, { Alpha: true, Bravo: true, Charlie: false }, {});
+		assert.strictEqual(groups.length, 2, 'one group per Group node, no extras bucket');
+		assert.strictEqual(groups[0].label, 'Proper Nouns');
+		assert.strictEqual(groups[0].description, 'Names that keep their capitalisation.', 'the Group description is attached');
+		// harper's own order is preserved — NOT sorted. The tree is the presentation contract.
+		assert.deepStrictEqual(groups[0].rules, ['Bravo', 'Alpha'], 'rules keep tree order');
+		assert.deepStrictEqual(groups[1].rules, ['Charlie']);
+	});
+
+	await test('buildGroups: a nested Group becomes its own breadcrumb group, listed AFTER its parent', () => {
+		const { buildGroups } = extractDialogFunctions(
+			['buildGroups'],
+			"var ADDITIONAL_GROUP_ID = '__additional__';",
+		);
+		// harper 2.7.0 never nests, but Group.child is typed as a full StructuredLintConfig, so a future
+		// release could. The parent's own rules must come first: listing "Parent > Child" above "Parent"
+		// reads as though the child owned the parent.
+		const structured = {
+			settings: [
+				{
+					Group: {
+						label: 'Parent',
+						description: 'outer',
+						child: {
+							settings: [
+								{ Bool: { name: 'OwnRule' } },
+								{ Group: { label: 'Child', description: 'inner', child: { settings: [{ Bool: { name: 'NestedRule' } }] } } },
+							],
+						},
+					},
+				},
+			],
+		};
+		const groups = buildGroups(structured, { OwnRule: true, NestedRule: true }, {});
+		assert.strictEqual(groups.length, 2);
+		assert.strictEqual(groups[0].label, 'Parent', 'the parent is listed first');
+		assert.deepStrictEqual(groups[0].rules, ['OwnRule']);
+		assert.strictEqual(groups[0].description, 'outer');
+		assert.strictEqual(groups[1].label, 'Parent > Child', 'the nested group gets a breadcrumb label');
+		assert.deepStrictEqual(groups[1].rules, ['NestedRule']);
+		assert.strictEqual(groups[1].description, 'inner', 'descriptions pair by id, not by position');
+	});
+
+	await test('buildGroups: OneOfMany members become ordinary rows, and top-level Bools get their own bucket', () => {
+		const { buildGroups } = extractDialogFunctions(
+			['buildGroups'],
+			"var ADDITIONAL_GROUP_ID = '__additional__';",
+		);
+		const structured = {
+			settings: [
+				{ Bool: { name: 'Loose' } },
+				{ OneOfMany: { names: ['PickA', 'PickB'], name: 'PickA' } },
+			],
+		};
+		const groups = buildGroups(structured, { Loose: true, PickA: true, PickB: false }, {});
+		assert.strictEqual(groups.length, 1, 'ungrouped rules collapse into a single bucket');
+		assert.strictEqual(groups[0].label, 'Other Rules');
+		// Rendering a OneOfMany as individual rows loses its mutual exclusion, but the alternative is
+		// dropping the node — which would hide rules with nothing on screen to say so.
+		assert.deepStrictEqual(groups[0].rules, ['Loose', 'PickA', 'PickB']);
+	});
+
+	await test('buildGroups: rules the tree omits land in "Additional Rules", prototype-named ones included', () => {
+		const { buildGroups } = extractDialogFunctions(
+			['buildGroups'],
+			"var ADDITIONAL_GROUP_ID = '__additional__';",
+		);
+		const structured = {
+			settings: [{ Group: { label: 'Known', description: '', child: { settings: [{ Bool: { name: 'InTree' } }] } } }],
+		};
+		// `constructor` is the trap: a plain-object `seen` map answers truthily for it without anything
+		// ever being stored, which would silently drop the rule from the UI while it stayed in force.
+		const defaults = { InTree: true, Orphan: true, constructor: false, toString: true };
+		// A hand-edited ruleOverrides entry for a rule in NEITHER the tree nor the defaults must still
+		// surface — it is active, so it has to be visible and editable.
+		const groups = buildGroups(structured, defaults, { HandEdited: false });
+		const extras = groups.find((g) => g.label === 'Additional Rules');
+		assert.ok(extras, 'an Additional Rules bucket was emitted');
+		assert.deepStrictEqual(
+			extras.rules.slice().sort(),
+			['HandEdited', 'Orphan', 'constructor', 'toString'].sort(),
+			'every rule missing from the tree is listed exactly once',
+		);
+		assert.ok(!extras.rules.includes('InTree'), 'a rule already in the tree is NOT duplicated into extras');
+	});
+
+	await test('tri-state derivation: absence is Default, and a group reports on/off/default/mixed', () => {
+		const lifted = extractDialogFunctions(
+			['ruleState', 'groupState'],
+			'var state = { overrides: Object.create(null) };',
+			['state'],
+		);
+		const { ruleState, groupState, state: fake } = lifted;
+		const group = { rules: ['A', 'B'] };
+
+		// ABSENCE — not null — is what "Default" means. This is the whole tri-state contract.
+		assert.strictEqual(ruleState('A'), 'default', 'a missing key is Default');
+		assert.strictEqual(groupState(group), 'default', 'all-absent => Default');
+
+		fake.overrides.A = true;
+		assert.strictEqual(ruleState('A'), 'on');
+		assert.strictEqual(groupState(group), 'mixed', 'one set, one absent => mixed');
+
+		fake.overrides.B = true;
+		assert.strictEqual(groupState(group), 'on', 'all-true => On');
+
+		fake.overrides.A = false;
+		fake.overrides.B = false;
+		assert.strictEqual(ruleState('A'), 'off');
+		assert.strictEqual(groupState(group), 'off', 'all-false => Off');
+
+		fake.overrides.B = true;
+		assert.strictEqual(groupState(group), 'mixed', 'disagreeing children => mixed');
+	});
+
 	// ---- config handshake ---------------------------------------------------
 	const handler = state.contentScriptMessageHandlers['harperCm'];
 	await test('getConfig returns {enabled, debounceMs, underlineStyle, platform, generation} for the content script', async () => {

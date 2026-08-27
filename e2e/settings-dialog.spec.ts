@@ -228,6 +228,19 @@ test.describe.serial('Harper settings dialog', () => {
     expect(shownGroups).toBeLessThan(allGroups);
     await expect(frame.locator(`.hs-rule[data-rule="${RULE}"]`)).toHaveCount(1);
 
+    // Expanding a rule shows harper's own description for it. These ~823 HTML strings are fetched
+    // lazily AFTER the first paint (they would roughly triple the snapshot), so this also proves the
+    // background fetch lands and re-renders.
+    const row = frame.locator(`.hs-rule[data-rule="${RULE}"]`);
+    await row.locator('.hs-disclosure').click();
+    const description = row.locator('.hs-rule-desc');
+    await expect(description).toHaveCount(1);
+    await expect
+      .poll(async () => ((await description.textContent()) || '').trim(), { timeout: 30_000 })
+      .not.toMatch(/^(Loading description…)?$/);
+    // eslint-disable-next-line no-console
+    console.log(`[harper-e2e] ${RULE} description = ${JSON.stringify(await description.textContent())}`);
+
     // A nonsense query filters everything out rather than silently showing all rules.
     await searchRules(frame, 'zzzznotarulezzzz');
     await expect(frame.locator('#hs-rules-groups .hs-group')).toHaveCount(0);
@@ -278,6 +291,24 @@ test.describe.serial('Harper settings dialog', () => {
     const frame = await openSettings(win);
     await openTab(frame, 'rules');
 
+    // REOPEN FRESHNESS: this is a brand-new open of the dialog, and it must show the override the
+    // previous open made. A webview that was reused without re-fetching would still be showing the
+    // all-defaults state from before.
+    await expect(frame.locator('#hs-rules-summary')).toContainText('1 overridden.');
+    await searchRules(frame, RULE);
+    await expect(frame.locator(`[data-rule-select="${RULE}"]`)).toHaveValue('off');
+    await searchRules(frame, '');
+
+    // Disable All Rules writes an explicit `false` for every rule in the roster. The count comes off
+    // getDefaultLintConfig(), so it is asserted as "the whole roster" rather than a literal that a
+    // harper bump would invalidate.
+    await frame.locator('#hs-disable-all-rules').click();
+    await expect(frame.locator('#hs-rules-status')).toHaveText(/Saved\. [89]\d\d rules overridden\./, {
+      timeout: 30_000,
+    });
+    await expect(frame.locator('.hs-group-select').first()).toHaveValue('off');
+
+    // ...and Reset drops the lot, back to an empty map.
     await frame.locator('#hs-reset-rules').click();
     await expect(frame.locator('#hs-rules-status')).toContainText('No rules overridden', {
       timeout: 30_000,

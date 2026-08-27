@@ -36,10 +36,17 @@
 	 * dialect, dictionaryPath on mobile, non-allowlisted key), and the caller has to be able to see it.
 	 */
 	function send(message) {
-		return webviewApi.postMessage(message).then(function (reply) {
-			if (reply && reply.__error) throw new Error(reply.__error);
-			return reply;
-		});
+		// Wrapped so a MISSING webviewApi becomes a rejection rather than a synchronous ReferenceError.
+		// Thrown synchronously it would escape load()'s .catch entirely and leave a blank white dialog
+		// with nothing to explain it; as a rejection the user gets the "Could not load settings" screen.
+		try {
+			return webviewApi.postMessage(message).then(function (reply) {
+				if (reply && reply.__error) throw new Error(reply.__error);
+				return reply;
+			});
+		} catch (error) {
+			return Promise.reject(error);
+		}
 	}
 
 	// =============================================================================
@@ -102,13 +109,17 @@
 		overrides: {}, // rule -> boolean (SPARSE; a missing key means "Default")
 		groups: [], // [{ id, label, description, rules: [ruleName, ...] }]
 		descriptions: null, // rule -> HTML, or null until the lazy fetch lands
-		descriptionText: {}, // rule -> plain text, for search
+		// PROTOTYPE-FREE lookup maps. These are keyed by RULE NAME, and a plain `{}` answers truthily
+		// for "constructor", "toString", "valueOf" and friends without anything ever being stored — so
+		// a rule with such a name would read as already-seen / already-expanded. harper's names are
+		// PascalCase today, but a lookup table keyed by external strings has no business inheriting.
+		descriptionText: Object.create(null), // rule -> plain text, for search
 		dictionaryWords: [],
 		dismissed: { entries: [], legacyCount: 0 },
 		search: '',
 		tab: 'general',
-		expandedGroups: {}, // group id -> true
-		expandedRules: {}, // rule name -> true
+		expandedGroups: Object.create(null), // group id -> true
+		expandedRules: Object.create(null), // rule name -> true
 		confirmClearAll: false,
 	};
 
@@ -133,7 +144,7 @@
 	 */
 	function buildGroups(structured, defaults, overrides) {
 		var groups = [];
-		var seen = {};
+		var seen = Object.create(null); // see the note on descriptionText above
 
 		function addGroup(id, label, description, rules) {
 			if (!rules.length) return;
@@ -142,9 +153,15 @@
 
 		function walk(node, trail) {
 			if (!node || !node.settings || !node.settings.length) return;
+
+			// PASS 1 — this node's OWN rules, emitted before recursing, so a parent group always appears
+			// ahead of the nested groups that belong to it. (Collecting and recursing in one loop would
+			// list "Parent > Child" above "Parent", which reads as though the child owns the parent.)
 			var ownRules = [];
-			for (var i = 0; i < node.settings.length; i++) {
-				var entry = node.settings[i];
+			var i;
+			var entry;
+			for (i = 0; i < node.settings.length; i++) {
+				entry = node.settings[i];
 				if (!entry || typeof entry !== 'object') continue;
 				if (entry.Bool && entry.Bool.name) {
 					ownRules.push(entry.Bool.name);
@@ -156,30 +173,23 @@
 						ownRules.push(member);
 						seen[member] = true;
 					}
-				} else if (entry.Group) {
-					var label = entry.Group.label || 'Rules';
-					var childTrail = trail.concat([label]);
-					// Depth-first, so a nested group lands right after the parent it belongs to.
-					var before = groups.length;
-					walk(entry.Group.child, childTrail);
-					// Keep the parent's own rules ahead of its children in the list.
-					if (ownRules.length && before === groups.length) {
-						/* nothing nested was emitted; the parent flush below covers it */
-					}
-					if (entry.Group.description) {
-						// Attach the description to whichever group the child produced under this label.
-						for (var k = before; k < groups.length; k++) {
-							if (groups[k].label === childTrail.join(' > ') && !groups[k].description) {
-								groups[k].description = entry.Group.description;
-							}
-						}
-					}
 				}
 			}
 			if (ownRules.length) {
-				var id = trail.length ? trail.join('/') : '__root__';
-				var groupLabel = trail.length ? trail.join(' > ') : 'Other Rules';
-				addGroup(id, groupLabel, '', ownRules);
+				addGroup(
+					trail.length ? trail.join('/') : '__root__',
+					trail.length ? trail.join(' > ') : 'Other Rules',
+					'',
+					ownRules,
+				);
+			}
+
+			// PASS 2 — nested groups, depth-first. Each one's description is attached afterwards, in
+			// applyDescriptions, where an emitted group can be matched back to its source node by id.
+			for (i = 0; i < node.settings.length; i++) {
+				entry = node.settings[i];
+				if (!entry || typeof entry !== 'object' || !entry.Group) continue;
+				walk(entry.Group.child, trail.concat([entry.Group.label || 'Rules']));
 			}
 		}
 
@@ -276,27 +286,63 @@
 		else state.overrides[name] = next === 'on';
 	}
 
-	function pushOverrides() {
+	function errorText(error) {
+		return (error && error.message) || String(error);
+	}
+
+	/**
+	 * Queue ONE rule-config write behind every write already in flight.
+	 *
+	 * Every path that changes the rule config goes through here — single toggles, whole-group flips,
+	 * Reset and Disable All alike. Letting any of them skip the queue would let a slower earlier write
+	 * land last and undo it: clicking a rule and then Reset could re-persist the pre-reset map, leaving
+	 * the engine holding overrides while the dialog showed "all defaults".
+	 *
+	 * `build` returns the message to send; `adopt` takes the reply's authoritative override map.
+	 */
+	function queueRuleWrite(build, pendingStatus) {
 		applyPending++;
-		setRulesStatus('Saving…');
+		setRulesStatus(pendingStatus || 'Saving…');
+		applyChain = applyChain.then(
+			function () {
+				return send(build()).then(
+					function (reply) {
+						applyPending--;
+						// The service returns the sparse map it actually stored, so the UI adopts that
+						// rather than trusting its own optimistic copy.
+						if (reply && reply.overrides) state.overrides = reply.overrides;
+						// Only the LAST write in a burst repaints the status, so an intermediate "Saved"
+						// cannot flash over a still-running save.
+						if (applyPending === 0) {
+							renderRules();
+							setRulesStatus(describeOverrides(state.overrides));
+						}
+						return reply;
+					},
+					function (error) {
+						applyPending--;
+						setRulesStatus('Could not save: ' + errorText(error), true);
+					},
+				);
+			},
+			// The chain itself must never stay rejected: `applyChain.then(...)` on a rejected chain
+			// would SKIP the send entirely, silently breaking every later toggle for the session.
+			function () {
+				applyPending--;
+			},
+		);
+		return applyChain;
+	}
+
+	function pushOverrides() {
+		// Snapshot the map NOW — it is edited in place, and by the time this write runs the user may
+		// have toggled something else that belongs to a later write.
 		var snapshot = {};
 		var keys = Object.keys(state.overrides);
 		for (var i = 0; i < keys.length; i++) snapshot[keys[i]] = state.overrides[keys[i]];
-		applyChain = applyChain
-			.then(function () {
-				return send({ type: 'settings:applyRuleOverrides', overrides: snapshot });
-			})
-			.then(function (reply) {
-				applyPending--;
-				// Only the LAST write in a burst gets to repaint the status, so an intermediate "Saved"
-				// cannot flash over a still-running save.
-				if (applyPending === 0) setRulesStatus(describeOverrides(reply && reply.overrides));
-			})
-			.catch(function (error) {
-				applyPending--;
-				setRulesStatus('Could not save: ' + error.message, true);
-			});
-		return applyChain;
+		return queueRuleWrite(function () {
+			return { type: 'settings:applyRuleOverrides', overrides: snapshot };
+		});
 	}
 
 	function describeOverrides(overrides) {
@@ -434,11 +480,24 @@
 		debounce.value = String(typeof s.debounceMs === 'number' ? s.debounceMs : 500);
 		var debounceBefore = debounce.value;
 		debounce.addEventListener('change', function () {
-			var value = Number(debounce.value);
+			// A number input enforces min/max only on FORM validation, and there is no form here — so
+			// "99999" arrives untouched. The service clamps it to 10000 and reports plain {ok:true},
+			// which would leave the field showing a value that was never stored. Clamp to the same
+			// bounds here and write the clamped number back, so what is on screen is what was saved.
+			var raw = debounce.value.trim();
+			// An empty box is not "0" (a real, meaningful value: lint immediately) — it is an unfinished
+			// edit, so revert rather than silently disabling the delay.
+			if (!raw) {
+				debounce.value = debounceBefore;
+				return;
+			}
+			var value = Number(raw);
 			if (!isFinite(value)) {
 				debounce.value = debounceBefore;
 				return;
 			}
+			value = Math.min(10000, Math.max(0, Math.round(value)));
+			debounce.value = String(value);
 			updateSetting('debounceMs', value, function () {
 				debounce.value = debounceBefore;
 			}).then(function () {
@@ -590,9 +649,11 @@
 		select.addEventListener('change', function () {
 			setRuleState(name, select.value);
 			pushOverrides();
-			// The group header's derived state may have moved; repaint just the header rather than the
-			// whole (potentially 800-row) list.
+			// The group header's derived state and the roster summary both moved. Repaint just those
+			// two rather than the whole (potentially 800-row) list — leaving the summary alone would
+			// have it disagree with the status line right below it until the next full render.
 			refreshGroupHeader(group);
+			refreshRulesSummary();
 		});
 		row.appendChild(select);
 		return row;
@@ -627,16 +688,21 @@
 
 		var header = el('div', 'hs-group-header');
 		// A search auto-opens the groups that matched: with a needle typed, hiding the hits behind a
-		// second click would make the search useless.
+		// second click would make the search useless. That is a DISPLAY override only \u2014 the stored
+		// expansion state is left alone, so clearing the search restores exactly what the user had
+		// open, and the toggle below flips the stored value rather than this forced one (flipping the
+		// forced value would make the arrow a dead control during a search).
 		var expanded = needle ? true : !!state.expandedGroups[group.id];
+
+		function toggleExpanded() {
+			state.expandedGroups[group.id] = !state.expandedGroups[group.id];
+			renderRules();
+		}
 
 		var toggle = el('button', 'hs-disclosure', expanded ? '\u25BE' : '\u25B8');
 		toggle.type = 'button';
 		toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
-		toggle.addEventListener('click', function () {
-			state.expandedGroups[group.id] = !expanded;
-			renderRules();
-		});
+		toggle.addEventListener('click', toggleExpanded);
 		header.appendChild(toggle);
 
 		var titleWrap = el('div', 'hs-group-title-wrap');
@@ -650,10 +716,7 @@
 		if (group.description) titleWrap.appendChild(el('div', 'hs-group-desc', group.description));
 		// Clicking the title is the same as clicking the arrow — a bigger tap target, which matters on
 		// mobile where the arrow alone is well under 44 px.
-		titleWrap.addEventListener('click', function () {
-			state.expandedGroups[group.id] = !expanded;
-			renderRules();
-		});
+		titleWrap.addEventListener('click', toggleExpanded);
 		header.appendChild(titleWrap);
 
 		var value = groupState(group);
@@ -665,7 +728,13 @@
 		if (value === 'mixed') options.unshift(['mixed', 'Default (mixed)']);
 		var select = makeSelect(options, value, 'hs-select hs-group-select');
 		select.setAttribute('data-group-select', group.id);
-		select.title = 'Set every rule in this group';
+		// The group selector always writes to the WHOLE group, never to just the rows a search left
+		// visible. That is the useful behaviour, but beside a header reading "3 of 121" it would be a
+		// nasty surprise, so during a search the tooltip says plainly how many rules it will touch.
+		select.title =
+			needle && rules.length !== group.rules.length
+				? 'Set all ' + group.rules.length + ' rules in this group, including the ones the search is hiding'
+				: 'Set every rule in this group';
 		select.addEventListener('change', function () {
 			if (select.value === 'mixed') return; // "mixed" is a readout, not a command
 			for (var i = 0; i < group.rules.length; i++) setRuleState(group.rules[i], select.value);
@@ -697,6 +766,10 @@
 			}
 		}
 		if (!shown) host.appendChild(el('div', 'hs-empty', 'No rules match "' + state.search.trim() + '".'));
+		refreshRulesSummary();
+	}
+
+	function refreshRulesSummary() {
 		var summary = document.getElementById('hs-rules-summary');
 		if (summary) summary.textContent = rulesSummaryText();
 	}
@@ -752,16 +825,9 @@
 		reset.type = 'button';
 		reset.id = 'hs-reset-rules';
 		reset.addEventListener('click', function () {
-			setRulesStatus('Resetting…');
-			send({ type: 'settings:resetRules' })
-				.then(function (reply) {
-					state.overrides = reply && reply.overrides ? reply.overrides : {};
-					renderRules();
-					setRulesStatus(describeOverrides(state.overrides));
-				})
-				.catch(function (error) {
-					setRulesStatus('Could not reset: ' + error.message, true);
-				});
+			queueRuleWrite(function () {
+				return { type: 'settings:resetRules' };
+			}, 'Resetting…');
 		});
 		toolbar.appendChild(reset);
 
@@ -769,16 +835,9 @@
 		disableAll.type = 'button';
 		disableAll.id = 'hs-disable-all-rules';
 		disableAll.addEventListener('click', function () {
-			setRulesStatus('Disabling…');
-			send({ type: 'settings:disableAllRules' })
-				.then(function (reply) {
-					state.overrides = reply && reply.overrides ? reply.overrides : {};
-					renderRules();
-					setRulesStatus(describeOverrides(state.overrides));
-				})
-				.catch(function (error) {
-					setRulesStatus('Could not disable: ' + error.message, true);
-				});
+			queueRuleWrite(function () {
+				return { type: 'settings:disableAllRules' };
+			}, 'Disabling…');
 		});
 		toolbar.appendChild(disableAll);
 		section.appendChild(toolbar);
@@ -825,11 +884,14 @@
 		save.type = 'button';
 		save.id = 'hs-save-dictionary';
 		save.addEventListener('click', function () {
+			// Split, trim, drop empties — and drop repeats. The service normalizes its side anyway, so
+			// leaving duplicates in would not corrupt anything; it would just mean the textarea we
+			// re-render and the word count beside it describe a list the plugin never stored.
 			var words = [];
 			var lines = area.value.split('\n');
 			for (var i = 0; i < lines.length; i++) {
 				var word = lines[i].trim();
-				if (word) words.push(word);
+				if (word && words.indexOf(word) === -1) words.push(word);
 			}
 			status.textContent = 'Saving…';
 			status.className = 'hs-status';
@@ -841,6 +903,7 @@
 					var removes = (reply && reply.removes) || [];
 					state.dictionaryWords = words.slice().sort();
 					area.value = state.dictionaryWords.join('\n');
+					count.textContent = state.dictionaryWords.length + ' words';
 					if (!adds.length && !removes.length) {
 						status.textContent = 'Saved. Nothing changed.';
 					} else {

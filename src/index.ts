@@ -1313,9 +1313,21 @@ async function buildSettingsDialog(): Promise<string> {
 	return handle;
 }
 
-/** Build once, reuse forever. Concurrent opens await the same in-flight construction. */
+/**
+ * Build once, reuse forever. Concurrent opens await the same in-flight construction (the assignment
+ * happens before any await, so a second caller cannot start a second build).
+ *
+ * A FAILED build must not be memoized: holding on to the rejected promise would make every later
+ * open re-throw the original error, leaving the command permanently dead until Joplin restarts. One
+ * transient failure during startup would cost the user the whole settings screen for the session.
+ */
 function getSettingsDialog(): Promise<string> {
-	if (!settingsDialogPromise) settingsDialogPromise = buildSettingsDialog();
+	if (!settingsDialogPromise) {
+		settingsDialogPromise = buildSettingsDialog().catch((error) => {
+			settingsDialogPromise = null; // let the next open try again
+			throw error;
+		});
+	}
 	return settingsDialogPromise;
 }
 
