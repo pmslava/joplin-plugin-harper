@@ -119,8 +119,12 @@
 		search: '',
 		tab: 'general',
 		expandedGroups: Object.create(null), // group id -> true
+		// Per-SEARCH expansion overrides. A search force-opens the groups it matched, which would make
+		// the disclosure arrow a dead control; this map records the groups the user collapsed while
+		// that search was active, and is thrown away whenever the query changes — so clearing the
+		// search still restores exactly what was open before it, which expandedGroups alone holds.
+		searchExpanded: Object.create(null), // group id -> false (collapsed during this search)
 		expandedRules: Object.create(null), // rule name -> true
-		confirmClearAll: false,
 	};
 
 	var ADDITIONAL_GROUP_ID = '__additional__';
@@ -281,9 +285,55 @@
 	var applyChain = Promise.resolve();
 	var applyPending = 0;
 
+	/**
+	 * The user's rule edits that no completed write has confirmed yet, in the order they were made.
+	 * Each entry is { rule: name, value: true | false | null }, where null means "Default" (delete
+	 * the key — absence is what Default means, see rule 2 in the header).
+	 *
+	 * SERIALIZING THE SENDS IS NOT ENOUGH ON ITS OWN. `settings:applyRuleOverrides` REPLACES the
+	 * stored map wholesale, and every reply carries the authoritative map the service stored — so two
+	 * things have to be true, and neither was:
+	 *
+	 *   1. a payload must be built at SEND time, from whatever the map is by then. A payload
+	 *      snapshotted at CLICK time predates the earlier write's reply, so sending it overwrites that
+	 *      write: one rule toggled during a slow "Disable All Rules" used to persist a single-key map
+	 *      and silently put all 822 other rules back on.
+	 *   2. adopting a reply must not drop the edits made after ITS payload was built. `state.overrides
+	 *      = reply.overrides` alone loses them, and since the repaint is gated on the last write in a
+	 *      burst, they vanish from the UI as well as from the setting.
+	 *
+	 * So each write records how many queued edits its payload carried; when its reply lands, exactly
+	 * those are retired and every later one is re-applied on top of the authoritative map. A bulk
+	 * Reset / Disable All carries none of its own, which is right: it deliberately supersedes
+	 * everything queued before it, and only edits made after it was sent survive it.
+	 */
+	var queuedEdits = [];
+
 	function setRuleState(name, next) {
 		if (next === 'default') delete state.overrides[name];
 		else state.overrides[name] = next === 'on';
+		queuedEdits.push({ rule: name, value: next === 'default' ? null : next === 'on' });
+	}
+
+	/** A plain, boolean-only copy of the override map — what a write actually sends. */
+	function copyOverrides(source) {
+		var out = {};
+		var keys = Object.keys(source || {});
+		for (var i = 0; i < keys.length; i++) {
+			if (typeof source[keys[i]] === 'boolean') out[keys[i]] = source[keys[i]];
+		}
+		return out;
+	}
+
+	/** The authoritative map from a reply, with every still-unconfirmed edit replayed on top. */
+	function withQueuedEdits(authoritative) {
+		var out = copyOverrides(authoritative);
+		for (var i = 0; i < queuedEdits.length; i++) {
+			var edit = queuedEdits[i];
+			if (edit.value === null) delete out[edit.rule];
+			else out[edit.rule] = edit.value;
+		}
+		return out;
 	}
 
 	function errorText(error) {
@@ -305,12 +355,22 @@
 		setRulesStatus(pendingStatus || 'Saving…');
 		applyChain = applyChain.then(
 			function () {
-				return send(build()).then(
+				// Built HERE, when it is this write's turn to go out — never at click time. See the note
+				// on queuedEdits: a payload frozen at click time predates the previous write's reply and
+				// would overwrite it wholesale.
+				var message = build();
+				// Everything the user has edited so far rides along in that payload (or, for a bulk
+				// action, is deliberately superseded by it). Edits made from now on do not, so they are
+				// what has to be replayed when this write's reply lands.
+				var carried = queuedEdits.length;
+				return send(message).then(
 					function (reply) {
 						applyPending--;
+						queuedEdits = queuedEdits.slice(carried);
 						// The service returns the sparse map it actually stored, so the UI adopts that
-						// rather than trusting its own optimistic copy.
-						if (reply && reply.overrides) state.overrides = reply.overrides;
+						// rather than trusting its own optimistic copy — plus the edits it could not know
+						// about, which are still unsaved and still on screen.
+						if (reply && reply.overrides) state.overrides = withQueuedEdits(reply.overrides);
 						// Only the LAST write in a burst repaints the status, so an intermediate "Saved"
 						// cannot flash over a still-running save.
 						if (applyPending === 0) {
@@ -321,6 +381,11 @@
 					},
 					function (error) {
 						applyPending--;
+						// Retired even though the write failed: `state.overrides` still holds these edits, so
+						// the next write's payload carries them again. Replaying them a second time on top of
+						// a later reply would be a no-op at best and could resurrect an edit the user has
+						// since undone.
+						queuedEdits = queuedEdits.slice(carried);
 						setRulesStatus('Could not save: ' + errorText(error), true);
 					},
 				);
@@ -335,13 +400,8 @@
 	}
 
 	function pushOverrides() {
-		// Snapshot the map NOW — it is edited in place, and by the time this write runs the user may
-		// have toggled something else that belongs to a later write.
-		var snapshot = {};
-		var keys = Object.keys(state.overrides);
-		for (var i = 0; i < keys.length; i++) snapshot[keys[i]] = state.overrides[keys[i]];
 		return queueRuleWrite(function () {
-			return { type: 'settings:applyRuleOverrides', overrides: snapshot };
+			return { type: 'settings:applyRuleOverrides', overrides: copyOverrides(state.overrides) };
 		});
 	}
 
@@ -401,6 +461,27 @@
 		if (help) body.appendChild(el('div', 'hs-help', help));
 		row.appendChild(body);
 		return row;
+	}
+
+	/**
+	 * Stop Enter inside a plain text input from closing the whole dialog.
+	 *
+	 * Joplin's webview bootstrap installs a document-level keydown listener that treats Enter in an
+	 * `INPUT[type=text]` as a form submit; the dialog's `onSubmit` then matches the first button whose
+	 * id is one of ok/yes/submit/confirm and calls it. This dialog registers exactly one button,
+	 * `{id:'ok', title:'Close'}` — so pressing Enter to commit a note id or a file path dismissed the
+	 * entire settings screen, 100% of the time. There is no form here and nothing to submit (every
+	 * change is already saved on `change`), so the key is stopped at the input, before it can bubble
+	 * to that listener. The rules search box dodges this for free with `type='search'`; these two
+	 * fields need the text type.
+	 *
+	 * stopPropagation only — NOT preventDefault: the `change` event that actually saves the value
+	 * still has to fire.
+	 */
+	function stopEnterFromClosingTheDialog(input) {
+		input.addEventListener('keydown', function (event) {
+			if (event.key === 'Enter') event.stopPropagation();
+		});
 	}
 
 	function setGeneralStatus(text, isError) {
@@ -547,6 +628,7 @@
 		noteId.type = 'text';
 		noteId.id = 'hs-dictionary-note-id';
 		noteId.value = s.dictionaryNoteId || '';
+		stopEnterFromClosingTheDialog(noteId);
 		var noteIdBefore = noteId.value;
 		noteId.addEventListener('change', function () {
 			var value = noteId.value.trim();
@@ -572,6 +654,7 @@
 			dictPath.type = 'text';
 			dictPath.id = 'hs-dictionary-path';
 			dictPath.value = s.dictionaryPath || '';
+			stopEnterFromClosingTheDialog(dictPath);
 			var dictPathBefore = dictPath.value;
 			dictPath.addEventListener('change', function () {
 				var value = dictPath.value;
@@ -679,6 +762,34 @@
 		return String(value).replace(/["\\]/g, '\\$&');
 	}
 
+	/**
+	 * Is this group's rule list shown right now?
+	 *
+	 * A search auto-opens the groups that matched: with a needle typed, hiding the hits behind a
+	 * second click would make the search useless. That is a DISPLAY override only \u2014 the stored
+	 * expansion state (`expandedGroups`) is left alone, so clearing the search restores exactly what
+	 * the user had open.
+	 *
+	 * The override used to be unconditional, which made the arrow a DEAD CONTROL during a search while
+	 * still flipping the stored value underneath: nothing moved on screen, and the group turned out to
+	 * have silently collapsed once the search was cleared \u2014 by a click count the UI gave no feedback
+	 * for. So a collapse made DURING a search is recorded separately, in `searchExpanded`, and is
+	 * honoured over the force-open while that search lasts.
+	 */
+	function groupExpanded(groupId, needle) {
+		if (!needle) return !!state.expandedGroups[groupId];
+		if (Object.prototype.hasOwnProperty.call(state.searchExpanded, groupId)) {
+			return !!state.searchExpanded[groupId];
+		}
+		return true;
+	}
+
+	/** Flip the state `groupExpanded` reads \u2014 the per-search one during a search, the stored one otherwise. */
+	function toggleGroupExpanded(groupId, needle) {
+		if (needle) state.searchExpanded[groupId] = !groupExpanded(groupId, needle);
+		else state.expandedGroups[groupId] = !state.expandedGroups[groupId];
+	}
+
 	function renderGroup(group, needle) {
 		var rules = matchingRules(group, needle);
 		if (needle && !rules.length) return null;
@@ -687,15 +798,10 @@
 		box.setAttribute('data-group', group.id);
 
 		var header = el('div', 'hs-group-header');
-		// A search auto-opens the groups that matched: with a needle typed, hiding the hits behind a
-		// second click would make the search useless. That is a DISPLAY override only \u2014 the stored
-		// expansion state is left alone, so clearing the search restores exactly what the user had
-		// open, and the toggle below flips the stored value rather than this forced one (flipping the
-		// forced value would make the arrow a dead control during a search).
-		var expanded = needle ? true : !!state.expandedGroups[group.id];
+		var expanded = groupExpanded(group.id, needle);
 
 		function toggleExpanded() {
-			state.expandedGroups[group.id] = !state.expandedGroups[group.id];
+			toggleGroupExpanded(group.id, needle);
 			renderRules();
 		}
 
@@ -811,6 +917,10 @@
 		search.value = state.search;
 		search.addEventListener('input', function () {
 			state.search = search.value;
+			// A new query is a new set of matches, so the collapses the user made against the OLD one no
+			// longer describe anything. Dropping them here is what keeps `expandedGroups` — the state a
+			// cleared search restores — untouched by anything that happened during a search.
+			state.searchExpanded = Object.create(null);
 			// Debounced: a one-letter query can match hundreds of rules, and re-rendering on every
 			// keystroke would stutter on mobile.
 			if (searchTimer) clearTimeout(searchTimer);
@@ -863,6 +973,34 @@
 	// Section: Dictionary.
 	// =============================================================================
 
+	function setDictionaryStatus(text, isError) {
+		var node = document.getElementById('hs-dictionary-status');
+		if (!node) return;
+		node.textContent = text || '';
+		node.className = 'hs-status' + (isError ? ' hs-status-error' : '');
+	}
+
+	/**
+	 * Repaint the dictionary section from `state.dictionaryWords`, BY ID.
+	 *
+	 * A save is a seconds-scale round trip (a note read, an L3-gated note write, an atomic external
+	 * file rewrite), and nothing stops the user switching tabs inside it. Writing the reply into the
+	 * `area` / `count` / `save` nodes the save handler closed over put it into DETACHED nodes: the
+	 * re-entered tab still showed the pre-save list, the old count and a blank status, so the word
+	 * looked like it had vanished — and saving again from that stale textarea deleted it for real.
+	 * Every other async writer in this file already re-resolves by id (setRulesStatus,
+	 * setGeneralStatus, setDismissedStatus); this one now does too, so it lands on whatever nodes are
+	 * currently on screen, and harmlessly on none when the tab is elsewhere.
+	 */
+	function paintDictionary() {
+		var area = document.getElementById('hs-dictionary');
+		if (area) area.value = state.dictionaryWords.join('\n');
+		var count = document.getElementById('hs-dictionary-count');
+		if (count) count.textContent = state.dictionaryWords.length + ' words';
+		var save = document.getElementById('hs-save-dictionary');
+		if (save) save.disabled = false;
+	}
+
 	function renderDictionary(root) {
 		var section = el('div', 'hs-section');
 		section.appendChild(
@@ -886,41 +1024,50 @@
 		save.addEventListener('click', function () {
 			// Split, trim, drop empties — and drop repeats. The service normalizes its side anyway, so
 			// leaving duplicates in would not corrupt anything; it would just mean the textarea we
-			// re-render and the word count beside it describe a list the plugin never stored.
+			// re-render and the word count beside it describe a list the plugin never stored. '# '
+			// lines are comments in both dictionary formats and can never be stored as words, so they
+			// are dropped here too rather than reported back as an add that then quietly disappears.
 			var words = [];
 			var lines = area.value.split('\n');
 			for (var i = 0; i < lines.length; i++) {
 				var word = lines[i].trim();
-				if (word && words.indexOf(word) === -1) words.push(word);
+				if (!word || word.indexOf('# ') === 0) continue;
+				if (words.indexOf(word) === -1) words.push(word);
 			}
-			status.textContent = 'Saving…';
-			status.className = 'hs-status';
+			// THE BASELINE: the list this textarea was seeded from, sent with the save so the service
+			// can tell "the user deleted this" from "the dialog never saw it". Without it, a save posts
+			// what is effectively a wholesale replace, and anything that entered the dictionary since
+			// the dialog loaded — a word synced from another device, the 500 words in an external file
+			// just configured on the General tab — reads as an explicit deletion.
+			var baseline = state.dictionaryWords.slice();
+			setDictionaryStatus('Saving…');
 			save.disabled = true;
-			send({ type: 'settings:saveDictionary', words: words })
+			send({ type: 'settings:saveDictionary', words: words, baseline: baseline })
 				.then(function (reply) {
-					save.disabled = false;
 					var adds = (reply && reply.adds) || [];
 					var removes = (reply && reply.removes) || [];
-					state.dictionaryWords = words.slice().sort();
-					area.value = state.dictionaryWords.join('\n');
-					count.textContent = state.dictionaryWords.length + ' words';
+					// The reply carries the reconciled truth, not an echo of what was posted, so the
+					// editor shows what the dictionary actually holds — and the next save's baseline is
+					// that same truth rather than a list already out of date.
+					state.dictionaryWords =
+						reply && reply.words ? reply.words.slice() : words.slice().sort();
+					paintDictionary();
 					if (!adds.length && !removes.length) {
-						status.textContent = 'Saved. Nothing changed.';
+						setDictionaryStatus('Saved. Nothing changed.');
 					} else {
-						status.textContent =
-							'Saved. ' + adds.length + ' added, ' + removes.length + ' removed.';
+						setDictionaryStatus('Saved. ' + adds.length + ' added, ' + removes.length + ' removed.');
 					}
-					status.className = 'hs-status';
 				})
 				.catch(function (error) {
-					save.disabled = false;
-					status.textContent = 'Could not save: ' + error.message;
-					status.className = 'hs-status hs-status-error';
+					var current = document.getElementById('hs-save-dictionary');
+					if (current) current.disabled = false;
+					setDictionaryStatus('Could not save: ' + error.message, true);
 				});
 		});
 		bar.appendChild(save);
 
 		var count = el('span', 'hs-summary');
+		count.id = 'hs-dictionary-count';
 		count.textContent = state.dictionaryWords.length + ' words';
 		bar.appendChild(count);
 		section.appendChild(bar);
@@ -1005,8 +1152,13 @@
 			var legacy = el('div', 'hs-dismissed hs-dismissed-legacy');
 			legacy.id = 'hs-legacy-row';
 			var legacyText = el('div', 'hs-dismissed-text');
+			// "findings", not "dismissals": this is a count of harper ignore hashes, and one Dismiss
+			// routinely produces several of them (the multi-pass loop exists because harper surfaces
+			// overlapping findings on a span one at a time). Unattributed hashes carry no record of how
+			// many dismissals produced them, so the honest unit is the one thing each hash IS — an
+			// ignored finding.
 			legacyText.appendChild(
-				el('span', 'hs-dismissed-rule', state.dismissed.legacyCount + ' legacy dismissals'),
+				el('span', 'hs-dismissed-rule', state.dismissed.legacyCount + ' legacy findings'),
 			);
 			legacyText.appendChild(
 				el('div', 'hs-help', 'Dismissed before Harper started recording what they were. They can only be cleared.'),
@@ -1023,7 +1175,7 @@
 					.then(function (reply) {
 						state.dismissed.legacyCount = 0;
 						renderDismissedList();
-						setDismissedStatus('Cleared ' + ((reply && reply.cleared) || 0) + ' legacy dismissals.');
+						setDismissedStatus('Cleared ' + ((reply && reply.cleared) || 0) + ' legacy findings.');
 					})
 					.catch(function (error) {
 						clearLegacy.disabled = false;
@@ -1052,13 +1204,21 @@
 		clearAll.addEventListener('click', function () {
 			// Inline confirm: the button becomes the question, so there is no modal-inside-a-modal (which
 			// Joplin dialogs handle badly) and no second click needed for the reversible actions.
-			if (!state.confirmClearAll) {
-				state.confirmClearAll = true;
+			//
+			// ARMED-NESS LIVES ON THE NODE, never in `state`. This button is rebuilt from scratch — with
+			// the unarmed label and the plain class — by every render: a tab switch, and the load() that
+			// index.ts triggers before each reopen. A flag in `state` survived that rebuild, so a button
+			// reading "Clear all" could be one click away from destroying every dismissal with no
+			// confirmation ever shown. Worse, navigating away was the ONLY way to back out of the armed
+			// state, so changing your mind was exactly what planted the trap. On the node, arming dies
+			// with the node it was shown on, which makes leaving the tab a real cancel.
+			if (clearAll.getAttribute('data-armed') !== 'true') {
+				clearAll.setAttribute('data-armed', 'true');
 				clearAll.textContent = 'Really clear all?';
 				clearAll.className = 'hs-button hs-button-danger';
 				return;
 			}
-			state.confirmClearAll = false;
+			clearAll.setAttribute('data-armed', 'false');
 			clearAll.textContent = 'Clear all';
 			clearAll.className = 'hs-button';
 			setDismissedStatus('Clearing…');
@@ -1195,6 +1355,9 @@
 				state.settings = snapshot.settings || {};
 				state.defaults = snapshot.defaults || {};
 				state.overrides = {};
+				// The snapshot IS the truth, so nothing queued before it is still unconfirmed: replaying
+				// those edits on top of a later reply would resurrect state this load just superseded.
+				queuedEdits = [];
 				// Copy, not alias: the reply object is a one-shot structured clone and this map is edited
 				// in place on every toggle.
 				var flat = snapshot.flatConfig || {};
