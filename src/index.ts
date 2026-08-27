@@ -598,8 +598,19 @@ async function applyConfiguration(linter: LocalLinter, reason = 'apply-configura
 	// result, so a word deleted on any side stops being accepted by the engine immediately.
 	await importWordsIntoLinter(linter, await reconcileDictionary(reason));
 
-	// Rule overrides on top of defaults.
-	await linter.setLintConfig(parseRuleOverrides());
+	// Rule overrides on top of defaults. GUARDED, like the ignored-lints import below: this runs
+	// inside the memoized `linterPromise`, so a throw here is cached for the whole session — every
+	// lint AND every settings-dialog snapshot would reject forever, with the dialog showing only the
+	// raw harper error and no way to reach the setting that caused it. `parseRuleOverridesJson` now
+	// drops the non-boolean values harper rejects, so this should be unreachable; it stays because
+	// "the engine is unconfigurable" must never mean "the plugin is dead".
+	try {
+		await linter.setLintConfig(parseRuleOverrides());
+	} catch (error) {
+		// eslint-disable-next-line no-console
+		console.warn('[harper] ruleOverrides rejected by the engine; running with defaults:', error);
+		await linter.setLintConfig({});
+	}
 
 	// Ignored lints (persisted between sessions). harper filters these internally on every subsequent
 	// lint once imported, so no host-side filtering is needed.
@@ -761,6 +772,34 @@ function reconcileDictionary(reason: string): Promise<string[]> {
 	return reconcilePromise;
 }
 
+/**
+ * Reconcile in a pass that is guaranteed to have seen everything written BEFORE this call.
+ *
+ * Joining an in-flight pass is right for a POLL or a selection change — they only ask "what is the
+ * dictionary now?". It is wrong for a caller that has just written to the pending buffers, because
+ * that pass snapshotted them before those writes existed: the dictionary editor's save would land in
+ * the buffers, the joined pass would return the pre-save word set, the note would never be written,
+ * and `importWordsIntoLinter` would clear-then-import that stale list — undoing the `importWords` the
+ * save had just done, so the words the dialog reported as saved come straight back as underlines.
+ * Nothing retries it either: the poll returns early unless a side moved.
+ *
+ * So: drain whatever is in flight, then reconcile. A pass that starts while we wait began strictly
+ * after this caller's writes, so joining THAT one is correct.
+ */
+async function reconcileFresh(reason: string): Promise<string[]> {
+	const inFlight = reconcilePromise;
+	if (inFlight) {
+		// runReconcile catches its own errors and never rejects; the guard is belt-and-braces so a
+		// future change there cannot turn a stale-pass wait into a failed save.
+		try {
+			await inFlight;
+		} catch {
+			/* the pass logged it itself */
+		}
+	}
+	return reconcileDictionary(reason);
+}
+
 async function runReconcile(reason: string): Promise<string[]> {
 	try {
 		if (!isMobile() && !cachedLocalWordsPath) cachedLocalWordsPath = await localWordsPath();
@@ -769,15 +808,34 @@ async function runReconcile(reason: string): Promise<string[]> {
 		// exactly what it was in v1.2.0: an additive-only local fallback, outside the merge.
 		const local = readLocalWords();
 
-		const removals = await readPendingRemovals();
 		const note = await readDictionaryNote(); // null when there is no readable note side
 		const file = readExternalFile(); // null on mobile / no path / unreadable
+
+		// BOTH PENDING BUFFERS ARE SNAPSHOTTED HERE, TOGETHER, and the pair is made disjoint before
+		// anything reads it.
+		//
+		// `addPendingWord`/`addPendingRemoval` keep the two buffers disjoint at WRITE time — but that is
+		// a write-time invariant only. A pass that reads them at two different instants (this one used
+		// to take `removals` two awaits earlier, with the note `data.get` in between) can observe a pair
+		// that was never simultaneously true, and mergeDictionary then applies removals-beat-additions
+		// to it: a word re-added by "Add to dictionary" mid-pass was cancelled by the very removal it
+		// had just superseded, left out of the note, and then retired from BOTH buffers — permanent loss
+		// of a word whose underline the user had just watched clear.
+		//
+		// An overlap is resolved in favour of the ADDITION, and the removal stays in its buffer: this
+		// pass does not consume it, so `retirePendingEntries` cannot drop it and the next pass — reading
+		// a pair that has settled — applies it. This direction costs at worst one deferred deletion;
+		// the other direction is unrecoverable.
+		const pending = await readPendingWords();
+		const removalsRaw = await readPendingRemovals();
+		const pendingSet = new Set(pending);
+		const removals = removalsRaw.filter((w) => !pendingSet.has(w));
+
 		if (note === null && file === null) {
 			// Nothing durable to reconcile against: keep buffering (exactly as v1.2.0 did) and feed the
 			// engine the local fallback plus whatever is in the pending buffer.
-			const pendingOnly = await readPendingWords();
 			const removed = new Set(removals);
-			lastEngineWords = [...new Set([...pendingOnly, ...local])].filter((w) => !removed.has(w));
+			lastEngineWords = [...new Set([...pending, ...local])].filter((w) => !removed.has(w));
 			// A removal is only DONE once the sides that could resurrect the word have absorbed it.
 			// With no durable side CONFIGURED there is nothing left to absorb it — persistRemovedWord
 			// already pruned the desktop-local fallback — so the buffer can be retired here. But when a
@@ -785,14 +843,14 @@ async function runReconcile(reason: string): Promise<string[]> {
 			// buffer must survive: clearing it would let that side put the word back when it returns.
 			const anyDurableSideConfigured = !!cfg.dictionaryNoteId || (!isMobile() && !!cfg.dictionaryPath);
 			if (!anyDurableSideConfigured) {
-				// Only the removals THIS pass read are retired: `readPendingWords` above is an await, so a
-				// removal queued since the snapshot has not been applied to anything yet and must survive.
+				// Only the removals THIS pass consumed are retired: a removal queued since the snapshot,
+				// or one this pass set aside as superseded by a pending add, has not been applied to
+				// anything yet and must survive.
 				await retirePendingEntries(PENDING_REMOVALS_KEY, removals, readPendingRemovals);
 			}
 			return lastEngineWords;
 		}
 
-		const pending = await readPendingWords();
 		const base = await readSyncBase();
 		const merged = mergeDictionary({
 			base,
@@ -887,21 +945,27 @@ async function runReconcile(reason: string): Promise<string[]> {
 	}
 }
 
-/** Reconcile, then push the result into the live engine and poke any open editor to re-lint. */
-async function reconcileAndApply(reason: string): Promise<void> {
-	const words = await reconcileDictionary(reason);
-	if (!linterPromise) return; // engine not built yet; its own init will reconcile
+/**
+ * Reconcile, then push the result into the live engine and poke any open editor to re-lint.
+ *
+ * `fresh` is for callers that have just written to the pending buffers and need their own writes
+ * reflected — see reconcileFresh. Returns the reconciled word set so such a caller can report it.
+ */
+async function reconcileAndApply(reason: string, fresh = false): Promise<string[]> {
+	const words = fresh ? await reconcileFresh(reason) : await reconcileDictionary(reason);
+	if (!linterPromise) return words; // engine not built yet; its own init will reconcile
 	let changed = false;
 	try {
 		changed = await importWordsIntoLinter(await linterPromise, words);
 	} catch (error) {
 		// eslint-disable-next-line no-console
 		console.warn('[harper] could not refresh the engine dictionary:', error);
-		return;
+		return words;
 	}
 	// Only poke the editor when the word set actually moved: a selection change or an unchanged poll
 	// must not cost an extra full re-lint.
 	if (changed) await pokeForceLint();
+	return words;
 }
 
 /**
@@ -934,12 +998,18 @@ function rewriteExternalFile(snapshot: FileSnapshot, target: string[]): boolean 
 	// original trailing-newline shape is reproduced exactly rather than doubled.
 	const hadTrailingNewline = snapshot.raw.endsWith('\n');
 	const body = hadTrailingNewline ? snapshot.raw.slice(0, -1) : snapshot.raw;
-	const lines = body.length ? body.split('\n') : [];
+	// The CR of a CRLF file belongs to the line TERMINATOR, not to the line, and `out.join(eol)` puts
+	// a full terminator back — so a kept line that still carried its own CR would end up with two, and
+	// with one more on every later rewrite (`line.replace(/\r$/, '')` strips exactly one). The words
+	// still parse, so nothing surfaces it: the user's own dictionary file, shared with harper-ls and
+	// synced by rclone, just accretes stray CRs and diffs dirty on every device. Stripping here also
+	// revives the `content === snapshot.raw` no-op guard below, which was dead for CRLF files.
+	const lines = body.length ? body.split('\n').map((line) => line.replace(/\r$/, '')) : [];
 
 	const kept: string[] = [];
 	const seen = new Set<string>();
 	for (const line of lines) {
-		const word = line.replace(/\r$/, '').trim();
+		const word = line.trim();
 		const isWordLine = word.length > 0 && !word.startsWith('# ');
 		if (isWordLine) {
 			if (!keep.has(word)) continue; // deleted elsewhere — drop this line
@@ -949,7 +1019,7 @@ function rewriteExternalFile(snapshot: FileSnapshot, target: string[]): boolean 
 			if (seen.has(word)) continue;
 			seen.add(word);
 		}
-		kept.push(line); // comments, blank lines and surviving words stay byte-identical
+		kept.push(line); // comments, blank lines and surviving words keep their content byte-identically
 	}
 	const appended = target.filter((w) => !seen.has(w));
 	const out = [...kept, ...appended];
@@ -1090,13 +1160,19 @@ async function persistAddedWord(word: string): Promise<void> {
 				// still wanted, so a duplicate appended here would survive every future rewrite instead of
 				// being transient. An unreadable/absent file falls through to the append, which creates it.
 				let alreadyThere = false;
+				// The file's dominant line ending, so a word appended to a CRLF dictionary does not
+				// arrive LF-terminated (the rewrite would normalize it later, but a dictionary that only
+				// ever grows never gets rewritten). Defaults to '\n' for a new or unreadable file.
+				let eol = '\n';
 				try {
-					alreadyThere = parseWords(fs.readFileSync(external, 'utf8')).includes(word);
+					const raw: string = fs.readFileSync(external, 'utf8');
+					alreadyThere = parseWords(raw).includes(word);
+					if (raw.includes('\r\n')) eol = '\r\n';
 				} catch {
 					alreadyThere = false;
 				}
 				if (!alreadyThere) {
-					fs.appendFileSync(external, `${word}\n`);
+					fs.appendFileSync(external, `${word}${eol}`);
 					try {
 						lastExternalMtimeMs = fs.statSync(external).mtimeMs;
 					} catch {
@@ -1252,7 +1328,7 @@ async function ignoreFinding(
  * Nothing about the note/file mirroring, the L3 note-write gate or the deletion propagation is
  * re-implemented here — runReconcile still owns all of it.
  */
-async function applyWordEdits(adds: string[], removes: string[]): Promise<void> {
+async function applyWordEdits(adds: string[], removes: string[]): Promise<string[]> {
 	for (const word of adds) {
 		const trimmed = (word || '').trim();
 		if (trimmed) await persistAddedWord(trimmed);
@@ -1273,8 +1349,14 @@ async function applyWordEdits(adds: string[], removes: string[]): Promise<void> 
 	}
 	// One reconcile for the whole batch: merges, writes the sides, and pushes the result to the
 	// engine (clear-then-import, which is how a DELETED word stops being accepted).
-	await reconcileAndApply('dictionary-editor');
+	//
+	// FRESH, not joined: the writes above happened after any pass already in flight took its snapshot
+	// of the pending buffers, so joining that pass would return a word set this save is not in — the
+	// note would go unwritten and the stale clear-then-import would take the just-added words back out
+	// of the engine, while the dialog reported them saved.
+	const words = await reconcileAndApply('dictionary-editor', true);
 	await pokeForceLint();
+	return words;
 }
 
 const settingsService: SettingsService = createSettingsService({
@@ -1872,6 +1954,13 @@ joplin.plugins.register({
 				const linter = await linterPromise;
 				if (external.includes('dialect') && cfg.dialect !== before) {
 					await linter.setDialect(dialectEnum());
+					// setDialect FREES the WASM instance and builds a new one, so every word imported into
+					// the engine went with it. The memo that skips an unchanged re-import has to be
+					// invalidated here or `applyConfiguration` below would compare the reconciled list
+					// against the key from BEFORE the rebuild, find it unchanged, skip the import — and
+					// leave the engine with an EMPTY custom dictionary for the rest of the session, so
+					// every one of the user's own words underlines as a spelling error in every note.
+					importedWordsKey = null;
 				}
 				await applyConfiguration(linter, 'settings-change');
 			} else {

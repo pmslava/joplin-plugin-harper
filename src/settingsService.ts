@@ -78,6 +78,18 @@ export interface SettingsSnapshot {
 	dismissed: DismissedSnapshot;
 }
 
+/** What a dictionary-editor save reports back: what it changed, and the resulting truth. */
+export interface DictionarySaveResult {
+	adds: string[];
+	removes: string[];
+	/**
+	 * The reconciled word list AFTER the save. The dialog re-seeds its textarea and its next
+	 * baseline from this, so a word that arrived while the editor was open shows up instead of
+	 * being silently missing from a list the next save would then read as a deletion.
+	 */
+	words: string[];
+}
+
 export interface SettingsServiceDeps {
 	getLinter(): Promise<LocalLinter>;
 	/** The existing multi-window refresh: bump the config generation, then poke the focused editor. */
@@ -91,8 +103,12 @@ export interface SettingsServiceDeps {
 	dismissedStore: DismissedStore;
 	/** The reconciled word set the engine currently holds. */
 	getEffectiveWords(): Promise<string[]>;
-	/** Route adds/removes through the plugin's existing dictionary buffers + reconcile. */
-	applyWordEdits(adds: string[], removes: string[]): Promise<void>;
+	/**
+	 * Route adds/removes through the plugin's existing dictionary buffers + reconcile, and hand back
+	 * the reconciled word set that resulted — so a save can report the truth rather than echoing the
+	 * list the dialog happened to post.
+	 */
+	applyWordEdits(adds: string[], removes: string[]): Promise<string[]>;
 	/** Accepted `dialect` values, so validation cannot drift from DIALECT_BY_NAME. */
 	dialectNames: string[];
 }
@@ -104,13 +120,23 @@ export interface SettingsServiceDeps {
 /**
  * Parse the `ruleOverrides` setting — the JSON object users have been hand-editing since v1.0.
  * Anything that is not a JSON object returns null so the caller can warn; `''` is a valid empty.
+ *
+ * VALUES ARE TYPE-CHECKED HERE, not just the shape. harper's `setLintConfig` REJECTS a non-boolean
+ * value outright (`{"Spaces": 0}` throws "invalid type: floating point `0.0`, expected a boolean"),
+ * and that call happens inside the memoized linter promise — so one such value, which is perfectly
+ * valid JSON, would poison every lint and every settings-dialog snapshot for the whole session,
+ * against a registered description that promises "Invalid JSON is ignored". `normalizeRuleOverrides`
+ * already has the right rule for the UI's side of the same map, so the shared parse applies it too:
+ * a bad value is DROPPED (the key falls back to "Default"), the good ones keep working.
  */
 export function parseRuleOverridesJson(raw: string): LintConfig | null {
 	const text = (raw || '').trim();
 	if (!text) return {};
 	try {
 		const parsed = JSON.parse(text);
-		if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as LintConfig;
+		if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+			return normalizeRuleOverrides(parsed as Record<string, unknown>);
+		}
 	} catch {
 		/* fall through */
 	}
@@ -125,7 +151,7 @@ export function parseRuleOverridesJson(raw: string): LintConfig | null {
  * the persisted setting has always meant "only what the user explicitly changed". So null/undefined
  * (and any non-boolean that reaches us) are DROPPED rather than stored.
  */
-export function normalizeRuleOverrides(map: Record<string, boolean | null | undefined>): LintConfig {
+export function normalizeRuleOverrides(map: Record<string, unknown>): LintConfig {
 	const out: LintConfig = {};
 	for (const key of Object.keys(map || {})) {
 		const value = map[key];
@@ -136,27 +162,58 @@ export function normalizeRuleOverrides(map: Record<string, boolean | null | unde
 	return out;
 }
 
-/** Sorted, deduped, blank-free — the canonical form for a word list coming out of the editor. */
+/**
+ * Sorted, deduped, blank-free — the canonical form for a word list coming out of the editor.
+ *
+ * '# ' COMMENT LINES ARE DROPPED, exactly as `parseWords` (src/index.ts) drops them on the way in.
+ * Both dictionary formats treat such a line as a comment, so one pasted into the editor can never
+ * become a stored word — and without this it would be reported as an ADD, appended to the user's
+ * external file, appended a SECOND time by the next rewrite (a non-word line never enters that
+ * function's `seen` set), written into the dictionary note, and then dropped again on the next read.
+ * The word silently vanishes from the list while the junk lines accrete permanently.
+ */
 export function normalizeWords(words: readonly string[]): string[] {
 	const set = new Set<string>();
 	for (const raw of words || []) {
 		if (typeof raw !== 'string') continue;
 		const word = raw.trim();
-		if (word) set.add(word);
+		if (!word) continue;
+		if (word.startsWith('# ')) continue;
+		set.add(word);
 	}
 	return [...set].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
-/** The add/remove diff a dictionary-editor save implies, against the current effective list. */
+/**
+ * The add/remove diff a dictionary-editor save implies.
+ *
+ * `baseline` is the list the editor was RENDERED from — the only words the user could actually see
+ * and delete. REMOVALS ARE COMPUTED AGAINST IT, never against the live effective list: anything that
+ * entered the dictionary after the editor was seeded (a word synced in from another device by the
+ * 60 s poll, a 500-word external file the user pointed the plugin at from the General tab, an
+ * add-to-dictionary made in the editor pane) is invisible to the dialog, and reading its absence
+ * from the textarea as a deletion is how a two-word snapshot wipes a 500-word dictionary — through
+ * `pendingRemovals`, whose stated removals beat every concurrent addition by design and propagate to
+ * every synced device.
+ *
+ * ADDITIONS still diff against the live list: an add is idempotent and can never destroy anything.
+ *
+ * A null baseline yields NO removals. A caller that cannot say what it was looking at cannot claim
+ * the user deleted anything; failing closed costs one re-save and cannot lose a word.
+ */
 export function diffWords(
 	current: readonly string[],
 	next: readonly string[],
+	baseline: readonly string[] | null,
 ): { adds: string[]; removes: string[] } {
 	const before = new Set(normalizeWords(current));
 	const after = new Set(normalizeWords(next));
+	const seen = baseline == null ? new Set<string>() : new Set(normalizeWords(baseline));
 	return {
 		adds: [...after].filter((w) => !before.has(w)),
-		removes: [...before].filter((w) => !after.has(w)),
+		// Still in `before` too: a word the baseline listed but the dictionary no longer holds needs no
+		// removal, and queueing one could only cancel someone else's concurrent re-add of it.
+		removes: [...seen].filter((w) => !after.has(w) && before.has(w)),
 	};
 }
 
@@ -205,8 +262,14 @@ const SETTING_VALIDATORS: Record<string, (value: unknown, deps: SettingsServiceD
 	},
 	ruleOverrides: (v) => {
 		if (typeof v !== 'string') throw new Error('ruleOverrides must be a JSON string');
-		if (parseRuleOverridesJson(v) === null) throw new Error('ruleOverrides is not a JSON object');
-		return v;
+		const parsed = parseRuleOverridesJson(v);
+		if (parsed === null) throw new Error('ruleOverrides is not a JSON object');
+		// Store the NORMALIZED map rather than the raw string, so a write through this allowlist cannot
+		// leave a non-boolean value sitting in the setting for the native settings page (or a future
+		// reader) to trip over. An empty map keeps the setting's pristine '' default — the same
+		// "Default = absence of the key" rule writeRuleOverrides follows.
+		const keys = Object.keys(parsed);
+		return keys.length ? JSON.stringify(parsed) : '';
 	},
 };
 
@@ -224,7 +287,7 @@ export interface SettingsService {
 	resetRules(): Promise<LintConfig>;
 	disableAllRules(): Promise<LintConfig>;
 	updateSetting(key: string, value: unknown): Promise<void>;
-	saveDictionaryWords(words: string[]): Promise<{ adds: string[]; removes: string[] }>;
+	saveDictionaryWords(words: string[], baseline: readonly string[] | null): Promise<DictionarySaveResult>;
 	restoreDismissed(id: string): Promise<boolean>;
 	clearDismissedFindings(scope: 'all' | 'legacy'): Promise<number>;
 	/** One dispatcher for the Phase-2 dialog to forward its webview messages into. */
@@ -367,16 +430,20 @@ export function createSettingsService(deps: SettingsServiceDeps): SettingsServic
 			await deps.setSetting(key, validate(value, deps));
 		},
 
-		async saveDictionaryWords(words): Promise<{ adds: string[]; removes: string[] }> {
+		async saveDictionaryWords(words, baseline): Promise<DictionarySaveResult> {
 			// Editor semantics as a DIFF, not a wholesale replace: the adds and removes are then fed
 			// into the same buffers add-to-dictionary uses, so the note/file mirror and its deletion
 			// propagation behave exactly as they do for a single word.
+			//
+			// The posted list is NOT authoritative over the dictionary — only over the words the editor
+			// was seeded with. See diffWords for why removals are computed against `baseline` instead of
+			// against this live read.
 			const current = await deps.getEffectiveWords();
-			const diff = diffWords(current, words);
-			if (diff.adds.length || diff.removes.length) {
-				await deps.applyWordEdits(diff.adds, diff.removes);
+			const diff = diffWords(current, words, baseline);
+			if (!diff.adds.length && !diff.removes.length) {
+				return { ...diff, words: normalizeWords(current) };
 			}
-			return diff;
+			return { ...diff, words: normalizeWords(await deps.applyWordEdits(diff.adds, diff.removes)) };
 		},
 
 		async restoreDismissed(id): Promise<boolean> {
@@ -398,23 +465,33 @@ export function createSettingsService(deps: SettingsServiceDeps): SettingsServic
 		async clearDismissedFindings(scope): Promise<number> {
 			const linter = await deps.getLinter();
 			const raw = await deps.loadIgnoredLintsRaw();
-			const before = extractHashes(raw).length;
+			const entries = await loadDismissed(deps.dismissedStore);
 
 			if (scope === 'all') {
+				// COUNT DISMISSALS, NOT HASHES. One user-visible Dismiss routinely produces several
+				// context hashes — that is exactly what ignoreFinding's multi-pass loop is for, since
+				// harper surfaces overlapping findings on a span one at a time — so returning the hash
+				// count would tell a user who dismissed two things that three were cleared. A side-table
+				// row IS one dismissal; unattributed legacy hashes carry no record of how many dismissals
+				// produced them, so they are counted as the ignored findings they are and reported under
+				// that name by the dialog.
+				const cleared = entries.length + legacyCount(raw, entries);
 				await linter.clearIgnoredLints();
 				await persistIgnoreStateAndPoke(linter);
 				await clearDismissed(deps.dismissedStore);
-				return before;
+				return cleared;
 			}
 
 			// 'legacy': keep every hash the side table accounts for, drop the rest. The entries
-			// themselves are untouched — they still describe live ignores.
-			const entries = await loadDismissed(deps.dismissedStore);
+			// themselves are untouched — they still describe live ignores. The count here is a hash
+			// count by necessity (see above) and the dialog labels it "legacy findings", not
+			// "dismissals".
 			const covered = coveredHashes(entries);
-			const keep = extractHashes(raw).filter((hash) => covered.has(hash));
+			const hashes = extractHashes(raw);
+			const keep = hashes.filter((hash) => covered.has(hash));
 			await rebuildIgnoreState(linter, keep);
 			await persistIgnoreStateAndPoke(linter);
-			return before - keep.length;
+			return hashes.length - keep.length;
 		},
 
 		async handleMessage(message): Promise<unknown> {
@@ -435,7 +512,15 @@ export function createSettingsService(deps: SettingsServiceDeps): SettingsServic
 					await service.updateSetting(String(msg.key), msg.value);
 					return { ok: true };
 				case 'settings:saveDictionary':
-					return { ok: true, ...(await service.saveDictionaryWords(msg.words || [])) };
+					return {
+						ok: true,
+						// A missing/!Array baseline means "the caller cannot say what it was looking at", which
+						// diffWords answers with zero removals rather than with a wholesale replace.
+						...(await service.saveDictionaryWords(
+							Array.isArray(msg.words) ? msg.words : [],
+							Array.isArray(msg.baseline) ? msg.baseline : null,
+						)),
+					};
 				case 'settings:restoreDismissed':
 					return { ok: await service.restoreDismissed(String(msg.id)) };
 				case 'settings:clearDismissed':

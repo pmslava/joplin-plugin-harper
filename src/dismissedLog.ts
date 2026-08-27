@@ -252,6 +252,39 @@ export function withEntryAppended(
 // Store-backed operations.
 // =============================================================================
 
+/**
+ * ONE WRITER AT A TIME, per store.
+ *
+ * Every mutation below is a read-modify-write, and its critical section straddles real suspension
+ * points: on desktop both halves await `joplin.plugins.dataDir()` (which falls through to an
+ * `fs.pathExists` on the threadpool in steady state) and on mobile both are settings-bridge round
+ * trips. Nothing upstream serializes them — Joplin invokes the content-script message handler
+ * directly, with no queue, and the suggestion card fires Dismiss without waiting for the previous one
+ * — so two dismissals close together interleave as "A reads [], B reads [], A writes [A], B writes
+ * [B]". The lost row's hash is still in harper's ignore set, so that dismissal degrades into an
+ * unnameable "legacy" entry that only the destructive bulk clear can remove, and nothing ever heals
+ * it.
+ *
+ * The lock is per store object (a WeakMap, so a store handed out per test run is not kept alive) and
+ * covers the whole read-modify-write, not the individual reads and writes. `loadDismissed` stays
+ * lock-free on purpose: a stale read is harmless, and taking the lock for it would serialize the
+ * snapshot path behind every dismissal for no benefit.
+ */
+const storeLocks = new WeakMap<DismissedStore, Promise<unknown>>();
+
+function withStoreLock<T>(store: DismissedStore, fn: () => Promise<T>): Promise<T> {
+	const previous = storeLocks.get(store) ?? Promise.resolve();
+	// `.then(fn, fn)` rather than `.then(fn)`: a rejected predecessor must not skip this operation and
+	// silently break every later write for the session.
+	const next = previous.then(fn, fn);
+	// The chain itself never stays rejected, for the same reason.
+	storeLocks.set(
+		store,
+		next.catch(() => undefined),
+	);
+	return next;
+}
+
 export async function loadDismissed(store: DismissedStore): Promise<DismissedEntry[]> {
 	let raw = '';
 	try {
@@ -269,14 +302,16 @@ export async function saveDismissed(
 	await store.write(serializeEntries(entries));
 }
 
-/** Record one dismissal. Returns the new table. */
+/** Record one dismissal. Returns the new table. Serialized against every other store mutation. */
 export async function appendDismissed(
 	store: DismissedStore,
 	entry: DismissedEntry,
 ): Promise<DismissedEntry[]> {
-	const next = withEntryAppended(await loadDismissed(store), entry);
-	await saveDismissed(store, next);
-	return next;
+	return withStoreLock(store, async () => {
+		const next = withEntryAppended(await loadDismissed(store), entry);
+		await saveDismissed(store, next);
+		return next;
+	});
 }
 
 /**
@@ -287,15 +322,19 @@ export async function removeDismissed(
 	store: DismissedStore,
 	id: string,
 ): Promise<{ entries: DismissedEntry[]; removed: DismissedEntry | null }> {
-	const entries = await loadDismissed(store);
-	const removed = entries.find((entry) => entry.id === id) ?? null;
-	if (!removed) return { entries, removed: null };
-	const next = entries.filter((entry) => entry.id !== id);
-	await saveDismissed(store, next);
-	return { entries: next, removed };
+	return withStoreLock(store, async () => {
+		const entries = await loadDismissed(store);
+		const removed = entries.find((entry) => entry.id === id) ?? null;
+		if (!removed) return { entries, removed: null };
+		const next = entries.filter((entry) => entry.id !== id);
+		await saveDismissed(store, next);
+		return { entries: next, removed };
+	});
 }
 
 /** Forget the whole side table. Does NOT touch harper's own ignore state — the caller does that. */
 export async function clearDismissed(store: DismissedStore): Promise<void> {
-	await saveDismissed(store, []);
+	// Under the lock too: otherwise a dismissal that read the table before the clear would write its
+	// row back out afterwards, leaving a row whose ignore hashes the clear has already destroyed.
+	await withStoreLock(store, () => saveDismissed(store, []));
 }
