@@ -76,6 +76,10 @@ function makeJoplin(options) {
         timeouts: [],
         // Set to a DialogResult to make the next dialogs.open() return it instead of a cancel.
         dialogResult: null,
+        // Optional awaited hook run at the START of every data.put, before the write is recorded or
+        // applied: `async (noteId, body) => {}`. Lets a test act while a reconcile pass is suspended
+        // mid-write (see the pending-buffer race regressions in run.js).
+        beforeNotePut: null,
     }
 
     const notes = options.notes || {}
@@ -271,6 +275,10 @@ function makeJoplin(options) {
                 throw new Error(`Unexpected data.get: ${pathParts}`)
             },
             put: async (pathParts, _q, body) => {
+                // HARPER: an optional AWAITED hook, set by a test after run(). A note write is the widest
+                // await inside a reconcile pass, so this is where a test injects the concurrent user
+                // action (add-to-dictionary, a queued removal) that the pending-buffer race is about.
+                if (state.beforeNotePut) await state.beforeNotePut(pathParts[1], body)
                 // `fields` keeps the whole PUT body so a test can assert the exact shape (e.g. that a tick
                 // writes a numeric todo_completed); `body` stays the note-body string the older checks read.
                 state.notePuts.push({ id: pathParts[1], body: body.body, fields: body })

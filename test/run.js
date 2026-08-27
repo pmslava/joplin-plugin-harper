@@ -852,6 +852,173 @@ async function main() {
 		});
 	}
 
+	// ---- RECONCILE RACE: entries enqueued MID-PASS must survive the commit ---
+	//
+	// A pass SNAPSHOTS pendingWords / pendingRemovals near its start and only commits several awaits
+	// later (the note read, the L3-gated note write, the file rewrite, the base write). Retiring the
+	// buffers with `setValue(key, [])` at that point — what the code did before — threw away anything
+	// the user queued in between: it was never in the merge, never reached the note or the file, and
+	// its only record was the buffer that just got wiped.
+	//
+	// `beforeNotePut` puts the test INSIDE that window: the hook runs while the reconcile is suspended
+	// on its own data.put, which is strictly after both snapshots and strictly before the commit.
+	{
+		const rnotes = {
+			'race-note': {
+				id: 'race-note',
+				body: '# h\n\nKeepme\nDropme\nDropmelater\n',
+				updated_time: 3,
+			},
+		};
+		const rstate = await run({
+			dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'harper-race-')),
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			// Note only (no file side), so every pass sees the whole picture and commits.
+			initialSettings: { dictionaryNoteId: 'race-note' },
+			notes: rnotes,
+		});
+		const rh = rstate.contentScriptMessageHandlers['harperCm'];
+		// Let the start reconcile finish: a pass that is still in flight would be JOINED rather than
+		// re-run, and the buffers must start from a committed, quiet state.
+		await waitFor(() => (rstate.settings.syncBase || '').includes('Keepme'));
+
+		await test('reconcile race: a word added DURING a pass survives the commit (pendingWords)', async () => {
+			await rh({ type: 'getConfig' }); // editor open => the add is buffered, never written
+			await rh({ type: 'addWord', word: 'Zfirstword' });
+			assert.deepStrictEqual(rstate.settings.pendingWords, ['Zfirstword'], 'precondition: one word queued');
+
+			// One-shot, fired from inside the pass's own note write.
+			let injected = false;
+			rstate.beforeNotePut = async () => {
+				if (injected) return;
+				injected = true;
+				await rh({ type: 'addWord', word: 'Zsecondword' });
+			};
+			const putsBefore = rstate.notePuts.length;
+			await rstate.noteSelectionChangeHandler(); // closes the editor, then reconciles
+			assert.ok(await waitFor(() => rstate.notePuts.length > putsBefore), 'the pass wrote the note');
+			assert.ok(injected, 'the concurrent add really landed inside the pass');
+			rstate.beforeNotePut = null;
+
+			const put = rstate.notePuts[rstate.notePuts.length - 1];
+			assert.ok(/(^|\n)Zfirstword(\n|$)/.test(put.body), 'the snapshotted word reached the note');
+			assert.ok(
+				!/(^|\n)Zsecondword(\n|$)/.test(put.body),
+				'the mid-pass word was not part of THIS merge (it arrived after the snapshot)',
+			);
+			assert.deepStrictEqual(
+				rstate.settings.pendingWords,
+				['Zsecondword'],
+				'the mid-pass word SURVIVED the commit — a clear-all here would have dropped it silently',
+			);
+		});
+
+		await test('reconcile race: the surviving word is merged by the NEXT pass', async () => {
+			const putsBefore = rstate.notePuts.length;
+			await rstate.noteSelectionChangeHandler();
+			assert.ok(await waitFor(() => rstate.notePuts.length > putsBefore), 'the next pass wrote the note');
+			const put = rstate.notePuts[rstate.notePuts.length - 1];
+			assert.ok(/(^|\n)Zsecondword(\n|$)/.test(put.body), 'the survivor reached the note one pass later');
+			assert.ok(/(^|\n)Zfirstword(\n|$)/.test(put.body), 'and the earlier word is still there');
+			assert.deepStrictEqual(rstate.settings.pendingWords, [], 'the buffer is empty once nothing is left queued');
+		});
+
+		await test('reconcile race: a removal queued DURING a pass survives the commit (pendingRemovals)', async () => {
+			// How the dictionary editor's delete half reaches the reconcile (applyWordEdits ->
+			// persistRemovedWord -> addPendingRemoval); written directly here because the settings
+			// dialog is a webview the harness does not mount.
+			await rstate.setSetting('pendingRemovals', ['Dropme']);
+
+			let injected = false;
+			rstate.beforeNotePut = async () => {
+				if (injected) return;
+				injected = true;
+				const queued = rstate.settings.pendingRemovals || [];
+				await rstate.setSetting('pendingRemovals', [...queued, 'Dropmelater']);
+			};
+			const putsBefore = rstate.notePuts.length;
+			await rstate.noteSelectionChangeHandler();
+			assert.ok(await waitFor(() => rstate.notePuts.length > putsBefore), 'the pass wrote the note');
+			assert.ok(injected, 'the concurrent removal really landed inside the pass');
+			rstate.beforeNotePut = null;
+
+			const put = rstate.notePuts[rstate.notePuts.length - 1];
+			assert.ok(!/(^|\n)Dropme(\n|$)/.test(put.body), 'the snapshotted removal was applied to the note');
+			assert.ok(
+				/(^|\n)Dropmelater(\n|$)/.test(put.body),
+				'the mid-pass removal was not part of THIS merge (it arrived after the snapshot)',
+			);
+			assert.deepStrictEqual(
+				rstate.settings.pendingRemovals,
+				['Dropmelater'],
+				'the mid-pass removal SURVIVED the commit',
+			);
+		});
+
+		await test('reconcile race: the surviving removal is applied by the NEXT pass', async () => {
+			const putsBefore = rstate.notePuts.length;
+			await rstate.noteSelectionChangeHandler();
+			assert.ok(await waitFor(() => rstate.notePuts.length > putsBefore), 'the next pass wrote the note');
+			const put = rstate.notePuts[rstate.notePuts.length - 1];
+			assert.ok(!/(^|\n)Dropmelater(\n|$)/.test(put.body), 'the survivor was applied one pass later');
+			assert.deepStrictEqual(rstate.settings.pendingRemovals, [], 'the removals buffer is empty again');
+		});
+
+		await test('reconcile: with nothing enqueued mid-pass, both buffers are emptied exactly as before', async () => {
+			await rh({ type: 'getConfig' });
+			await rh({ type: 'addWord', word: 'Zthirdword' });
+			await rstate.setSetting('pendingRemovals', ['Keepme']);
+			const putsBefore = rstate.notePuts.length;
+			const writesBefore = rstate.settingWrites.length;
+
+			await rstate.noteSelectionChangeHandler();
+			assert.ok(await waitFor(() => rstate.notePuts.length > putsBefore), 'the pass wrote the note');
+
+			const put = rstate.notePuts[rstate.notePuts.length - 1];
+			assert.ok(/(^|\n)Zthirdword(\n|$)/.test(put.body), 'the queued addition landed');
+			assert.ok(!/(^|\n)Keepme(\n|$)/.test(put.body), 'the queued removal landed');
+			assert.deepStrictEqual(rstate.settings.pendingWords, [], 'pendingWords fully retired');
+			assert.deepStrictEqual(rstate.settings.pendingRemovals, [], 'pendingRemovals fully retired');
+			// Still ONE settings write per buffer: retiring re-reads the buffer, it does not re-write it
+			// per entry, and an unchanged buffer is not written at all.
+			const writes = rstate.settingWrites.slice(writesBefore);
+			assert.strictEqual(
+				writes.filter((w) => w.key === 'pendingWords').length,
+				1,
+				'exactly one pendingWords write on the commit path',
+			);
+			assert.strictEqual(
+				writes.filter((w) => w.key === 'pendingRemovals').length,
+				1,
+				'exactly one pendingRemovals write on the commit path',
+			);
+		});
+
+		await test('reconcile: a pass that cannot commit leaves both buffers untouched', async () => {
+			// The abort path: an editor is open, so the note write is deferred (L3) and the pass does not
+			// commit. Nothing may be retired — the entries have reached no durable side.
+			await rh({ type: 'getConfig' }); // editorOpen = true
+			await rh({ type: 'addWord', word: 'Zfourthword' });
+			await rstate.setSetting('pendingRemovals', ['Zthirdword']);
+			const putsBefore = rstate.notePuts.length;
+			const baseBefore = rstate.settings.syncBase;
+
+			await rh({ type: 'lint', text: 'Zfourthword alone.' }); // any activity; no reconcile trigger
+			const pollTimer = rstate.intervals.find((i) => i.ms === 60000 && !i.cleared);
+			assert.ok(pollTimer, 'the 60s dictionary poll is armed');
+			rstate.notes['race-note'].updated_time = 9999; // force the poll to reconcile
+			await pollTimer.fn();
+			await waitFor(() => false, 200); // let the async pass settle
+
+			assert.strictEqual(rstate.notePuts.length, putsBefore, 'L3: no note write while the editor is open');
+			assert.strictEqual(rstate.settings.syncBase, baseBefore, 'an uncommitted pass does not advance the base');
+			assert.deepStrictEqual(rstate.settings.pendingWords, ['Zfourthword'], 'pendingWords untouched');
+			assert.deepStrictEqual(rstate.settings.pendingRemovals, ['Zthirdword'], 'pendingRemovals untouched');
+		});
+	}
+
 	// ---- desktop NOTE<->FILE MIRROR convergence, no ping-pong ----------------
 	{
 		const mirrorDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-mirror-'));
