@@ -95,6 +95,17 @@ function makeJoplin(options) {
         // applied: `async (noteId, body) => {}`. Lets a test act while a reconcile pass is suspended
         // mid-write (see the pending-buffer race regressions in run.js).
         beforeNotePut: null,
+        // The same idea one stage EARLIER: an awaited hook at the start of every single-note data.get,
+        // `async (noteId, query) => {}`. A reconcile pass reads the dictionary note long before it
+        // writes anything, and the buffer snapshots straddle that read — so the window that a
+        // beforeNotePut injection is already past is only reachable from here.
+        beforeNoteGet: null,
+        // An awaited hook run once a settings.setValue is VISIBLE but before the onChange handlers:
+        // `async (key, value) => {}`. The dictionary editor's save spends its whole duration in
+        // per-word settings writes, so this is where a test can start a COMPETING reconcile partway
+        // through one — a pass that has read the buffers as they stood after some of the words but
+        // before the rest.
+        afterSettingWrite: null,
     }
 
     const notes = options.notes || {}
@@ -181,6 +192,7 @@ function makeJoplin(options) {
             setValue: async (key, value) => {
                 state.settingWrites.push({ key, value })
                 settings[key] = value
+                if (state.afterSettingWrite) await state.afterSettingWrite(key, value)
                 for (const handler of state.settingHandlers) await handler({ keys: [key] })
             },
             onChange: async (handler) => { state.settingHandlers.push(handler) },
@@ -294,6 +306,7 @@ function makeJoplin(options) {
                 if (pathParts[0] === 'notes') {
                     // Bare ['notes'] is the search field's "recent notes" suggestion fetch.
                     if (pathParts.length === 1) return { items: options.recentNotes || [], has_more: false }
+                    if (state.beforeNoteGet) await state.beforeNoteGet(pathParts[1], query)
                     const note = notes[pathParts[1]]
                     if (!note) throw new Error('Not Found')
                     // ['notes', id, 'tags'] lists the tags currently on a note (tag picker).

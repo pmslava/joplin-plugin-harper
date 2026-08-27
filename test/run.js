@@ -441,19 +441,31 @@ async function main() {
 	// can exercise the ONE shape harper 2.7.0 happens to emit), the functions are lifted out by source
 	// and driven against the shapes harper's own types permit but its current release never produces:
 	// nested groups, OneOfMany, and rules missing from the tree.
-	function extractDialogFunctions(names, preamble, extraExports) {
+	// `args` are passed straight through to the generated function, so a preamble can reach them as
+	// arguments[0], arguments[1], ... — how a test injects its own `document` / `send` / promise gate
+	// into the lifted code without the source knowing anything about tests.
+	// `optional` names are lifted when present and silently skipped when not. That is what lets a
+	// regression test for a fix that INTRODUCED a helper still run against the pre-fix source and fail
+	// on its own assertion — the thing it is meant to prove — rather than on "function not found".
+	function extractDialogFunctions(names, preamble, extraExports, args, optional) {
 		const source = fs.readFileSync(path.join(REPO_ROOT, 'src', 'settingsDialog.js'), 'utf8');
 		const parts = [];
-		for (const name of names) {
-			// Top-level functions in the IIFE are indented one tab, so their closing brace is the first
-			// "\n\t}" — nested helpers close at "\n\t\t}" and cannot terminate the match early.
+		// Top-level functions in the IIFE are indented one tab, so their closing brace is the first
+		// "\n\t}" — nested helpers close at "\n\t\t}" and cannot terminate the match early.
+		const lift = (name) => {
 			const match = source.match(new RegExp(`\\n\\tfunction ${name}\\([\\s\\S]*?\\n\\t\\}`));
-			assert.ok(match, `found ${name}() in src/settingsDialog.js`);
+			if (!match) return false;
 			parts.push(match[0]);
-		}
-		const exported = names.concat(extraExports || []);
+			return true;
+		};
+		for (const name of names) assert.ok(lift(name), `found ${name}() in src/settingsDialog.js`);
+		const alsoFound = (optional || []).filter(lift);
+		const exported = names.concat(alsoFound, extraExports || []);
 		// eslint-disable-next-line no-new-func
-		return new Function(`${preamble || ''}\n${parts.join('\n')}\nreturn { ${exported.join(', ')} };`)();
+		const build = new Function(
+			`${preamble || ''}\n${parts.join('\n')}\nreturn { ${exported.join(', ')} };`,
+		);
+		return build(...(args || []));
 	}
 
 	await test('buildGroups: flat harper shape -> one display group per Group node, rules in tree order', () => {
@@ -586,6 +598,401 @@ async function main() {
 
 		fake.overrides.B = true;
 		assert.strictEqual(groupState(group), 'mixed', 'disagreeing children => mixed');
+	});
+
+	// ---- the dialog's async writers -----------------------------------------
+	// Three of the dialog's bugs were about WHERE state lives across an await: a confirm flag in the
+	// module state that outlived the button it armed, a save that wrote its reply into nodes a tab
+	// switch had detached, and rule payloads frozen before the reply that superseded them. None of
+	// that is reachable through buildGroups-style pure lifting, and all of it is a few hundred
+	// milliseconds of real user behaviour — so the render functions are lifted the same way and run
+	// against a tiny DOM stand-in. Enough of a DOM to be honest about node identity and event
+	// dispatch; deliberately no more.
+	function makeFakeDom() {
+		function createElement(tag) {
+			return {
+				tagName: String(tag).toUpperCase(),
+				className: '',
+				textContent: '',
+				value: '',
+				id: '',
+				type: '',
+				title: '',
+				disabled: false,
+				spellcheck: true,
+				children: [],
+				parentNode: null,
+				attributes: {},
+				listeners: {},
+				get firstChild() {
+					return this.children[0] || null;
+				},
+				appendChild(child) {
+					child.parentNode = this;
+					this.children.push(child);
+					return child;
+				},
+				removeChild(child) {
+					this.children = this.children.filter((c) => c !== child);
+					child.parentNode = null;
+					return child;
+				},
+				insertBefore(child, before) {
+					const at = this.children.indexOf(before);
+					this.children.splice(at < 0 ? 0 : at, 0, child);
+					child.parentNode = this;
+					return child;
+				},
+				setAttribute(name, value) {
+					this.attributes[name] = String(value);
+				},
+				getAttribute(name) {
+					return Object.prototype.hasOwnProperty.call(this.attributes, name)
+						? this.attributes[name]
+						: null;
+				},
+				addEventListener(type, fn) {
+					(this.listeners[type] = this.listeners[type] || []).push(fn);
+				},
+				querySelector() {
+					return null;
+				},
+				/** Dispatch to this node's own listeners — no bubbling; nothing here relies on it. */
+				fire(type, event) {
+					for (const fn of this.listeners[type] || []) fn(event || {});
+				},
+			};
+		}
+		function walk(node, visit) {
+			if (!node) return null;
+			if (visit(node)) return node;
+			for (const child of node.children) {
+				const hit = walk(child, visit);
+				if (hit) return hit;
+			}
+			return null;
+		}
+		const document = {
+			root: null, // the test sets this to whatever it is rendering into
+			createElement,
+			getElementById(id) {
+				return walk(document.root, (n) => n.id === id);
+			},
+			/** Test convenience: every node carrying a class, for counting rendered rows. */
+			byClass(className) {
+				const out = [];
+				walk(document.root, (n) => {
+					if (String(n.className).split(' ').includes(className)) out.push(n);
+					return false;
+				});
+				return out;
+			},
+		};
+		return document;
+	}
+
+	/** Resolve every already-queued microtask/turn, so a lifted async handler can run to its next await. */
+	const settle = async (turns = 6) => {
+		for (let i = 0; i < turns; i++) await Promise.resolve();
+	};
+
+	await test('"Clear all" arming lives on the BUTTON, so a tab switch cannot leave it armed and invisible', async () => {
+		const document = makeFakeDom();
+		const sent = [];
+		const lifted = extractDialogFunctions(
+			['el', 'clear', 'formatDate', 'setDismissedStatus', 'renderDismissedList', 'renderDismissed'],
+			`var document = arguments[0];
+			 var sent = arguments[1];
+			 var state = { dismissed: { entries: [], legacyCount: 0 } };
+			 function send(message) { sent.push(message); return Promise.resolve({ ok: true, cleared: 1 }); }`,
+			['state'],
+			[document, sent],
+		);
+		lifted.state.dismissed = {
+			entries: [
+				{ id: '7', hashes: ['7'], ruleName: 'ModalOf', problemText: 'should of', dismissedAt: '2026-01-01T10:00:00.000Z' },
+			],
+			legacyCount: 0,
+		};
+
+		const root = document.createElement('div');
+		document.root = root;
+		lifted.renderDismissed(root);
+
+		// One click ARMS — it must not clear anything.
+		const armed = document.getElementById('hs-clear-all');
+		armed.fire('click');
+		assert.strictEqual(armed.textContent, 'Really clear all?', 'the first click asks for confirmation');
+		assert.deepStrictEqual(sent, [], 'and sends nothing');
+
+		// The user changes their mind and leaves the tab, which is the ONLY way to back out (clicking
+		// the armed button again confirms). renderTabBody discards the section and rebuilds it.
+		lifted.clear(root);
+		lifted.renderDismissed(root);
+
+		const rebuilt = document.getElementById('hs-clear-all');
+		assert.notStrictEqual(rebuilt, armed, 'the section really was rebuilt from scratch');
+		assert.strictEqual(rebuilt.textContent, 'Clear all', 'and the fresh button looks unarmed');
+
+		// ...so it must BE unarmed. With the flag in module state this single click fell straight through
+		// to clearDismissed(scope:'all') — harper's whole ignore set and the entire side table
+		// destroyed, irreversibly, with no confirmation ever shown.
+		rebuilt.fire('click');
+		assert.deepStrictEqual(sent, [], 'a click on a button that reads "Clear all" never clears');
+		assert.strictEqual(rebuilt.textContent, 'Really clear all?', 'it arms, exactly as the first one did');
+
+		// And confirming still works.
+		rebuilt.fire('click');
+		assert.deepStrictEqual(
+			sent,
+			[{ type: 'settings:clearDismissed', scope: 'all' }],
+			'the second click on the armed button does clear',
+		);
+		await settle();
+		assert.strictEqual(
+			document.getElementById('hs-dismissed-status').textContent,
+			'Cleared 1 dismissals.',
+			'and reports the count the service returned',
+		);
+	});
+
+	await test('a dictionary save lands on the CURRENT nodes, not the ones the save started on', async () => {
+		const document = makeFakeDom();
+		const sent = [];
+		let resolveSave = null;
+		const lifted = extractDialogFunctions(
+			['el', 'clear', 'renderDictionary'],
+			`var document = arguments[0];
+			 var sent = arguments[1];
+			 var hold = arguments[2];
+			 var state = { dictionaryWords: [] };
+			 function send(message) { sent.push(message); return hold(); }`,
+			['state'],
+			[document, sent, () => new Promise((resolve) => { resolveSave = resolve; })],
+			['setDictionaryStatus', 'paintDictionary'],
+		);
+		lifted.state.dictionaryWords = ['alpha'];
+
+		const root = document.createElement('div');
+		document.root = root;
+		lifted.renderDictionary(root);
+
+		const firstArea = document.getElementById('hs-dictionary');
+		firstArea.value = 'alpha\nbeta';
+		document.getElementById('hs-save-dictionary').fire('click');
+
+		// The save posts the BASELINE it was rendered from, so the service can tell a deletion from a
+		// word the editor never saw.
+		assert.deepStrictEqual(
+			sent,
+			[{ type: 'settings:saveDictionary', words: ['alpha', 'beta'], baseline: ['alpha'] }],
+			'the posted list and the list the textarea was seeded with both go up',
+		);
+
+		// The round trip is a note read, an L3-gated note write and a file rewrite — seconds, not
+		// milliseconds — and nothing stops an impatient user switching tabs inside it.
+		lifted.clear(root);
+		lifted.renderDictionary(root);
+		const currentArea = document.getElementById('hs-dictionary');
+		assert.notStrictEqual(currentArea, firstArea, 'the re-entered tab built a new textarea');
+
+		resolveSave({ ok: true, adds: ['beta'], removes: [], words: ['alpha', 'beta'] });
+		await settle();
+
+		// Writing into the detached nodes left the re-entered tab showing the PRE-save list, a wrong
+		// count and a blank status — so the word looked like it had vanished, and saving again from
+		// that stale textarea deleted it for real.
+		assert.strictEqual(currentArea.value, 'alpha\nbeta', 'the visible textarea shows the saved list');
+		assert.strictEqual(document.getElementById('hs-dictionary-count').textContent, '2 words');
+		assert.strictEqual(
+			document.getElementById('hs-dictionary-status').textContent,
+			'Saved. 1 added, 0 removed.',
+			'and the visible status says what happened',
+		);
+		assert.strictEqual(
+			document.getElementById('hs-save-dictionary').disabled,
+			false,
+			'the visible Save button is usable again',
+		);
+		assert.deepStrictEqual(
+			lifted.state.dictionaryWords,
+			['alpha', 'beta'],
+			'the next baseline is the service\'s reconciled truth, not an echo of what was posted',
+		);
+	});
+
+	/** The rules-write machinery, with `send` under the test's control. No DOM needed. */
+	function liftRuleWrites() {
+		const sent = [];
+		const resolvers = [];
+		const lifted = extractDialogFunctions(
+			['setRuleState', 'errorText', 'queueRuleWrite', 'pushOverrides', 'describeOverrides', 'setRulesStatus'],
+			`var sent = arguments[0];
+			 var resolvers = arguments[1];
+			 var state = { overrides: {} };
+			 var applyChain = Promise.resolve();
+			 var applyPending = 0;
+			 var queuedEdits = [];
+			 var renders = 0;
+			 var document = { getElementById: function () { return null; } };
+			 function send(message) {
+				sent.push(message);
+				return new Promise(function (resolve, reject) { resolvers.push({ resolve: resolve, reject: reject }); });
+			 }
+			 function renderRules() { renders++; }`,
+			['state'],
+			[sent, resolvers],
+			['copyOverrides', 'withQueuedEdits'],
+		);
+		return { ...lifted, sent, resolvers };
+	}
+
+	await test('rule writes: a toggle made during a slow bulk action does not undo the bulk action', async () => {
+		const rules = liftRuleWrites();
+
+		// 1) "Disable All Rules" — one message, and a slow one: 823 keys stringified, a ~20 KB
+		//    setSetting, an 823-key WASM setLintConfig and a poke.
+		rules.queueRuleWrite(() => ({ type: 'settings:disableAllRules' }), 'Disabling…');
+		await settle();
+		assert.deepStrictEqual(rules.sent, [{ type: 'settings:disableAllRules' }], 'the bulk write went out');
+
+		// 2) The user sets one rule while it is still in flight. The list still reads "Default" for
+		//    everything (nothing repaints until the bulk reply lands), so this is a natural thing to do.
+		rules.setRuleState('Cee', 'on');
+		rules.pushOverrides();
+
+		// 3) The bulk write lands with the authoritative all-false roster.
+		rules.resolvers[0].resolve({ ok: true, overrides: { Aye: false, Bee: false, Cee: false } });
+		await settle();
+
+		// 4) The queued write now goes out. Built from a snapshot taken at CLICK time it carried
+		//    {Cee:true} alone — and since the service REPLACES the stored map wholesale, that silently
+		//    put the other 822 rules back on. It must carry the post-bulk map with the toggle applied.
+		assert.strictEqual(rules.sent.length, 2, 'the queued write followed the bulk one');
+		assert.deepStrictEqual(
+			rules.sent[1],
+			{ type: 'settings:applyRuleOverrides', overrides: { Aye: false, Bee: false, Cee: true } },
+			'the bulk action survives, with the user\'s later toggle on top of it',
+		);
+		assert.deepStrictEqual(
+			rules.state.overrides,
+			{ Aye: false, Bee: false, Cee: true },
+			'and the UI shows exactly that',
+		);
+	});
+
+	await test('rule writes: a toggle made while an earlier toggle is in flight is not dropped', async () => {
+		const rules = liftRuleWrites();
+
+		// Toggle A, then toggle B before A's reply lands — a burst faster than one round trip.
+		rules.setRuleState('Aye', 'off');
+		rules.pushOverrides();
+		await settle();
+		rules.setRuleState('Bee', 'off');
+		rules.pushOverrides();
+
+		// A's reply carries the authoritative map, which cannot know about B.
+		rules.resolvers[0].resolve({ ok: true, overrides: { Aye: false } });
+		await settle();
+
+		// Adopting it wholesale dropped B from the model AND from the UI, so the next payload no longer
+		// carried it and it never reached the setting at all.
+		assert.deepStrictEqual(rules.state.overrides, { Aye: false, Bee: false }, 'B survives A\'s reply');
+		assert.deepStrictEqual(
+			rules.sent[1],
+			{ type: 'settings:applyRuleOverrides', overrides: { Aye: false, Bee: false } },
+			'and B\'s own write carries both',
+		);
+
+		// A third toggle after A's reply has landed keeps everything.
+		rules.setRuleState('Cee', 'on');
+		rules.pushOverrides();
+		rules.resolvers[1].resolve({ ok: true, overrides: { Aye: false, Bee: false } });
+		await settle();
+		assert.deepStrictEqual(
+			rules.sent[2],
+			{ type: 'settings:applyRuleOverrides', overrides: { Aye: false, Bee: false, Cee: true } },
+			'nothing is lost across a burst of writes',
+		);
+		rules.resolvers[2].resolve({ ok: true, overrides: { Aye: false, Bee: false, Cee: true } });
+		await settle();
+		assert.deepStrictEqual(rules.state.overrides, { Aye: false, Bee: false, Cee: true });
+	});
+
+	await test('a group disclosure stays live during a search, and a search never rewrites the stored state', () => {
+		const document = makeFakeDom();
+		const lifted = extractDialogFunctions(
+			[
+				'el',
+				'clear',
+				'makeSelect',
+				'ruleDisplayLabel',
+				'ruleMatches',
+				'matchingRules',
+				'ruleState',
+				'groupState',
+				'defaultLabelFor',
+				'cssEscape',
+				'renderRuleRow',
+				'renderGroup',
+			],
+			`var document = arguments[0];
+			 var state = {
+				overrides: Object.create(null),
+				defaults: { ModalOf: true, Spaces: true },
+				descriptionText: Object.create(null),
+				descriptions: null,
+				expandedGroups: Object.create(null),
+				searchExpanded: Object.create(null),
+				expandedRules: Object.create(null),
+			 };
+			 function renderRules() {}
+			 function setRuleState() {}
+			 function pushOverrides() {}
+			 function refreshGroupHeader() {}
+			 function refreshRulesSummary() {}`,
+			['state'],
+			[document],
+			['groupExpanded', 'toggleGroupExpanded'],
+		);
+		const group = { id: 'Misc', label: 'Miscellaneous', description: '', rules: ['ModalOf', 'Spaces'] };
+		const root = document.createElement('div');
+		document.root = root;
+		const paint = (needle) => {
+			lifted.clear(root);
+			root.appendChild(lifted.renderGroup(group, needle));
+			return {
+				listed: document.byClass('hs-rule-list').length > 0,
+				arrow: document.byClass('hs-disclosure')[0],
+			};
+		};
+
+		lifted.state.expandedGroups.Misc = true; // the user opened "Miscellaneous" before searching
+
+		// A search force-opens the groups it matched: hiding the hits behind another click would make
+		// the search useless.
+		const searching = paint('modal');
+		assert.strictEqual(searching.listed, true, 'the search force-opened the group');
+
+		// Clicking the arrow during that search must DO something. It used to flip only the STORED
+		// value, which the force-open then ignored: nothing moved on screen, while the group silently
+		// became collapsed for after the search — by a click count the UI gave no feedback for.
+		searching.arrow.fire('click');
+		assert.strictEqual(paint('modal').listed, false, 'the arrow collapses the group, visibly');
+		assert.strictEqual(lifted.state.expandedGroups.Misc, true, 'and the STORED state is untouched');
+		document.byClass('hs-disclosure')[0].fire('click');
+		assert.strictEqual(paint('modal').listed, true, 'clicking again re-opens it');
+
+		// Collapse it once more, then clear the search: what comes back is what the user had open
+		// BEFORE the search, not whatever they did to it during one.
+		document.byClass('hs-disclosure')[0].fire('click');
+		lifted.state.searchExpanded = Object.create(null); // what a new query does to the per-search map
+		assert.strictEqual(paint('').listed, true, 'the pre-search expansion is what comes back');
+
+		// And with no search the arrow writes to the stored state, exactly as it always did.
+		document.byClass('hs-disclosure')[0].fire('click');
+		assert.strictEqual(lifted.state.expandedGroups.Misc, false, 'no search => the stored value flips');
+		assert.strictEqual(paint('').listed, false);
 	});
 
 	// ---- config handshake ---------------------------------------------------
@@ -1817,6 +2224,345 @@ async function main() {
 	}
 
 	// =========================================================================
+	// v1.4.0 DICTIONARY EDITOR — a save may only ever delete what the editor SHOWED.
+	// =========================================================================
+	// The editor posts the words it is displaying while the service reads the LIVE effective list, so
+	// the two can differ by anything that arrived in between: a word synced from another device by the
+	// 60 s poll, or — with no race at all — the whole content of an external file the user has just
+	// pointed the plugin at from the General tab, since nothing reloads the dialog's snapshot when a
+	// setting changes. Diffing those two lists directly turns every such word into an explicit
+	// removal, and an explicit removal beats every concurrent addition by design, rewrites the user's
+	// own file (shared with harper-ls, synced by rclone) and propagates to every device. The baseline
+	// the dialog now sends is what separates "the user deleted this" from "the dialog never saw it".
+	{
+		const edDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-editor-'));
+		const edFile = path.join(edDir, 'dict.txt');
+		// The user's own dictionary file: a header comment and 500 words the dialog will never see.
+		const unseen = [];
+		for (let i = 0; i < 500; i++) unseen.push(`Unseenqx${i}`);
+		fs.writeFileSync(edFile, `# my own words\n${unseen.join('\n')}\n`, 'utf8');
+		const edState = await run({
+			dataDir: edDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			// The note side holds the two words the dialog WAS seeded with, and the file side is
+			// configured — exactly the state after "set External dictionary file" on the General tab.
+			initialSettings: { dictionaryPath: edFile, dictionaryNoteId: 'ednote' },
+			notes: { ednote: { id: 'ednote', body: '# h\n\nAlphaqx\nBetaqx\n', updated_time: 100 } },
+		});
+		const edh = edState.contentScriptMessageHandlers['harperCm'];
+		// What the dialog cached at load(), BEFORE the external file was configured: two words.
+		const staleBaseline = ['Alphaqx', 'Betaqx'];
+
+		await test('dictionary editor: saving a stale two-word snapshot does NOT delete 500 unseen words', async () => {
+			assert.ok(
+				await waitFor(() => (edState.settings.syncBase || '').includes('Unseenqx0')),
+				'precondition: the file and note sides converged, so the effective list is 502 words',
+			);
+			const snap = await edh({ type: 'settings:snapshot', includeDescriptions: false });
+			assert.strictEqual(snap.dictionaryWords.length, 502, 'the live list really is 502 words');
+
+			// The user opens the Dictionary tab (rendered from the stale cache) and presses Save without
+			// touching anything. This used to report "0 added, 500 removed".
+			const res = await edh({
+				type: 'settings:saveDictionary',
+				words: staleBaseline,
+				baseline: staleBaseline,
+			});
+			assert.deepStrictEqual(res.removes, [], 'nothing the editor never saw is deleted');
+			assert.deepStrictEqual(res.adds, [], 'and nothing is added');
+
+			const onDisk = fs.readFileSync(edFile, 'utf8');
+			for (const word of ['Unseenqx0', 'Unseenqx250', 'Unseenqx499']) {
+				assert.ok(onDisk.includes(word), `the user's own file still holds ${word}`);
+			}
+			assert.ok(onDisk.startsWith('# my own words'), 'and its header comment is untouched');
+			assert.ok(edState.notes.ednote.body.includes('Unseenqx0'), 'the synced note keeps them too');
+
+			// The reply carries the reconciled TRUTH, so the dialog re-seeds from it and the next save's
+			// baseline is no longer stale — which is what stops this repeating.
+			assert.strictEqual(res.words.length, 502, 'the save reports the real word list back');
+			assert.ok(res.words.includes('Unseenqx0'));
+		});
+
+		await test('dictionary editor: a word the editor DID show is still deletable, and only that word', async () => {
+			const baseline = (await edh({ type: 'settings:snapshot', includeDescriptions: false })).dictionaryWords;
+			assert.ok(baseline.includes('Betaqx'), 'precondition: the fresh snapshot shows Betaqx');
+			const next = baseline.filter((w) => w !== 'Betaqx');
+
+			const res = await edh({ type: 'settings:saveDictionary', words: next, baseline: baseline });
+			assert.deepStrictEqual(res.removes, ['Betaqx'], 'exactly the word the user deleted');
+			assert.deepStrictEqual(res.adds, [], 'nothing else moved');
+
+			assert.ok(await waitFor(() => !fs.readFileSync(edFile, 'utf8').includes('Betaqx')));
+			assert.ok(fs.readFileSync(edFile, 'utf8').includes('Unseenqx0'), 'the other 500 are untouched');
+			const flagged = (await edh({ type: 'lint', text: 'I said Betaqx and Unseenqx0.' })).map((l) => l.problemText);
+			assert.ok(flagged.includes('Betaqx'), 'the deleted word is flagged again');
+			assert.ok(!flagged.includes('Unseenqx0'), 'a word that was never deleted still is not');
+		});
+
+		await test('dictionary editor: a "# " comment line pasted in is not stored and does not pollute the file', async () => {
+			const baseline = (await edh({ type: 'settings:snapshot', includeDescriptions: false })).dictionaryWords;
+			const before = fs.readFileSync(edFile, 'utf8');
+			// The realistic trigger: pasting an existing dictionary file, whose canonical first line is
+			// exactly a "# " comment.
+			const res = await edh({
+				type: 'settings:saveDictionary',
+				words: baseline.concat(['# proper nouns', 'Mikeqx']),
+				baseline: baseline,
+			});
+			assert.deepStrictEqual(res.adds, ['Mikeqx'], 'the comment is not an addition; the real word is');
+			assert.ok(!res.words.includes('# proper nouns'), 'and it is not in the resulting list');
+
+			assert.ok(await waitFor(() => fs.readFileSync(edFile, 'utf8').includes('Mikeqx')));
+			const after = fs.readFileSync(edFile, 'utf8');
+			// It used to be appended by persistAddedWord AND a second time by the rewrite (a non-word
+			// line never enters that function's `seen` set), then dropped on the next read — so the
+			// "added" word silently vanished while two junk lines stayed in the user's file forever.
+			assert.strictEqual(
+				after.split('\n').filter((l) => l.startsWith('# ')).length,
+				before.split('\n').filter((l) => l.startsWith('# ')).length,
+				'the file gained no comment lines at all',
+			);
+			assert.ok(!edState.notes.ednote.body.includes('# proper nouns'), 'and the synced note gained none');
+		});
+	}
+
+	// ---- CRLF dictionaries: a rewrite must not accrete carriage returns ------
+	{
+		const crDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-crlf-'));
+		const crFile = path.join(crDir, 'dict.txt');
+		// A dictionary hand-authored on Windows, which is where Joplin desktop meets CRLF.
+		fs.writeFileSync(crFile, '# words\r\nAlphacr\r\nBetacr\r\n', 'utf8');
+		const crState = await run({
+			dataDir: crDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryPath: crFile },
+		});
+		const crh = crState.contentScriptMessageHandlers['harperCm'];
+
+		await test('CRLF dictionary: a rewrite keeps exactly one CR per line instead of doubling it', async () => {
+			assert.ok(
+				await waitFor(() => (crState.settings.syncBase || '').includes('Alphacr')),
+				'precondition: the file side converged',
+			);
+			// The v1.4.0 removals path makes a rewrite an ordinary, user-initiated operation.
+			const res = await crh({
+				type: 'settings:saveDictionary',
+				words: ['Alphacr'],
+				baseline: ['Alphacr', 'Betacr'],
+			});
+			assert.deepStrictEqual(res.removes, ['Betacr'], 'precondition: the delete really happened');
+			assert.ok(await waitFor(() => !fs.readFileSync(crFile, 'utf8').includes('Betacr')));
+
+			const after = fs.readFileSync(crFile, 'utf8');
+			// `split('\n')` left each line's CR in place and `join('\r\n')` then added a second one, with
+			// one more on every later rewrite. Nothing surfaced it — parseWords trims them all off — so
+			// the user's own rclone-synced file just diffed dirty on every device, forever.
+			assert.ok(!after.includes('\r\r'), `no doubled CR: ${JSON.stringify(after)}`);
+			assert.strictEqual(after, '# words\r\nAlphacr\r\n', 'the surviving lines are byte-exact CRLF');
+
+			// A second rewrite is where the accretion used to compound.
+			await crh({ type: 'addWord', word: 'Gammacr' });
+			assert.ok(await waitFor(() => fs.readFileSync(crFile, 'utf8').includes('Gammacr')));
+			const grown = fs.readFileSync(crFile, 'utf8');
+			assert.ok(!grown.includes('\r\r'), `still no doubled CR after an append: ${JSON.stringify(grown)}`);
+			assert.strictEqual(grown, '# words\r\nAlphacr\r\nGammacr\r\n', 'and the appended word is CRLF too');
+		});
+	}
+
+	// ---- a dictionary save must not be answered by a pass that predates it ---
+	{
+		const jnDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-join-'));
+		const jnState = await run({
+			dataDir: jnDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryNoteId: 'jnote' },
+			notes: { jnote: { id: 'jnote', body: '# h\n\nKeepmeqx\n', updated_time: 100 } },
+		});
+		const jnh = jnState.contentScriptMessageHandlers['harperCm'];
+
+		await test('dictionary editor: a save is not satisfied by a reconcile that started before it', async () => {
+			assert.ok(
+				await waitFor(() => (jnState.settings.syncBase || '').includes('Keepmeqx')),
+				'precondition: converged',
+			);
+			await jnh({ type: 'lint', text: 'warm the engine' }); // so nothing below builds the linter
+
+			// A competing pass — the 60 s poll firing because sync moved the note, or a rule write from
+			// the dialog's own Rules tab reaching applyConfiguration — is started PARTWAY through the
+			// save's per-word loop, so it snapshots the pending buffers holding the first word but not
+			// the second. It is then parked on its note write, which is where a save that merely JOINS
+			// the pass in flight ends up waiting for a result that cannot contain its own edits.
+			let openGate = null;
+			let gateEntered = null;
+			const parked = new Promise((resolve) => {
+				gateEntered = resolve;
+			});
+			const gate = new Promise((resolve) => {
+				openGate = resolve;
+			});
+			jnState.beforeNotePut = async () => {
+				jnState.beforeNotePut = null; // park the competing pass only
+				gateEntered();
+				await gate;
+			};
+			jnState.afterSettingWrite = async (key) => {
+				if (key !== 'pendingWords') return;
+				jnState.afterSettingWrite = null;
+				// Synchronous up to its first await, so the pass IS in flight from here on.
+				void jnState.noteSelectionChangeHandler();
+				await parked;
+			};
+			// Release it shortly after, so the save is not blocked forever either way.
+			setTimeout(() => openGate(), 60);
+
+			const res = await jnh({
+				type: 'settings:saveDictionary',
+				words: ['Keepmeqx', 'Zalphaqx', 'Zbetaqx'],
+				baseline: ['Keepmeqx'],
+			});
+			assert.deepStrictEqual(res.adds, ['Zalphaqx', 'Zbetaqx'], 'the dialog was told both words were saved');
+
+			// Joining the in-flight pass returned a word set the later edits were not in: the note was
+			// written WITHOUT them, the buffer was left holding them with nothing scheduled to retry
+			// (the poll returns early unless a side moved, and the user cannot change note while a modal
+			// dialog is open), and the stale clear-then-import took them back OUT of the live engine —
+			// so the dialog said "Saved. 2 added." while the words were underlined again.
+			assert.ok(
+				jnState.notes.jnote.body.includes('Zbetaqx'),
+				`the note actually holds every saved word: ${JSON.stringify(jnState.notes.jnote.body)}`,
+			);
+			assert.deepStrictEqual(jnState.settings.pendingWords, [], 'and the buffer was retired, not stranded');
+			const flagged = (await jnh({ type: 'lint', text: 'Zbetaqx and Zalphaqx are fine.' })).map((l) => l.problemText);
+			assert.ok(!flagged.includes('Zbetaqx'), 'the live engine still accepts the words it just saved');
+		});
+	}
+
+	// ---- the pending buffers must be read as ONE consistent pair -------------
+	{
+		const pbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-pair-'));
+		const pbState = await run({
+			dataDir: pbDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryNoteId: 'pbnote' },
+			notes: { pbnote: { id: 'pbnote', body: '# h\n\nAlphapb\nKubernetes\n', updated_time: 100 } },
+		});
+		const pbh = pbState.contentScriptMessageHandlers['harperCm'];
+
+		await test('reconcile: re-adding a word mid-pass does not cancel it against its own stale removal', async () => {
+			assert.ok(
+				await waitFor(() => (pbState.settings.syncBase || '').includes('Kubernetes')),
+				'precondition: converged with a base',
+			);
+			await pbh({ type: 'lint', text: 'warm the engine' });
+
+			// A removal is queued and still uncommitted — normal, since the note write is deferred while
+			// an editor is open and the buffer is what carries it until a pass can land it.
+			await pbState.setSetting('pendingRemovals', ['Kubernetes']);
+
+			// The user changes their mind and re-adds the word WHILE a pass is suspended on the note
+			// read. addPendingWord cancels the pending removal and queues the addition — so the two
+			// buffers are disjoint in storage at every instant, but a pass that read them either side of
+			// this window saw the word in BOTH.
+			let injected = false;
+			pbState.beforeNoteGet = async () => {
+				if (injected) return;
+				injected = true;
+				await pbh({ type: 'addWord', word: 'Kubernetes' });
+			};
+			await pbState.noteSelectionChangeHandler();
+			pbState.beforeNoteGet = null;
+
+			// Removals beat additions by design, so reading a non-disjoint pair dropped the word from the
+			// merge, rewrote the note without it, and then retired it from BOTH buffers — gone from the
+			// note, the file, the base and the engine, with the underline the user had just cleared back.
+			assert.ok(
+				pbState.notes.pbnote.body.includes('Kubernetes'),
+				`the note still lists the re-added word: ${JSON.stringify(pbState.notes.pbnote.body)}`,
+			);
+			const snap = await pbh({ type: 'settings:snapshot', includeDescriptions: false });
+			assert.ok(snap.dictionaryWords.includes('Kubernetes'), 'and it is still in the effective list');
+			const flagged = (await pbh({ type: 'lint', text: 'We run Kubernetes here.' })).map((l) => l.problemText);
+			assert.ok(!flagged.includes('Kubernetes'), 'so the engine still accepts it');
+		});
+	}
+
+	// ---- the dialect switch rebuilds the engine, taking the dictionary with it
+	{
+		const dlDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-dialect-'));
+		const dlFile = path.join(dlDir, 'dict.txt');
+		fs.writeFileSync(dlFile, 'Zorblaxqx\n', 'utf8');
+		const dlState = await run({
+			dataDir: dlDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryPath: dlFile },
+		});
+		const dlh = dlState.contentScriptMessageHandlers['harperCm'];
+
+		await test('changing the dialect does not empty the engine dictionary for the rest of the session', async () => {
+			const before = (await dlh({ type: 'lint', text: 'I like Zorblaxqx a lot.' })).map((l) => l.problemText);
+			assert.ok(!before.includes('Zorblaxqx'), 'precondition: the custom word is accepted');
+
+			// Exactly what the General tab's dialect dropdown sends.
+			await dlh({ type: 'settings:updateSetting', key: 'dialect', value: 'British' });
+
+			// setDialect FREES the WASM instance and builds a new one, so every imported word went with
+			// it. applyConfiguration re-hydrates through a memo keyed on the reconciled word list — which
+			// did not change — so the import was skipped and the engine was left holding NOTHING. One
+			// click on a dropdown made every custom word underline as a misspelling in every note.
+			const after = (await dlh({ type: 'lint', text: 'I like Zorblaxqx a lot.' })).map((l) => l.problemText);
+			assert.ok(!after.includes('Zorblaxqx'), 'the custom word is still accepted after the switch');
+			// ...and the engine really was rebuilt, so the test is not passing vacuously.
+			const british = (await dlh({ type: 'lint', text: 'The colour is nice.' })).map((l) => l.problemText);
+			assert.ok(!british.includes('colour'), 'the British dialect really is in force');
+
+			// It stays fixed across later reconciles, which is where the memo used to re-skip the import.
+			await dlh({ type: 'settings:updateSetting', key: 'debounceMs', value: 400 });
+			const later = (await dlh({ type: 'lint', text: 'I like Zorblaxqx a lot.' })).map((l) => l.problemText);
+			assert.ok(!later.includes('Zorblaxqx'), 'and after a further settings change');
+		});
+	}
+
+	// ---- a non-boolean ruleOverrides value must not brick the session --------
+	{
+		const roState = await run({
+			dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'harper-overrides-')),
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			// Valid JSON, so "invalid JSON is ignored" never applied — but harper's setLintConfig throws
+			// on a non-boolean value, inside the memoized linter promise.
+			initialSettings: { ruleOverrides: '{"Spaces": 0, "AnA": false}' },
+		});
+		const roh = roState.contentScriptMessageHandlers['harperCm'];
+
+		await test('a non-boolean ruleOverrides value is dropped, not left to kill every lint for the session', async () => {
+			const lints = await roh({ type: 'lint', text: 'This is an test.' });
+			assert.ok(Array.isArray(lints), 'linting works at all — the rejection is no longer memoized');
+			assert.strictEqual(
+				lints.filter((l) => l.ruleName === 'AnA').length,
+				0,
+				'the VALID override beside it is still honoured',
+			);
+			// The settings dialog awaits the same linter, so it used to show only the raw harper error
+			// with no way to reach the setting that caused it.
+			const snap = await roh({ type: 'settings:snapshot', includeDescriptions: false });
+			assert.deepStrictEqual(snap.flatConfig, { AnA: false }, 'the dialog reads back only the usable overrides');
+			assert.ok(Object.keys(snap.defaults).length > 500, 'and the rules browser has its roster');
+		});
+	}
+
+	// =========================================================================
 	// v1.1.1 COLD-START BUDGET — onStart returns fast; engine + I/O warm in the background.
 	// =========================================================================
 	// Restructure claim: onStart wires only the cheap registrations (settings, content script, command,
@@ -1987,6 +2733,56 @@ async function main() {
 		assert.strictEqual(parsed[0].id, REAL_HASH_A, 'the usable row survives intact');
 	});
 
+	await test('two dismissals landing together both reach the side table (the store serializes them)', async () => {
+		// Every mutation of the table is a read-modify-write whose critical section straddles real
+		// suspension points — `joplin.plugins.dataDir()` falls through to an fs.pathExists on desktop,
+		// and both halves are settings-bridge round trips on mobile. Nothing upstream serializes them:
+		// Joplin calls the content-script message handler directly with no queue, and the suggestion
+		// card fires Dismiss without waiting for the previous one. So they interleave as "A reads [],
+		// B reads [], A writes [A], B writes [B]".
+		const settle = () => new Promise((resolve) => setTimeout(resolve, 2));
+		let raw = '';
+		const slowStore = {
+			async read() {
+				await settle();
+				return raw;
+			},
+			async write(json) {
+				await settle();
+				raw = json;
+			},
+		};
+		const entry = (id) => ({
+			id,
+			hashes: [id],
+			ruleName: 'Spell',
+			problemText: `w${id}`,
+			dismissedAt: '2026-01-01T00:00:00.000Z',
+		});
+
+		await Promise.all([
+			dismissedLog.appendDismissed(slowStore, entry(REAL_HASH_A)),
+			dismissedLog.appendDismissed(slowStore, entry(REAL_HASH_B)),
+		]);
+
+		// The loser's hash is still in harper's ignore set, so a dropped row does not un-dismiss
+		// anything — it degrades the dismissal into an unnameable "legacy" entry that only the
+		// destructive bulk clear can ever remove, and nothing reconciles it back.
+		assert.deepStrictEqual(
+			dismissedLog.parseEntries(raw).map((e) => e.id).sort(),
+			[REAL_HASH_A, REAL_HASH_B].sort(),
+			'both rows survive a concurrent pair of dismissals',
+		);
+
+		// A clear racing a dismissal must not leave a row describing an ignore that is already gone.
+		await Promise.all([
+			dismissedLog.appendDismissed(slowStore, entry(REAL_HASH_A)),
+			dismissedLog.clearDismissed(slowStore),
+		]);
+		const after = dismissedLog.parseEntries(raw);
+		assert.ok(after.length === 0 || after.length === 1, `one ordering or the other, never a torn table: ${raw}`);
+	});
+
 	// ---- pure: settings-service helpers -------------------------------------
 	await test('normalizeRuleOverrides keeps explicit booleans and DROPS null (sparse = only what the user set)', () => {
 		assert.deepStrictEqual(
@@ -1998,11 +2794,76 @@ async function main() {
 	});
 
 	await test('diffWords computes the dictionary editor\'s add/remove sets against the current list', () => {
-		const diff = settingsSvc.diffWords(['alpha', 'beta'], ['beta', 'gamma']);
+		const baseline = ['alpha', 'beta'];
+		const diff = settingsSvc.diffWords(['alpha', 'beta'], ['beta', 'gamma'], baseline);
 		assert.deepStrictEqual(diff.adds, ['gamma'], 'gamma is new');
 		assert.deepStrictEqual(diff.removes, ['alpha'], 'alpha was deleted');
-		const noop = settingsSvc.diffWords(['a', 'b'], ['b', 'a']);
+		const noop = settingsSvc.diffWords(['a', 'b'], ['b', 'a'], ['a', 'b']);
 		assert.deepStrictEqual(noop, { adds: [], removes: [] }, 'reordering is not an edit');
+	});
+
+	// The CRITICAL one. The editor posts the words it is showing, and the service reads the live
+	// effective list — so anything that entered the dictionary since the editor was seeded is in the
+	// live list but not in the post. Diffing those two directly turns every such word into an explicit
+	// removal, and a stated removal beats every concurrent addition by design and propagates to every
+	// synced device. The baseline is what separates "the user deleted this" from "the dialog never
+	// saw it".
+	await test('diffWords: a word the editor never saw is NEVER a removal (stale-snapshot data loss)', () => {
+		// The dialog was seeded with two words; 500 more arrived afterwards (an external file the user
+		// pointed the plugin at from the General tab, or a sync while the dialog sat open).
+		const baseline = ['alpha', 'beta'];
+		const current = ['alpha', 'beta'];
+		for (let i = 0; i < 500; i++) current.push(`unseen${i}`);
+
+		// Saving the unchanged textarea must be a no-op, not a 500-word deletion.
+		const untouched = settingsSvc.diffWords(current, ['alpha', 'beta'], baseline);
+		assert.deepStrictEqual(untouched.removes, [], 'the 500 unseen words are not removals');
+		assert.deepStrictEqual(untouched.adds, [], 'and nothing is added');
+
+		// Editing one word the user CAN see still deletes exactly that one.
+		const edited = settingsSvc.diffWords(current, ['alpha'], baseline);
+		assert.deepStrictEqual(edited.removes, ['beta'], 'a word the editor showed is still deletable');
+		assert.deepStrictEqual(edited.adds, [], 'nothing else moved');
+
+		// No baseline at all => no removals. A caller that cannot say what it was looking at cannot
+		// claim a deletion; adds still work, because an add can never destroy anything.
+		const blind = settingsSvc.diffWords(current, ['alpha', 'zeta'], null);
+		assert.deepStrictEqual(blind.removes, [], 'a baseline-less save can never delete');
+		assert.deepStrictEqual(blind.adds, ['zeta'], 'but it can still add');
+
+		// A baseline word the dictionary no longer holds needs no removal — queueing one could only
+		// cancel someone else's concurrent re-add of it.
+		const gone = settingsSvc.diffWords(['alpha'], ['alpha'], ['alpha', 'beta']);
+		assert.deepStrictEqual(gone.removes, [], 'nothing to remove when it is already absent');
+	});
+
+	await test('normalizeWords drops "# " comment lines, which can never be stored as words', () => {
+		// Trim first, THEN test the prefix — exactly what parseWords (src/index.ts) does on the way in,
+		// so the two ends of the round trip agree on what a comment is. (A lone "# " trims to "#",
+		// which parseWords keeps as a word; matching that is the point.)
+		assert.deepStrictEqual(
+			settingsSvc.normalizeWords(['Alpha', '# proper nouns', '  Beta  ', '#hashtag', '', '# ']),
+			['#', '#hashtag', 'Alpha', 'Beta'],
+			'"# " comments go; a bare "#word" is a legitimate word and stays',
+		);
+		// ...so pasting a dictionary file (whose canonical header IS a "# " line) reports no phantom add.
+		const diff = settingsSvc.diffWords(['Alpha'], ['Alpha', '# proper nouns'], ['Alpha']);
+		assert.deepStrictEqual(diff.adds, [], 'a comment line is not an addition');
+		assert.deepStrictEqual(diff.removes, [], 'and it does not disturb anything else');
+	});
+
+	await test('parseRuleOverridesJson DROPS non-boolean values (harper rejects them and the linter is memoized)', () => {
+		// `{"Spaces": 0}` is valid JSON, so the "invalid JSON is ignored" promise did not cover it —
+		// but harper's setLintConfig throws on it, inside the memoized linter promise, killing every
+		// lint AND the settings dialog for the whole session.
+		assert.deepStrictEqual(
+			settingsSvc.parseRuleOverridesJson('{"Spaces": 0, "AnA": false, "Nope": "yes", "Null": null}'),
+			{ AnA: false },
+			'only real booleans survive; the rest fall back to Default (absence)',
+		);
+		assert.deepStrictEqual(settingsSvc.parseRuleOverridesJson(''), {}, 'empty is still a valid empty map');
+		assert.strictEqual(settingsSvc.parseRuleOverridesJson('this is { not json'), null, 'malformed still reports null');
+		assert.strictEqual(settingsSvc.parseRuleOverridesJson('[1,2]'), null, 'an array is still not an object');
 	});
 
 	await test('ruleDisplayLabel derives a label from the rule name (harper returns label:null for all 823)', () => {
@@ -2291,6 +3152,165 @@ async function main() {
 			const lints = await sh({ type: 'lint', text: 'I beleive this is teh answer.' });
 			assert.ok(Array.isArray(lints) && lints.length >= 1, 'linting still works under the Indian dialect');
 			await sh({ type: 'settings:updateSetting', key: 'dialect', value: 'American' });
+		});
+	}
+
+	// ---- integration: MIXED dismissed state (named rows + unaccounted hashes) --
+	// The two clear scopes only differ when both kinds are present at once, which is exactly the state
+	// of every user upgrading from a build that had no side table. Its own fixture, because the block
+	// above ends with everything wiped.
+	{
+		const mixDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-mixed-'));
+		const mixState = await run({
+			dataDir: mixDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+		});
+		const mixh = mixState.contentScriptMessageHandlers['harperCm'];
+		const mixMeta = path.join(mixDir, 'dismissedMeta.json');
+		const mixIgnore = path.join(mixDir, 'ignoredLints.json');
+		const mixEntries = () => {
+			try {
+				return JSON.parse(fs.readFileSync(mixMeta, 'utf8')).entries;
+			} catch {
+				return [];
+			}
+		};
+		const mixRaw = () => {
+			try {
+				return fs.readFileSync(mixIgnore, 'utf8');
+			} catch {
+				return '';
+			}
+		};
+		const TEH = 'I saw teh cat.';
+		const MODAL = 'We should of gone.';
+		const dismiss = async (text, problemText) => {
+			const lint = (await mixh({ type: 'lint', text })).find((l) => l.problemText === problemText);
+			assert.ok(lint, `precondition: "${problemText}" is flagged`);
+			await mixh({ type: 'ignoreLint', text, start: lint.start, end: lint.end, ruleName: lint.ruleName });
+		};
+
+		await test('clearDismissed("legacy") drops ONLY the unaccounted hashes, keeping every named one ignored', async () => {
+			await dismiss(TEH, 'teh');
+			await dismiss(MODAL, 'should of');
+			const rows = mixEntries();
+			assert.strictEqual(rows.length, 2, 'precondition: two named dismissals');
+			const orphaned = rows.find((e) => e.problemText === 'teh');
+			const named = rows.find((e) => e.problemText === 'should of');
+
+			// A dismissal made before the side table existed: harper still holds its hashes, but nothing
+			// readable names them, so the UI can only offer a bulk clear for them.
+			fs.writeFileSync(mixMeta, dismissedLog.serializeEntries([named]), 'utf8');
+			const snap = await mixh({ type: 'settings:snapshot', includeDescriptions: false });
+			assert.strictEqual(snap.dismissed.entries.length, 1, 'one row still names its hashes');
+			assert.strictEqual(snap.dismissed.legacyCount, orphaned.hashes.length, 'the rest count as legacy');
+
+			const res = await mixh({ type: 'settings:clearDismissed', scope: 'legacy' });
+			assert.strictEqual(res.cleared, orphaned.hashes.length, 'exactly the unaccounted hashes are dropped');
+
+			// The direction is the whole point: inverting the keep-filter would un-suppress every
+			// dismissal the user can see and name, while leaving the un-nameable ones in force forever.
+			assert.ok(
+				(await mixh({ type: 'lint', text: TEH })).some((l) => l.problemText === 'teh'),
+				'the legacy dismissal is gone, so its finding is flagged again',
+			);
+			assert.strictEqual(
+				(await mixh({ type: 'lint', text: MODAL })).filter((l) => l.problemText === 'should of').length,
+				0,
+				'and the NAMED dismissal is still suppressed',
+			);
+			assert.deepStrictEqual(
+				dismissedLog.extractHashes(mixRaw()).slice().sort(),
+				named.hashes.slice().sort(),
+				'harper is holding exactly the named row\'s hashes, byte-identically',
+			);
+			assert.deepStrictEqual(mixEntries().map((e) => e.id), [named.id], 'the row itself is untouched');
+			assert.strictEqual(
+				(await mixh({ type: 'settings:restoreDismissed', id: named.id })).ok,
+				true,
+				'and it is still individually restorable',
+			);
+		});
+
+		await test('clearDismissed("all") reports DISMISSALS, not the several ignore hashes each one made', async () => {
+			await dismiss(TEH, 'teh');
+			await dismiss(MODAL, 'should of');
+			const rows = mixEntries();
+			const legacy = dismissedLog.legacyCount(mixRaw(), rows);
+			const hashes = dismissedLog.extractHashes(mixRaw());
+			// A single user-visible Dismiss ignores every finding on the span, one at a time — that is
+			// what the 20-pass loop is for — so the two units genuinely differ. If harper ever stopped
+			// producing several hashes per dismissal this would fail loudly rather than test nothing.
+			assert.ok(
+				hashes.length > rows.length + legacy,
+				`precondition: at least one dismissal produced several hashes (${hashes.length} hashes for ${rows.length} rows)`,
+			);
+
+			const res = await mixh({ type: 'settings:clearDismissed', scope: 'all' });
+			assert.strictEqual(
+				res.cleared,
+				rows.length + legacy,
+				'the dialog prints this under a list of rows, so it has to count rows',
+			);
+			assert.deepStrictEqual(dismissedLog.extractHashes(mixRaw()), [], 'and everything really was cleared');
+			assert.deepStrictEqual(mixEntries(), [], 'side table included');
+		});
+	}
+
+	// ---- integration: ignoreNonEnglish actually suppresses non-English text ---
+	{
+		const neState = await run({
+			dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'harper-nonenglish-')),
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+		});
+		const neh = neState.contentScriptMessageHandlers['harperCm'];
+		// A multilingual note: a French paragraph that harper's English rules have plenty to say about,
+		// and an English one with two genuine errors that must survive the isolation. The paragraph
+		// break matters — harper isolates by span, and a one-clause English tail inside a French
+		// paragraph is (correctly) isolated away along with it.
+		const MIXED =
+			'Nous avons decide de partir tres tot ce matin, car la route est longue.\n\n' +
+			'The report is finished and I beleive that we should of gone earlier than planned today.';
+
+		await test('ignoreNonEnglish suppresses findings in non-English text (and is not merely a stored value)', async () => {
+			const before = await neh({ type: 'lint', text: MIXED });
+			assert.ok(before.length > 1, `precondition: the mixed note is flagged with the setting off (${before.length})`);
+
+			await neh({ type: 'settings:updateSetting', key: 'ignoreNonEnglish', value: true });
+			const after = await neh({ type: 'lint', text: MIXED });
+			// The setting's ONLY effect is `isolateEnglish` in lintOptions(). Dropping that one property
+			// left the value writing, reading back and echoing in the snapshot perfectly — the feature
+			// simply did nothing, with the whole suite green.
+			assert.ok(
+				after.length < before.length,
+				`the flag has to change what is reported: ${before.length} -> ${after.length}`,
+			);
+			assert.ok(
+				after.some((l) => l.problemText === 'beleive') && after.some((l) => l.problemText === 'should of'),
+				`the English errors are still caught — this isolates, it does not disable: ${JSON.stringify(after.map((l) => l.problemText))}`,
+			);
+			assert.ok(
+				!after.some((l) => l.problemText === 'longue'),
+				'while the French words are no longer reported as misspellings',
+			);
+
+			// The dismiss path must use the SAME options, or the span the user pointed at is not in the
+			// finding set that loop searches and Dismiss silently does nothing while the flag is on.
+			const target = after.find((l) => l.problemText === 'beleive');
+			await neh({ type: 'ignoreLint', text: MIXED, start: target.start, end: target.end, ruleName: target.ruleName });
+			assert.strictEqual(
+				(await neh({ type: 'lint', text: MIXED })).filter((l) => l.problemText === 'beleive').length,
+				0,
+				'dismissing a finding works with ignoreNonEnglish on',
+			);
+
+			await neh({ type: 'settings:updateSetting', key: 'ignoreNonEnglish', value: false });
+			const restored = await neh({ type: 'lint', text: MIXED });
+			assert.ok(restored.length > after.length, 'turning it back off restores the non-English findings');
 		});
 	}
 
