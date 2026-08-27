@@ -17,6 +17,8 @@ import {
 import { slimBinaryInlined } from 'harper.js/slimBinaryInlined';
 import { resolvePlatform, isMobile } from './platform';
 import { mergeDictionary } from './dictionaryMerge';
+import { DismissedStore, appendDismissed, makeEntryId } from './dismissedLog';
+import { SettingsService, createSettingsService, parseRuleOverridesJson } from './settingsService';
 
 const CONTENT_SCRIPT_ID = 'harperCm';
 const SECTION = 'harper';
@@ -337,12 +339,55 @@ async function readPendingWords(): Promise<string[]> {
 	return [];
 }
 
+/**
+ * The pendingRemovals buffer (v1.4.0) — the exact mirror of pendingWords for the dictionary
+ * editor's DELETE half. A removal has to survive until a durable side actually absorbs it, because
+ * the note write is L3-deferred whenever an editor is open; without a buffer, deleting a word while
+ * editing would be silently forgotten and the note would put the word straight back.
+ */
+const PENDING_REMOVALS_KEY = 'pendingRemovals';
+
+async function readPendingRemovals(): Promise<string[]> {
+	try {
+		const v = await joplin.settings.value(PENDING_REMOVALS_KEY);
+		if (Array.isArray(v)) return v.filter((w) => typeof w === 'string' && w.trim().length > 0);
+	} catch {
+		/* unreadable — treat as empty */
+	}
+	return [];
+}
+
+// The two buffers are kept DISJOINT by construction: adding a word cancels a pending removal of it
+// and vice versa. That makes "the user re-added a word whose removal has not landed yet" (and the
+// reverse) resolve to the last thing they actually did, rather than to whichever precedence rule
+// mergeDictionary happens to apply.
 async function addPendingWord(word: string): Promise<void> {
+	const removals = await readPendingRemovals();
+	if (removals.includes(word)) {
+		await joplin.settings.setValue(
+			PENDING_REMOVALS_KEY,
+			removals.filter((w) => w !== word),
+		);
+	}
 	const current = await readPendingWords();
 	if (current.includes(word)) return;
 	current.push(word);
 	// L4: settings writes are safe mid-edit on mobile (device-proven). This never touches a note.
 	await joplin.settings.setValue('pendingWords', current);
+}
+
+async function addPendingRemoval(word: string): Promise<void> {
+	const pending = await readPendingWords();
+	if (pending.includes(word)) {
+		await joplin.settings.setValue(
+			'pendingWords',
+			pending.filter((w) => w !== word),
+		);
+	}
+	const current = await readPendingRemovals();
+	if (current.includes(word)) return;
+	current.push(word);
+	await joplin.settings.setValue(PENDING_REMOVALS_KEY, current);
 }
 
 // -----------------------------------------------------------------------------
@@ -402,13 +447,10 @@ let lastInvalidOverridesRaw: string | null = null;
 
 function parseRuleOverrides(): LintConfig {
 	const raw = (cfg.ruleOverrides || '').trim();
-	if (!raw) return {};
-	try {
-		const obj = JSON.parse(raw);
-		if (obj && typeof obj === 'object' && !Array.isArray(obj)) return obj as LintConfig;
-	} catch {
-		/* fall through to warn */
-	}
+	// One shared parse with the settings service, so what the dialog reads back and what the engine
+	// is configured with can never diverge. The warn-once is this caller's own concern.
+	const parsed = parseRuleOverridesJson(raw);
+	if (parsed) return parsed;
 	if (raw !== lastInvalidOverridesRaw) {
 		// eslint-disable-next-line no-console
 		console.warn(`[harper] ruleOverrides is not a valid JSON object; ignoring: ${raw}`);
@@ -449,6 +491,48 @@ async function saveIgnoredLintsJson(json: string): Promise<void> {
 		console.warn('[harper] could not persist ignored lints');
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Dismissed-findings side table (v1.4.0) — the readable index over the hashes above.
+// -----------------------------------------------------------------------------
+// Storage mirrors the ignoredLints convention exactly: desktop writes a JSON file in dataDir, mobile
+// uses a private String setting (no fs there; settings writes are L4-safe). Plain JSON is safe for
+// THIS file — unlike harper's payload, every hash in it is already a string.
+const DISMISSED_META_KEY = 'dismissedMeta';
+
+async function dismissedMetaPath(): Promise<string> {
+	return joinPath(await joplin.plugins.dataDir(), 'dismissedMeta.json');
+}
+
+const dismissedStore: DismissedStore = {
+	async read(): Promise<string> {
+		if (isMobile()) {
+			try {
+				const v = await joplin.settings.value(DISMISSED_META_KEY);
+				return typeof v === 'string' ? v : '';
+			} catch {
+				return '';
+			}
+		}
+		try {
+			return getFs().readFileSync(await dismissedMetaPath(), 'utf8');
+		} catch {
+			return '';
+		}
+	},
+	async write(json: string): Promise<void> {
+		if (isMobile()) {
+			await joplin.settings.setValue(DISMISSED_META_KEY, json);
+			return;
+		}
+		try {
+			getFs().writeFileSync(await dismissedMetaPath(), json, 'utf8');
+		} catch {
+			// eslint-disable-next-line no-console
+			console.warn('[harper] could not persist the dismissed-findings side table');
+		}
+	},
+};
 
 // -----------------------------------------------------------------------------
 // Linter lifecycle.
@@ -623,8 +707,8 @@ async function importWordsIntoLinter(linter: LocalLinter, words: string[]): Prom
  * (the merge result plus the desktop plugin-local list, which is additive-only — see below).
  *
  * Concurrent callers join the in-flight pass. Reentrancy is impossible by construction: the only
- * settings this writes (`syncBase`, `pendingWords`) are filtered out of the settings onChange
- * handler, so a write from inside a reconcile can never call back into one.
+ * settings this writes (`syncBase`, `pendingWords`, `pendingRemovals`) are filtered out of the
+ * settings onChange handler, so a write from inside a reconcile can never call back into one.
  */
 function reconcileDictionary(reason: string): Promise<string[]> {
 	if (reconcilePromise) return reconcilePromise;
@@ -642,19 +726,36 @@ async function runReconcile(reason: string): Promise<string[]> {
 		// exactly what it was in v1.2.0: an additive-only local fallback, outside the merge.
 		const local = readLocalWords();
 
+		const removals = await readPendingRemovals();
 		const note = await readDictionaryNote(); // null when there is no readable note side
 		const file = readExternalFile(); // null on mobile / no path / unreadable
 		if (note === null && file === null) {
 			// Nothing durable to reconcile against: keep buffering (exactly as v1.2.0 did) and feed the
 			// engine the local fallback plus whatever is in the pending buffer.
 			const pendingOnly = await readPendingWords();
-			lastEngineWords = [...new Set([...pendingOnly, ...local])];
+			const removed = new Set(removals);
+			lastEngineWords = [...new Set([...pendingOnly, ...local])].filter((w) => !removed.has(w));
+			// A removal is only DONE once the sides that could resurrect the word have absorbed it.
+			// With no durable side CONFIGURED there is nothing left to absorb it — persistRemovedWord
+			// already pruned the desktop-local fallback — so the buffer can be retired here. But when a
+			// side IS configured and merely unreadable this pass (unsynced note, offline drive), the
+			// buffer must survive: clearing it would let that side put the word back when it returns.
+			const anyDurableSideConfigured = !!cfg.dictionaryNoteId || (!isMobile() && !!cfg.dictionaryPath);
+			if (removals.length && !anyDurableSideConfigured) {
+				await joplin.settings.setValue(PENDING_REMOVALS_KEY, []);
+			}
 			return lastEngineWords;
 		}
 
 		const pending = await readPendingWords();
 		const base = await readSyncBase();
-		const merged = mergeDictionary({ base, note, file: file ? file.words : null, pending });
+		const merged = mergeDictionary({
+			base,
+			note,
+			file: file ? file.words : null,
+			pending,
+			removals,
+		});
 
 		// PRESENCE GATE (v1.3.0 fix) — the other half of the commit condition, see the COMMIT block.
 		// A side is "present" when it is not configured at all (nothing to be absent) or it read back
@@ -710,6 +811,10 @@ async function runReconcile(reason: string): Promise<string[]> {
 		if (committed) {
 			await writeSyncBase(merged.result);
 			if (pending.length) await joplin.settings.setValue('pendingWords', []);
+			// Removals retire on exactly the same condition as pending additions: every side that
+			// needed writing was written, and every configured side was present. Until then the buffer
+			// is what stops a not-yet-rewritten side from resurrecting the word on the next pass.
+			if (removals.length) await joplin.settings.setValue(PENDING_REMOVALS_KEY, []);
 		}
 
 		if (merged.deleted.length || merged.added.length) {
@@ -720,7 +825,11 @@ async function runReconcile(reason: string): Promise<string[]> {
 			);
 		}
 
-		lastEngineWords = [...new Set([...merged.result, ...local])];
+		// The desktop-local fallback is unioned in, so an explicit removal is subtracted again here:
+		// persistRemovedWord already prunes userWords.txt, and this keeps the engine correct even if
+		// that prune could not be written (read-only dir, missing file).
+		const removed = new Set(removals);
+		lastEngineWords = [...new Set([...merged.result, ...local])].filter((w) => !removed.has(w));
 		return lastEngineWords;
 	} catch (error) {
 		// eslint-disable-next-line no-console
@@ -912,15 +1021,12 @@ async function lintText(text: string): Promise<PlainLint[]> {
 // -----------------------------------------------------------------------------
 // Tooltip-action handlers.
 // -----------------------------------------------------------------------------
-async function addWord(rawWord: string): Promise<void> {
-	const word = (rawWord || '').trim();
-	if (!word) return;
-
-	// 1) Immediate UX (both platforms): into the in-memory set now, so the underline clears at once.
-	const linter = await getLinter();
-	await linter.importWords([word]);
-	importedWordsKey = null; // the engine now holds more than the last reconciled list
-
+/**
+ * PERSIST ONE ADDED WORD — steps 2 and 3 of addWord, factored out so the dictionary editor's bulk
+ * save (settingsService.saveDictionaryWords) goes through the SAME buffer + file handling instead of
+ * reimplementing it. Deliberately does NOT touch the engine or poke: the caller batches those.
+ */
+async function persistAddedWord(word: string): Promise<void> {
 	// 2) Settings buffer (both platforms): the deferred flush folds this into the dictionary note when
 	//    no editor is open (L4-safe settings write; never a note write here).
 	await addPendingWord(word);
@@ -963,6 +1069,44 @@ async function addWord(rawWord: string): Promise<void> {
 			}
 		}
 	}
+}
+
+/**
+ * PERSIST ONE REMOVED WORD — the mirror of persistAddedWord.
+ *
+ * The durable sides (note, external file) are NOT touched here: runReconcile already owns writing
+ * them, with the L3 note-write gate, the mtime-checked atomic file rewrite and the presence gate.
+ * Feeding the removal into the buffer and letting that machinery run is the whole point — the only
+ * thing this has to handle itself is `userWords.txt`, the desktop-local additive fallback, which
+ * sits OUTSIDE the merge and would otherwise keep re-supplying the word forever.
+ */
+async function persistRemovedWord(word: string): Promise<void> {
+	await addPendingRemoval(word);
+	if (isMobile()) return;
+	try {
+		const path = cachedLocalWordsPath || (await localWordsPath());
+		const fs = getFs();
+		const raw: string = fs.readFileSync(path, 'utf8');
+		const kept = raw
+			.split('\n')
+			.filter((line) => line.replace(/\r$/, '').trim() !== word);
+		const next = kept.join('\n');
+		if (next !== raw) fs.writeFileSync(path, next, 'utf8');
+	} catch {
+		// No plugin-local list (the common case once a note or file is configured) — nothing to prune.
+	}
+}
+
+async function addWord(rawWord: string): Promise<void> {
+	const word = (rawWord || '').trim();
+	if (!word) return;
+
+	// 1) Immediate UX (both platforms): into the in-memory set now, so the underline clears at once.
+	const linter = await getLinter();
+	await linter.importWords([word]);
+	importedWordsKey = null; // the engine now holds more than the last reconciled list
+
+	await persistAddedWord(word);
 
 	await pokeForceLint();
 }
@@ -982,34 +1126,121 @@ async function ignoreFinding(
 		const s = lint.span();
 		return s.start === start && s.end === end;
 	};
+	// SIDE-TABLE CAPTURE (v1.4.0): harper only ever stores an opaque context hash, so the readable
+	// record for the "dismissed findings" manager has to be taken HERE, while the Lint handle that
+	// produced it is still alive. Every hash is kept as a decimal STRING — see src/dismissedLog.ts for
+	// why a u64 must never become a JS number. Capturing changes nothing about the loop below: the
+	// same findings are ignored, in the same order, under the same bound.
+	const hashes: string[] = [];
+	let recordedRule = '';
+	let recordedText = '';
 	let ignoredAny = false;
 	for (let i = 0; i < 20; i++) {
 		const organized = await linter.organizedLints(text, lintOptions());
 		let target: Lint | undefined = (organized[ruleName] || []).find(matchSpan);
+		let targetRule = ruleName;
 		if (!target) {
-			for (const lints of Object.values(organized)) {
+			for (const [key, lints] of Object.entries(organized)) {
 				const m = lints.find(matchSpan);
 				if (m) {
 					target = m;
+					targetRule = key;
 					break;
 				}
 			}
 		}
 		if (!target) break;
+		// Before ignoring: the hash identifying this exact finding, and (first pass only) the labels
+		// the manager will list it under — the first target is the finding the user actually clicked.
+		try {
+			hashes.push(String(await linter.contextHash(text, target)));
+		} catch {
+			// No hash for this one: it degrades to a "legacy" dismissal (still ignored, just not
+			// individually restorable). Never a reason to skip the ignore the user asked for.
+		}
+		if (!recordedRule) {
+			recordedRule = targetRule;
+			recordedText = target.get_problem_text();
+		}
 		await linter.ignoreLint(text, target);
 		ignoredAny = true;
 	}
 	if (ignoredAny) {
 		try {
+			// VERBATIM: harper's payload holds u64s that a JSON round trip would corrupt.
 			const json = await linter.exportIgnoredLints();
 			await saveIgnoredLintsJson(json);
 		} catch {
 			// eslint-disable-next-line no-console
 			console.warn('[harper] could not persist ignored lints');
 		}
+		// One entry per user-visible "Dismiss", carrying every hash that dismiss produced. Skipped when
+		// no hash could be computed: an entry with no hashes is neither restorable nor matchable.
+		const id = makeEntryId(hashes);
+		if (id) {
+			try {
+				await appendDismissed(dismissedStore, {
+					id,
+					hashes,
+					ruleName: recordedRule || ruleName,
+					problemText: recordedText,
+					dismissedAt: new Date().toISOString(),
+				});
+			} catch {
+				// eslint-disable-next-line no-console
+				console.warn('[harper] could not record the dismissed-findings entry');
+			}
+		}
 	}
 	await pokeForceLint();
 }
+
+/**
+ * BULK DICTIONARY EDIT — the primitive the settings dialog's word editor saves through.
+ *
+ * It is exactly addWord's persistence, batched, plus its mirror for deletions: both halves land in
+ * the pending buffers and the desktop-local list, and then ONE reconcile writes the durable sides.
+ * Nothing about the note/file mirroring, the L3 note-write gate or the deletion propagation is
+ * re-implemented here — runReconcile still owns all of it.
+ */
+async function applyWordEdits(adds: string[], removes: string[]): Promise<void> {
+	for (const word of adds) {
+		const trimmed = (word || '').trim();
+		if (trimmed) await persistAddedWord(trimmed);
+	}
+	for (const word of removes) {
+		const trimmed = (word || '').trim();
+		if (trimmed) await persistRemovedWord(trimmed);
+	}
+	// Import the additions into the live engine right away so their underlines clear immediately;
+	// removals need the full clear-then-import that reconcileAndApply performs below.
+	if (adds.length && linterPromise) {
+		try {
+			await (await linterPromise).importWords(adds);
+			importedWordsKey = null; // the engine now holds more than the last reconciled list
+		} catch {
+			/* the reconcile below still applies them */
+		}
+	}
+	// One reconcile for the whole batch: merges, writes the sides, and pushes the result to the
+	// engine (clear-then-import, which is how a DELETED word stops being accepted).
+	await reconcileAndApply('dictionary-editor');
+	await pokeForceLint();
+}
+
+const settingsService: SettingsService = createSettingsService({
+	getLinter,
+	pokeForceLint,
+	getSetting: (key: string) => joplin.settings.value(key),
+	setSetting: (key: string, value: any) => joplin.settings.setValue(key, value),
+	isMobile,
+	loadIgnoredLintsRaw: loadIgnoredLintsJson,
+	saveIgnoredLintsRaw: saveIgnoredLintsJson,
+	dismissedStore,
+	getEffectiveWords: () => reconcileDictionary('settings-snapshot'),
+	applyWordEdits,
+	dialectNames: Object.keys(DIALECT_BY_NAME),
+});
 
 async function disableRule(ruleName: string): Promise<void> {
 	if (!ruleName) return;
@@ -1116,6 +1347,14 @@ function pollDictionaryTick(): void {
 // -----------------------------------------------------------------------------
 async function handleMessage(message: IncomingMessage | unknown): Promise<unknown> {
 	if (!message || typeof message !== 'object') return null;
+	// SETTINGS-SERVICE CHANNEL (Phase 1). The 'settings:*' namespace is the whole surface the Phase-2
+	// settings dialog drives. It is answered here as well as (eventually) on the dialog's own
+	// onMessage because the service is deliberately transport-agnostic: one implementation, reachable
+	// from either side, and testable today without any UI.
+	const type = (message as { type?: unknown }).type;
+	if (typeof type === 'string' && type.startsWith('settings:')) {
+		return settingsService.handleMessage(message);
+	}
 	const msg = message as IncomingMessage;
 	switch (msg.type) {
 		case 'getConfig': {
@@ -1271,12 +1510,32 @@ async function registerSettings(): Promise<void> {
 			label: 'Pending dictionary words (internal)',
 			storage: SettingStorage.File,
 		},
+		// v1.4.0: the mirror of pendingWords for the dictionary editor's delete half.
+		[PENDING_REMOVALS_KEY]: {
+			value: [],
+			type: SettingItemType.Array,
+			public: false,
+			section: SECTION,
+			label: 'Pending dictionary removals (internal)',
+			storage: SettingStorage.File,
+		},
 		ignoredLints: {
 			value: '',
 			type: SettingItemType.String,
 			public: false,
 			section: SECTION,
 			label: 'Ignored lints (internal)',
+			storage: SettingStorage.File,
+		},
+		// v1.4.0: the readable side table over the ignore hashes above (mobile's backing store; on
+		// desktop the same JSON lives in dataDir/dismissedMeta.json). Registered on BOTH platforms so
+		// the key always reads back cleanly, and excluded from the onChange reconfigure below.
+		[DISMISSED_META_KEY]: {
+			value: '',
+			type: SettingItemType.String,
+			public: false,
+			section: SECTION,
+			label: 'Dismissed findings index (internal)',
 			storage: SettingStorage.File,
 		},
 		// v1.3.0: the three-way merge base — the word set as it stood after the last successful
@@ -1397,7 +1656,12 @@ joplin.plugins.register({
 			// a reconcile call itself back (and, in the worst case, deadlock on its own in-flight
 			// promise), so they are filtered out here — nothing user-visible changed.
 			const external = (keys || []).filter(
-				(k) => k !== 'pendingWords' && k !== 'ignoredLints' && k !== SYNC_BASE_KEY,
+				(k) =>
+					k !== 'pendingWords' &&
+					k !== 'ignoredLints' &&
+					k !== SYNC_BASE_KEY &&
+					k !== PENDING_REMOVALS_KEY &&
+					k !== DISMISSED_META_KEY,
 			);
 			if (!external.length) return;
 
