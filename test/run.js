@@ -2354,16 +2354,32 @@ async function main() {
 	// The four version fields (package.json, src/manifest.json, and BOTH package-lock fields) must
 	// stay pinned together; a stale lockfile drifted them once in the sibling project. Bump all four
 	// on every release, or the harness (and thus the publish gate) fails.
+	//
+	// Deliberately NO literal version here: package.json is the reference and the other three are
+	// compared against it, so cutting a release never means editing this test. The shape guard below
+	// keeps that strict -- without it, a version field that went missing everywhere would read as
+	// undefined === undefined and pass vacuously.
 	await test('version: package.json, manifest, and both package-lock fields agree', () => {
 		const readJSON = (...rel) => JSON.parse(fs.readFileSync(path.join(REPO_ROOT, ...rel), 'utf8'));
 		const pkg = readJSON('package.json');
 		const manifest = readJSON('src', 'manifest.json');
 		const lock = readJSON('package-lock.json');
-		const expected = '1.3.2';
-		assert.strictEqual(pkg.version, expected, 'package.json version');
-		assert.strictEqual(manifest.version, expected, 'src/manifest.json version');
-		assert.strictEqual(lock.version, expected, 'package-lock.json top-level version');
-		assert.strictEqual(lock.packages[''].version, expected, 'package-lock.json root package entry version');
+
+		const expected = pkg.version;
+		assert.match(
+			String(expected),
+			/^\d+\.\d+\.\d+$/,
+			`package.json version is the reference and must be a semver triple, got ${JSON.stringify(expected)}`,
+		);
+
+		const sources = [
+			['src/manifest.json version', manifest.version],
+			['package-lock.json top-level version', lock.version],
+			['package-lock.json root package entry version', lock.packages[''].version],
+		];
+		for (const [label, actual] of sources) {
+			assert.strictEqual(actual, expected, `${label} must match package.json version ${expected}`);
+		}
 	});
 
 	// ---- measurements (printed, not asserted) -------------------------------
