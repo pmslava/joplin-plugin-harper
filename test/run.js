@@ -2495,6 +2495,124 @@ async function main() {
 		});
 	}
 
+	// ---- every buffer mutation is serialized against every other one ---------
+	// Re-reading the buffer at commit time keeps a word enqueued mid-pass, but the re-read is itself
+	// an await: an add landing between it and the setValue is computed away by a survivor list that
+	// predates it and written straight over. Same for two adds, and for an add crossing a removal of a
+	// different word. Each is a permanent loss of a word the user watched their underline clear for.
+	//
+	// Both tests park one writer between its read and its write — the only way to hold that window
+	// open — and then let a second writer at it. Against a correct implementation the second writer is
+	// made to queue, which is exactly what the assertions check.
+	{
+		const rtDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-retire-'));
+		const rtState = await run({
+			dataDir: rtDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			initialSettings: { dictionaryNoteId: 'rtnote' },
+			notes: { rtnote: { id: 'rtnote', body: '# h\n\nAqx\nKeepqx\n', updated_time: 100 } },
+		});
+		const rth = rtState.contentScriptMessageHandlers['harperCm'];
+
+		/** Park the next `pendingWords` write whose payload is not the one we are watching for. */
+		function parkPendingWrite(unless) {
+			let release = null;
+			let onParked = null;
+			const parked = new Promise((resolve) => {
+				onParked = resolve;
+			});
+			const gate = new Promise((resolve) => {
+				release = resolve;
+			});
+			rtState.beforeSettingWrite = async (key, value) => {
+				if (key !== 'pendingWords') return;
+				if (Array.isArray(value) && value.includes(unless)) return;
+				rtState.beforeSettingWrite = null; // park exactly one write
+				onParked();
+				await gate;
+			};
+			return { parked, release: () => release() };
+		}
+
+		await test('a word added while a commit is retiring the buffer is not written over', async () => {
+			assert.ok(
+				await waitFor(() => (rtState.settings.syncBase || '').includes('Aqx')),
+				'precondition: converged with a base',
+			);
+			await rth({ type: 'lint', text: 'warm the engine' }); // so addWord below builds nothing
+
+			// A word buffered but not yet retired — the ordinary state between an "Add to dictionary"
+			// and the pass that folds it into the note.
+			await rtState.setSetting('pendingWords', ['Aqx']);
+
+			// A reconcile commits and retires ['Aqx']. Park it with its survivor list already computed
+			// (`[]`) but not yet written.
+			const retire = parkPendingWrite('Bqx');
+			const pass = rtState.noteSelectionChangeHandler();
+			await retire.parked;
+
+			// The user adds a word right then. Not awaited: against a correct implementation it CANNOT
+			// finish here, because it has to queue behind the retire holding the gate.
+			const add = rth({ type: 'addWord', word: 'Bqx' });
+			const raced = await waitFor(() => (rtState.settings.pendingWords || []).includes('Bqx'), 300);
+
+			retire.release();
+			await Promise.all([pass, add]);
+
+			// Un-serialized, the add wrote ['Aqx','Bqx'] and the retire then wrote its stale `[]` over
+			// the top: Bqx was gone from the buffer, had never been in that pass's merge, and had never
+			// reached the note or the file — its only record was what just got wiped.
+			assert.deepStrictEqual(
+				rtState.settings.pendingWords,
+				['Bqx'],
+				'the retire drops only what it consumed; the new word survives',
+			);
+
+			// ...and it is durable, not just buffered: the next pass folds it into the synced note.
+			await rtState.noteSelectionChangeHandler();
+			assert.ok(
+				rtState.notes.rtnote.body.includes('Bqx'),
+				`the word reaches the dictionary note: ${JSON.stringify(rtState.notes.rtnote.body)}`,
+			);
+			assert.deepStrictEqual(rtState.settings.pendingWords, [], 'and is retired once it is durable');
+
+			// Asserted last, so the failure this test reports is the lost word rather than the mechanism
+			// that lost it: the add must have been made to WAIT rather than run inside the retire's
+			// read-write window.
+			assert.strictEqual(raced, false, 'the add queued behind the retire instead of racing into it');
+		});
+
+		await test('two words added at once both survive (neither add overwrites the other)', async () => {
+			await rtState.setSetting('pendingWords', []);
+
+			// Park the first add with its own list computed but unwritten.
+			const first = parkPendingWrite('Csecondqx');
+			const addOne = rth({ type: 'addWord', word: 'Cfirstqx' });
+			await first.parked;
+
+			const addTwo = rth({ type: 'addWord', word: 'Csecondqx' });
+			const raced = await waitFor(() => (rtState.settings.pendingWords || []).includes('Csecondqx'), 300);
+
+			first.release();
+			await Promise.all([addOne, addTwo]);
+
+			// Both read the same empty buffer and each wrote its own single-element result, so whichever
+			// landed first was simply erased.
+			assert.deepStrictEqual(
+				(rtState.settings.pendingWords || []).slice().sort(),
+				['Cfirstqx', 'Csecondqx'],
+				'both words are queued',
+			);
+
+			await rtState.noteSelectionChangeHandler();
+			const body = rtState.notes.rtnote.body;
+			assert.ok(body.includes('Cfirstqx') && body.includes('Csecondqx'), `both reach the note: ${JSON.stringify(body)}`);
+			assert.strictEqual(raced, false, 'the second add queued behind the first instead of racing it');
+		});
+	}
+
 	// ---- the dialect switch rebuilds the engine, taking the dictionary with it
 	{
 		const dlDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-dialect-'));

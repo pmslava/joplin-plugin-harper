@@ -363,37 +363,82 @@ async function readPendingRemovals(): Promise<string[]> {
 	return [];
 }
 
+/**
+ * ONE MUTATOR AT A TIME, across BOTH pending buffers.
+ *
+ * Every mutation of `pendingWords` / `pendingRemovals` is a read-modify-write — `addPendingWord`,
+ * `addPendingRemoval` and `retirePendingEntries` — and each one straddles real suspension points:
+ * `joplin.settings.value`/`setValue` are plugin IPC on desktop and a WebView bridge round trip on
+ * mobile. Nothing upstream serializes them. The plugin's own event loop interleaves the editor's
+ * "Add to dictionary", the settings dialog's per-word save loop and a reconcile's commit freely, so
+ * these are ordinary interleavings rather than exotic ones, and each loses a word outright:
+ *
+ *   * a retire reads ['A'], an add appends B and writes ['A','B'], the retire writes [] — B is gone
+ *     from the buffer, was never in that pass's merge, and never reached the note or the file. Its
+ *     only record was the buffer that just got wiped;
+ *   * two adds both read [], then each writes its own single-element result;
+ *   * an add and a removal of DIFFERENT words cross, and one of the two is dropped.
+ *
+ * THE GATE COVERS BOTH KEYS AS ONE UNIT, not a lock per key, because the invariant it protects spans
+ * them: adding a word cancels a pending removal of it and vice versa, so one logical edit writes
+ * both. Per-key locks would have to be held across the pair (a lock-ordering hazard) or would let
+ * the pair go non-disjoint between the two halves of a single edit.
+ *
+ * Critical sections are SHORT by construction — settings I/O only, never a note read, a note write
+ * or a file rewrite, and nothing inside ever re-enters the gate. In particular a reconcile does NOT
+ * hold it across the pass: it takes it only for the commit's retire. The pass's own snapshot of the
+ * two buffers is deliberately left OUTSIDE the gate as well, for two reasons — it is a read, and a
+ * torn pair is already resolved safely there (in favour of the addition, with the removal left
+ * buffered for the next pass); and taking it would couple every seconds-long reconcile to the gate
+ * its own commit later needs.
+ */
+let pendingBufferChain: Promise<unknown> = Promise.resolve();
+
+function withPendingBuffers<T>(fn: () => Promise<T>): Promise<T> {
+	// `.then(fn, fn)`, not `.then(fn)`: a rejected predecessor must never SKIP the next mutation,
+	// which would silently break every buffered word for the rest of the session. The stored chain is
+	// likewise kept un-rejected, so one failed settings write cannot wedge the gate.
+	const next = pendingBufferChain.then(fn, fn);
+	pendingBufferChain = next.catch(() => undefined);
+	return next;
+}
+
 // The two buffers are kept DISJOINT by construction: adding a word cancels a pending removal of it
 // and vice versa. That makes "the user re-added a word whose removal has not landed yet" (and the
 // reverse) resolve to the last thing they actually did, rather than to whichever precedence rule
-// mergeDictionary happens to apply.
+// mergeDictionary happens to apply. Both halves run under the gate above, so the cancel and the
+// enqueue land as one step and no concurrent mutation can be interleaved between them.
 async function addPendingWord(word: string): Promise<void> {
-	const removals = await readPendingRemovals();
-	if (removals.includes(word)) {
-		await joplin.settings.setValue(
-			PENDING_REMOVALS_KEY,
-			removals.filter((w) => w !== word),
-		);
-	}
-	const current = await readPendingWords();
-	if (current.includes(word)) return;
-	current.push(word);
-	// L4: settings writes are safe mid-edit on mobile (device-proven). This never touches a note.
-	await joplin.settings.setValue('pendingWords', current);
+	return withPendingBuffers(async () => {
+		const removals = await readPendingRemovals();
+		if (removals.includes(word)) {
+			await joplin.settings.setValue(
+				PENDING_REMOVALS_KEY,
+				removals.filter((w) => w !== word),
+			);
+		}
+		const current = await readPendingWords();
+		if (current.includes(word)) return;
+		current.push(word);
+		// L4: settings writes are safe mid-edit on mobile (device-proven). This never touches a note.
+		await joplin.settings.setValue('pendingWords', current);
+	});
 }
 
 async function addPendingRemoval(word: string): Promise<void> {
-	const pending = await readPendingWords();
-	if (pending.includes(word)) {
-		await joplin.settings.setValue(
-			'pendingWords',
-			pending.filter((w) => w !== word),
-		);
-	}
-	const current = await readPendingRemovals();
-	if (current.includes(word)) return;
-	current.push(word);
-	await joplin.settings.setValue(PENDING_REMOVALS_KEY, current);
+	return withPendingBuffers(async () => {
+		const pending = await readPendingWords();
+		if (pending.includes(word)) {
+			await joplin.settings.setValue(
+				'pendingWords',
+				pending.filter((w) => w !== word),
+			);
+		}
+		const current = await readPendingRemovals();
+		if (current.includes(word)) return;
+		current.push(word);
+		await joplin.settings.setValue(PENDING_REMOVALS_KEY, current);
+	});
 }
 
 /**
@@ -418,18 +463,27 @@ async function addPendingRemoval(word: string): Promise<void> {
  * forever, since each later pass would consume and re-strand it.
  *
  * No consumed entries, or nothing of them left to drop, means no settings write at all.
+ *
+ * THE RE-READ AND THE WRITE ARE ONE STEP, under the buffer gate. Re-reading is what keeps a mid-pass
+ * edit, but on its own it only narrowed the window rather than closing it: the re-read is itself an
+ * await, so an add landing between it and the `setValue` was computed away by a survivor list that
+ * predates it and written straight over — the same permanent loss this function exists to prevent,
+ * just through a smaller door.
  */
 async function retirePendingEntries(
 	key: string,
 	consumed: string[],
 	read: () => Promise<string[]>,
 ): Promise<void> {
+	// Nothing to retire needs no gate at all — no read, no write, nothing to race with.
 	if (!consumed.length) return;
-	const current = await read();
-	const done = new Set(consumed);
-	const survivors = current.filter((w) => !done.has(w));
-	if (survivors.length === current.length) return; // nothing this pass consumed is still queued
-	await joplin.settings.setValue(key, survivors);
+	return withPendingBuffers(async () => {
+		const current = await read();
+		const done = new Set(consumed);
+		const survivors = current.filter((w) => !done.has(w));
+		if (survivors.length === current.length) return; // nothing this pass consumed is still queued
+		await joplin.settings.setValue(key, survivors);
+	});
 }
 
 // -----------------------------------------------------------------------------

@@ -106,6 +106,11 @@ function makeJoplin(options) {
         // through one — a pass that has read the buffers as they stood after some of the words but
         // before the rest.
         afterSettingWrite: null,
+        // The mirror, run BEFORE the value is applied: `async (key, value) => {}`. Awaiting here parks
+        // a read-modify-write between its read and its write, which is the only way to hold open the
+        // window a buffer clobber needs — and, run against a correct implementation, the way to prove
+        // a competing writer is made to queue behind it rather than racing into that window.
+        beforeSettingWrite: null,
     }
 
     const notes = options.notes || {}
@@ -190,6 +195,7 @@ function makeJoplin(options) {
                 return out
             },
             setValue: async (key, value) => {
+                if (state.beforeSettingWrite) await state.beforeSettingWrite(key, value)
                 state.settingWrites.push({ key, value })
                 settings[key] = value
                 if (state.afterSettingWrite) await state.afterSettingWrite(key, value)
