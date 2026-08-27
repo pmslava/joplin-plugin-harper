@@ -5,6 +5,7 @@ import {
 	Dialect,
 	Lint,
 	LintConfig,
+	LintOptions,
 	SuggestionKind,
 } from 'harper.js';
 // UNIFIED WASM LOADER (v1.1.0): both desktop and mobile now use the SAME inlined-binary path. The WASM
@@ -86,6 +87,8 @@ interface HarperConfig {
 	debounceMs: number;
 	/** 'squiggly' (Harper's default wavy SVG underline) | 'solid' (straight line + tint). */
 	underlineStyle: string;
+	/** Feeds harper's `isolateEnglish` LintOption: skip spans that do not look like English. */
+	ignoreNonEnglish: boolean;
 	dictionaryPath: string;
 	dictionaryNoteId: string;
 	ruleOverrides: string;
@@ -95,16 +98,18 @@ const cfg: HarperConfig = {
 	dialect: 'American',
 	debounceMs: 500,
 	underlineStyle: 'squiggly',
+	ignoreNonEnglish: false,
 	dictionaryPath: '',
 	dictionaryNoteId: '',
 	ruleOverrides: '',
 };
 
-const DIALECT_BY_NAME: Record<string, Dialect> = {
+export const DIALECT_BY_NAME: Record<string, Dialect> = {
 	American: Dialect.American,
 	British: Dialect.British,
 	Australian: Dialect.Australian,
 	Canadian: Dialect.Canadian,
+	Indian: Dialect.Indian,
 };
 
 function dialectEnum(): Dialect {
@@ -121,6 +126,8 @@ async function loadSettings(): Promise<void> {
 	cfg.debounceMs = await read('debounceMs', 500);
 	// Registered on BOTH platforms (pure CSS class choice in the content script — no fs, no note write).
 	cfg.underlineStyle = await read('underlineStyle', 'squiggly');
+	// Registered on BOTH platforms: it only toggles a harper LintOption (no fs, no note write).
+	cfg.ignoreNonEnglish = (await read('ignoreNonEnglish', false)) === true;
 	// dictionaryPath is registered on DESKTOP ONLY (its FilePath UX + fs read are desktop-only; see
 	// registerSettings). Reading an UNREGISTERED key throws 'Unknown key' in real Joplin, so on mobile we
 	// must never call value('dictionaryPath') — skip the read entirely and default to ''. (The old
@@ -850,6 +857,15 @@ function rewriteExternalFile(snapshot: FileSnapshot, target: string[]): boolean 
 // -----------------------------------------------------------------------------
 // Lint serialization.
 // -----------------------------------------------------------------------------
+/**
+ * The LintOptions every lint call in this plugin uses. SINGLE SOURCE — `ignoreLint`'s re-lint loop
+ * must see exactly the same finding set as `lintText`, or the span the user pointed at would not be
+ * found and "Dismiss" would silently do nothing whenever `ignoreNonEnglish` is on.
+ */
+function lintOptions(): LintOptions {
+	return { language: 'markdown', isolateEnglish: cfg.ignoreNonEnglish };
+}
+
 function suggestionKindToString(kind: SuggestionKind): PlainSuggestion['kind'] {
 	switch (kind) {
 		case SuggestionKind.Remove:
@@ -885,7 +901,7 @@ async function lintText(text: string): Promise<PlainLint[]> {
 	const enabled = await joplin.settings.value('enabled');
 	if (enabled === false) return [];
 	const linter = await getLinter();
-	const organized = await linter.organizedLints(text, { language: 'markdown' });
+	const organized = await linter.organizedLints(text, lintOptions());
 	const out: PlainLint[] = [];
 	for (const [ruleName, lints] of Object.entries(organized)) {
 		for (const lint of lints) out.push(lintToPlain(lint, ruleName));
@@ -968,7 +984,7 @@ async function ignoreFinding(
 	};
 	let ignoredAny = false;
 	for (let i = 0; i < 20; i++) {
-		const organized = await linter.organizedLints(text, { language: 'markdown' });
+		const organized = await linter.organizedLints(text, lintOptions());
 		let target: Lint | undefined = (organized[ruleName] || []).find(matchSpan);
 		if (!target) {
 			for (const lints of Object.values(organized)) {
@@ -1176,6 +1192,7 @@ async function registerSettings(): Promise<void> {
 				British: 'British',
 				Australian: 'Australian',
 				Canadian: 'Canadian',
+				Indian: 'Indian',
 			},
 			storage: SettingStorage.File,
 		},
@@ -1207,6 +1224,18 @@ async function registerSettings(): Promise<void> {
 				squiggly: 'Squiggly (default)',
 				solid: 'Solid line',
 			},
+			storage: SettingStorage.File,
+		},
+		// BOTH platforms: this only flips a harper LintOption on each lint call — no fs, no note write.
+		ignoreNonEnglish: {
+			value: false,
+			type: SettingItemType.Bool,
+			public: true,
+			section: SECTION,
+			label: 'Ignore non-English text',
+			description:
+				'Skip text that Harper detects as not English. Useful for multilingual notes. ' +
+				'Off by default.',
 			storage: SettingStorage.File,
 		},
 		dictionaryNoteId: {
