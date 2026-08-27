@@ -253,26 +253,44 @@ export function withEntryAppended(
 // =============================================================================
 
 /**
- * ONE WRITER AT A TIME, per store.
+ * ONE DISMISSAL TRANSACTION AT A TIME, per store.
  *
- * Every mutation below is a read-modify-write, and its critical section straddles real suspension
- * points: on desktop both halves await `joplin.plugins.dataDir()` (which falls through to an
- * `fs.pathExists` on the threadpool in steady state) and on mobile both are settings-bridge round
- * trips. Nothing upstream serializes them — Joplin invokes the content-script message handler
- * directly, with no queue, and the suggestion card fires Dismiss without waiting for the previous one
- * — so two dismissals close together interleave as "A reads [], B reads [], A writes [A], B writes
- * [B]". The lost row's hash is still in harper's ignore set, so that dismissal degrades into an
- * unnameable "legacy" entry that only the destructive bulk clear can remove, and nothing ever heals
- * it.
+ * A dismissal is not one piece of state, it is THREE that only mean anything together: harper's
+ * in-engine ignore set, the persisted payload mirroring it, and the side table that names the rows.
+ * Every operation over them is a read-modify-write whose critical section straddles real suspension
+ * points — `joplin.plugins.dataDir()` falls through to a threadpool `fs.pathExists` on desktop and
+ * both halves are settings-bridge round trips on mobile, with three awaited WASM calls in between —
+ * and nothing upstream serializes them. Joplin invokes the content-script message handler directly
+ * with no queue, the suggestion card fires Dismiss without awaiting the previous one, and the
+ * settings dialog disables only the individual Restore button it was clicked on.
  *
- * The lock is per store object (a WeakMap, so a store handed out per test run is not kept alive) and
- * covers the whole read-modify-write, not the individual reads and writes. `loadDismissed` stays
- * lock-free on purpose: a stale read is harmless, and taking the lock for it would serialize the
- * snapshot path behind every dismissal for no benefit.
+ * Locking just the side-table half is NOT ENOUGH, and reproduces the very failure this lock exists
+ * to prevent. Two Restores milliseconds apart both read the ignore payload before either persists:
+ * the second rebuilds the ignore set from ITS stale copy, putting the first entry's hash back, while
+ * both rows are correctly removed under the lock. The finding stays suppressed forever, is no longer
+ * restorable, and resurfaces as an unnameable "legacy" entry that only the destructive bulk clear
+ * can remove.
+ *
+ * So the unit of exclusion is the whole TRANSACTION, and it spans channels: `ignoreFinding` writes
+ * the same payload from the content-script channel while the dialog writes it from its own.
+ *
+ * TWO RULES for anything that takes this lock:
+ *   1. Use the `*InTransaction` primitives below inside it, never the locked wrappers — this lock is
+ *      not re-entrant, so calling `appendDismissed` from inside a transaction would deadlock.
+ *   2. Resolve the linter BEFORE entering. `getLinter()` runs `applyConfiguration`, which takes this
+ *      same lock to re-hydrate the ignore state, so awaiting it from inside a transaction is the one
+ *      lock cycle available here.
+ *
+ * The lock is per store object (a WeakMap, so a store handed out per test run is not kept alive).
+ * `loadDismissed` stays lock-free on purpose: a stale read is harmless, and taking the lock for it
+ * would serialize the snapshot path behind every dismissal for no benefit.
  */
 const storeLocks = new WeakMap<DismissedStore, Promise<unknown>>();
 
-function withStoreLock<T>(store: DismissedStore, fn: () => Promise<T>): Promise<T> {
+export function withDismissalTransaction<T>(
+	store: DismissedStore,
+	fn: () => Promise<T>,
+): Promise<T> {
 	const previous = storeLocks.get(store) ?? Promise.resolve();
 	// `.then(fn, fn)` rather than `.then(fn)`: a rejected predecessor must not skip this operation and
 	// silently break every later write for the session.
@@ -302,16 +320,46 @@ export async function saveDismissed(
 	await store.write(serializeEntries(entries));
 }
 
-/** Record one dismissal. Returns the new table. Serialized against every other store mutation. */
+// -----------------------------------------------------------------------------
+// The side-table primitives. Each comes in two forms: a `*InTransaction` core for callers that
+// already hold the lock (because they also touch harper's ignore payload, which is the other half of
+// the same transaction), and a locked wrapper for callers whose whole job is the one mutation.
+// -----------------------------------------------------------------------------
+
+/** Record one dismissal. Caller MUST already hold the transaction. Returns the new table. */
+export async function appendDismissedInTransaction(
+	store: DismissedStore,
+	entry: DismissedEntry,
+): Promise<DismissedEntry[]> {
+	const next = withEntryAppended(await loadDismissed(store), entry);
+	await saveDismissed(store, next);
+	return next;
+}
+
+/** Drop one entry by id. Caller MUST already hold the transaction. */
+export async function removeDismissedInTransaction(
+	store: DismissedStore,
+	id: string,
+): Promise<{ entries: DismissedEntry[]; removed: DismissedEntry | null }> {
+	const entries = await loadDismissed(store);
+	const removed = entries.find((entry) => entry.id === id) ?? null;
+	if (!removed) return { entries, removed: null };
+	const next = entries.filter((entry) => entry.id !== id);
+	await saveDismissed(store, next);
+	return { entries: next, removed };
+}
+
+/** Forget the whole side table. Caller MUST already hold the transaction. */
+export async function clearDismissedInTransaction(store: DismissedStore): Promise<void> {
+	await saveDismissed(store, []);
+}
+
+/** Record one dismissal. Returns the new table. Serialized against every other transaction. */
 export async function appendDismissed(
 	store: DismissedStore,
 	entry: DismissedEntry,
 ): Promise<DismissedEntry[]> {
-	return withStoreLock(store, async () => {
-		const next = withEntryAppended(await loadDismissed(store), entry);
-		await saveDismissed(store, next);
-		return next;
-	});
+	return withDismissalTransaction(store, () => appendDismissedInTransaction(store, entry));
 }
 
 /**
@@ -322,19 +370,10 @@ export async function removeDismissed(
 	store: DismissedStore,
 	id: string,
 ): Promise<{ entries: DismissedEntry[]; removed: DismissedEntry | null }> {
-	return withStoreLock(store, async () => {
-		const entries = await loadDismissed(store);
-		const removed = entries.find((entry) => entry.id === id) ?? null;
-		if (!removed) return { entries, removed: null };
-		const next = entries.filter((entry) => entry.id !== id);
-		await saveDismissed(store, next);
-		return { entries: next, removed };
-	});
+	return withDismissalTransaction(store, () => removeDismissedInTransaction(store, id));
 }
 
 /** Forget the whole side table. Does NOT touch harper's own ignore state — the caller does that. */
 export async function clearDismissed(store: DismissedStore): Promise<void> {
-	// Under the lock too: otherwise a dismissal that read the table before the clear would write its
-	// row back out afterwards, leaving a row whose ignore hashes the clear has already destroyed.
-	await withStoreLock(store, () => saveDismissed(store, []));
+	await withDismissalTransaction(store, () => clearDismissedInTransaction(store));
 }

@@ -23,7 +23,12 @@ import {
 import { slimBinaryInlined } from 'harper.js/slimBinaryInlined';
 import { resolvePlatform, isMobile } from './platform';
 import { mergeDictionary } from './dictionaryMerge';
-import { DismissedStore, appendDismissed, makeEntryId } from './dismissedLog';
+import {
+	DismissedStore,
+	appendDismissedInTransaction,
+	makeEntryId,
+	withDismissalTransaction,
+} from './dismissedLog';
 import { SettingsService, createSettingsService, parseRuleOverridesJson } from './settingsService';
 
 const CONTENT_SCRIPT_ID = 'harperCm';
@@ -267,9 +272,9 @@ interface FileSnapshot {
  * wipe the dictionary is the PRESENCE GATE on the commit in runReconcile — a pass that did not see a
  * configured side does not advance the base at all.
  */
-function readExternalFile(): FileSnapshot | null {
+function readExternalFile(configuredPath: string = cfg.dictionaryPath): FileSnapshot | null {
 	if (isMobile()) return null;
-	const p = expandTilde(cfg.dictionaryPath);
+	const p = expandTilde(configuredPath);
 	if (!p) return null;
 	const fs = getFs();
 	try {
@@ -319,10 +324,10 @@ let lastNoteUpdatedTime: number | null = null;
  * Same null-vs-empty rule as the file (see readExternalFile): an unreadable note infers no
  * deletions, an empty-but-readable note deletes what the base remembered.
  */
-async function readDictionaryNote(): Promise<string[] | null> {
-	if (!cfg.dictionaryNoteId) return null;
+async function readDictionaryNote(noteId: string = cfg.dictionaryNoteId): Promise<string[] | null> {
+	if (!noteId) return null;
 	try {
-		const note = await joplin.data.get(['notes', cfg.dictionaryNoteId], {
+		const note = await joplin.data.get(['notes', noteId], {
 			fields: ['body', 'updated_time'],
 		});
 		const body: string = (note && note.body) || '';
@@ -645,12 +650,22 @@ async function buildLinter(): Promise<LocalLinter> {
 }
 
 /** (Re)apply dictionary words, rule overrides and ignored lints to a linter instance. */
-async function applyConfiguration(linter: LocalLinter, reason = 'apply-configuration'): Promise<void> {
+/**
+ * `fresh` carries the same contract as `reconcileAndApply`'s: a caller that has just CHANGED state
+ * the reconcile reads — the settings onChange handler, which rewrites `cfg` and resets the merge
+ * base before it gets here — must not be answered by a pass that snapshotted the old state. See
+ * reconcileFresh. The engine-init caller has written nothing, so joining is right for it.
+ */
+async function applyConfiguration(
+	linter: LocalLinter,
+	reason = 'apply-configuration',
+	fresh = false,
+): Promise<void> {
 	if (!isMobile()) cachedLocalWordsPath = await localWordsPath();
 
 	// Dictionary: reconcile the sources (three-way merge, incl. deletions) and clear-then-import the
 	// result, so a word deleted on any side stops being accepted by the engine immediately.
-	await importWordsIntoLinter(linter, await reconcileDictionary(reason));
+	await importWordsIntoLinter(linter, fresh ? await reconcileFresh(reason) : await reconcileDictionary(reason));
 
 	// Rule overrides on top of defaults. GUARDED, like the ignored-lints import below: this runs
 	// inside the memoized `linterPromise`, so a throw here is cached for the whole session — every
@@ -668,15 +683,22 @@ async function applyConfiguration(linter: LocalLinter, reason = 'apply-configura
 
 	// Ignored lints (persisted between sessions). harper filters these internally on every subsequent
 	// lint once imported, so no host-side filtering is needed.
-	await linter.clearIgnoredLints();
-	const ignored = await loadIgnoredLintsJson();
-	if (ignored && ignored.trim()) {
-		try {
-			await linter.importIgnoredLints(ignored);
-		} catch {
-			/* corrupt persisted ignore-state — skip */
+	//
+	// UNDER THE DISMISSAL TRANSACTION: this is a clear-then-import of the very state a dismissal or a
+	// restore is rebuilding, read from the very payload they are rewriting. Run against a restore in
+	// flight it would re-import the pre-restore payload into the engine, leaving the engine ignoring a
+	// hash the persisted mirror no longer lists — a divergence nothing heals until the next restart.
+	await withDismissalTransaction(dismissedStore, async () => {
+		await linter.clearIgnoredLints();
+		const ignored = await loadIgnoredLintsJson();
+		if (ignored && ignored.trim()) {
+			try {
+				await linter.importIgnoredLints(ignored);
+			} catch {
+				/* corrupt persisted ignore-state — skip */
+			}
 		}
-	}
+	});
 }
 
 async function getLinter(): Promise<LocalLinter> {
@@ -862,8 +884,19 @@ async function runReconcile(reason: string): Promise<string[]> {
 		// exactly what it was in v1.2.0: an additive-only local fallback, outside the merge.
 		const local = readLocalWords();
 
-		const note = await readDictionaryNote(); // null when there is no readable note side
-		const file = readExternalFile(); // null on mobile / no path / unreadable
+		// THE CONFIGURATION THIS PASS IS RECONCILING AGAINST, captured ONCE, up front.
+		//
+		// `cfg` is a mutable module singleton that the settings onChange handler rewrites in place. Every
+		// read below and every write further down used to go back to it, so a pass that READ note N1
+		// could, several awaits later, `data.put` N1's merged body straight over note N2 after the user
+		// repointed the setting — destroying whatever the newly-pointed note held, and syncing that to
+		// every device. Reading the identity once makes the pass internally consistent; the guard before
+		// the writes then refuses to act at all if that identity has since moved.
+		const noteId = cfg.dictionaryNoteId;
+		const dictPath = isMobile() ? '' : cfg.dictionaryPath;
+
+		const note = await readDictionaryNote(noteId); // null when there is no readable note side
+		const file = readExternalFile(dictPath); // null on mobile / no path / unreadable
 
 		// BOTH PENDING BUFFERS ARE SNAPSHOTTED HERE, TOGETHER, and the pair is made disjoint before
 		// anything reads it.
@@ -895,7 +928,7 @@ async function runReconcile(reason: string): Promise<string[]> {
 			// already pruned the desktop-local fallback — so the buffer can be retired here. But when a
 			// side IS configured and merely unreadable this pass (unsynced note, offline drive), the
 			// buffer must survive: clearing it would let that side put the word back when it returns.
-			const anyDurableSideConfigured = !!cfg.dictionaryNoteId || (!isMobile() && !!cfg.dictionaryPath);
+			const anyDurableSideConfigured = !!noteId || (!isMobile() && !!dictPath);
 			if (!anyDurableSideConfigured) {
 				// Only the removals THIS pass consumed are retired: a removal queued since the snapshot,
 				// or one this pass set aside as superseded by a pending add, has not been applied to
@@ -917,9 +950,33 @@ async function runReconcile(reason: string): Promise<string[]> {
 		// PRESENCE GATE (v1.3.0 fix) — the other half of the commit condition, see the COMMIT block.
 		// A side is "present" when it is not configured at all (nothing to be absent) or it read back
 		// non-null this pass. On mobile there is no file side by construction, so it is never missing.
-		const noteSidePresent = !cfg.dictionaryNoteId || note !== null;
-		const fileSidePresent = isMobile() || !cfg.dictionaryPath || file !== null;
+		const noteSidePresent = !noteId || note !== null;
+		const fileSidePresent = isMobile() || !dictPath || file !== null;
 		const allSidesPresent = noteSidePresent && fileSidePresent;
+
+		// --- ABANDON IF THE CONFIGURATION MOVED UNDER US ----------------------------------------
+		//
+		// Everything above describes the note and the file this pass STARTED against. If the user has
+		// repointed either setting since, all of it is about a configuration that no longer exists, and
+		// each of the three writes below would do real damage with it:
+		//
+		//   * the note put would write the OLD note's merged body over the NEWLY-POINTED note,
+		//     destroying whatever that note held and syncing the loss everywhere;
+		//   * the file rewrite would reshape a file that is no longer the configured one;
+		//   * the base commit would overwrite the `''` that `resetSyncBase()` just wrote — and that
+		//     reset is the entire reason a repoint is safe, since it makes the next pass a FIRST RUN
+		//     that adopts the new side's union instead of inferring deletions from it. Committing a
+		//     base the new side has never seen turns every word it lacks into a deletion.
+		//
+		// So the pass stops here, having written nothing. It is idempotent and the repoint schedules its
+		// own reconcile, so the next pass simply redoes this correctly against the new configuration.
+		if (cfg.dictionaryNoteId !== noteId || (!isMobile() && cfg.dictionaryPath !== dictPath)) {
+			// eslint-disable-next-line no-console
+			console.info(
+				`[harper] dictionary reconcile (${reason}) abandoned: the dictionary was repointed mid-pass`,
+			);
+			return lastEngineWords;
+		}
 
 		// --- NOTE side (L3-guarded; the plugin's only data.put) ---------------------------------
 		let noteWritten = true;
@@ -927,11 +984,11 @@ async function runReconcile(reason: string): Promise<string[]> {
 			if (editorOpen) {
 				noteWritten = false; // deferred: an editor is open, so a note write is forbidden
 			} else {
-				await joplin.data.put(['notes', cfg.dictionaryNoteId], null, {
+				await joplin.data.put(['notes', noteId], null, {
 					body: canonicalDictionaryBody(merged.result),
 				});
 				try {
-					const after = await joplin.data.get(['notes', cfg.dictionaryNoteId], {
+					const after = await joplin.data.get(['notes', noteId], {
 						fields: ['updated_time'],
 					});
 					lastNoteUpdatedTime = (after && after.updated_time) || lastNoteUpdatedTime;
@@ -1290,6 +1347,19 @@ async function addWord(rawWord: string): Promise<void> {
 	await pokeForceLint();
 }
 
+/**
+ * Dismiss the finding on this exact span.
+ *
+ * ONE TRANSACTION over all three pieces of a dismissal — harper's in-engine ignore set, the
+ * persisted payload mirroring it, and the side table naming the row. This is the CONTENT-SCRIPT
+ * channel writing the very same payload the settings dialog's Restore and Clear write from theirs,
+ * so the lock has to span both channels: otherwise a dismissal landing inside a restore's
+ * read-modify-write leaves its brand-new hash destroyed, or the restore's stale copy puts a
+ * just-restored hash back with no row left to name it.
+ *
+ * The linter is resolved BEFORE entering, because getLinter() runs applyConfiguration, which takes
+ * this same lock to re-hydrate the ignore state.
+ */
 async function ignoreFinding(
 	text: string,
 	start: number,
@@ -1297,6 +1367,19 @@ async function ignoreFinding(
 	ruleName: string,
 ): Promise<void> {
 	const linter = await getLinter();
+	await withDismissalTransaction(dismissedStore, () =>
+		ignoreFindingInTransaction(linter, text, start, end, ruleName),
+	);
+	await pokeForceLint();
+}
+
+async function ignoreFindingInTransaction(
+	linter: LocalLinter,
+	text: string,
+	start: number,
+	end: number,
+	ruleName: string,
+): Promise<void> {
 	// harper stores an ignored lint by a context hash and filters it out of every SUBSEQUENT lint
 	// itself. It surfaces overlapping findings one at a time, so to make "Ignore" actually clear the
 	// span the user pointed at we ignore every finding on that exact span, re-linting after each until
@@ -1358,7 +1441,7 @@ async function ignoreFinding(
 		const id = makeEntryId(hashes);
 		if (id) {
 			try {
-				await appendDismissed(dismissedStore, {
+				await appendDismissedInTransaction(dismissedStore, {
 					id,
 					hashes,
 					ruleName: recordedRule || ruleName,
@@ -1371,7 +1454,6 @@ async function ignoreFinding(
 			}
 		}
 	}
-	await pokeForceLint();
 }
 
 /**
@@ -2016,11 +2098,14 @@ joplin.plugins.register({
 					// every one of the user's own words underlines as a spelling error in every note.
 					importedWordsKey = null;
 				}
-				await applyConfiguration(linter, 'settings-change');
+				// FRESH: this handler has just rewritten `cfg` and, on a repoint, reset the merge base.
+				// A pass already in flight snapshotted the state before all of that, so joining it would
+				// answer the change with a view of the world that predates it.
+				await applyConfiguration(linter, 'settings-change', true);
 			} else {
 				// No engine yet (warm-up still running): still reconcile, so a repointed note/file is
 				// merged and persisted rather than waiting for the first lint.
-				await reconcileDictionary('settings-change');
+				await reconcileFresh('settings-change'); // same freshness contract as the branch above
 			}
 			await pokeForceLint();
 		});

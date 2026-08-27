@@ -26,13 +26,14 @@ import {
 	DismissedEntry,
 	DismissedStore,
 	buildIgnoredLintsPayload,
-	clearDismissed,
+	clearDismissedInTransaction,
 	coveredHashes,
 	extractHashes,
 	hashesWithoutEntry,
 	legacyCount,
 	loadDismissed,
-	removeDismissed,
+	removeDismissedInTransaction,
+	withDismissalTransaction,
 } from './dismissedLog';
 
 // =============================================================================
@@ -88,6 +89,19 @@ export interface DictionarySaveResult {
 	 * being silently missing from a list the next save would then read as a deletion.
 	 */
 	words: string[];
+}
+
+/**
+ * What a clear removed, in the TWO units that actually exist.
+ *
+ * They cannot be summed into one honest number: a side-table row is one user-visible Dismiss,
+ * whereas an unattributed legacy hash is one ignored FINDING, and one Dismiss routinely produces
+ * several of those. Nothing records how many dismissals produced the legacy hashes, so the dialog
+ * reports each count under its own noun rather than inventing a total.
+ */
+export interface DismissedClearResult {
+	dismissals: number;
+	legacy: number;
 }
 
 export interface SettingsServiceDeps {
@@ -196,10 +210,19 @@ export function normalizeWords(words: readonly string[]): string[] {
  * `pendingRemovals`, whose stated removals beat every concurrent addition by design and propagate to
  * every synced device.
  *
- * ADDITIONS still diff against the live list: an add is idempotent and can never destroy anything.
+ * ADDITIONS ARE BASELINE-BOUND TOO. An add is not the harmless direction it looks like: this
+ * codebase deliberately makes a `pendingWords` entry OUTRANK an inferred deletion (mergeDictionary
+ * unions `pending` into the result unconditionally and skips it in the deletion loop), and
+ * `addPendingWord` additionally CANCELS a queued removal of the same word. So a word still sitting
+ * in the stale textarea only because the editor was seeded before someone else deleted it would be
+ * re-added — resurrecting the deletion, re-appending the word to the user's own external file, and
+ * syncing all of it back to every device. A word that the baseline listed but the dictionary no
+ * longer holds is therefore NOT an add: the user did not type it, they are just looking at an old
+ * screen. Only genuinely new text becomes an addition.
  *
- * A null baseline yields NO removals. A caller that cannot say what it was looking at cannot claim
- * the user deleted anything; failing closed costs one re-save and cannot lose a word.
+ * A null baseline yields NO removals, and leaves adds diffing against the live list alone — a caller
+ * that cannot say what it was looking at cannot claim a deletion, and has no stale screen to
+ * resurrect from either.
  */
 export function diffWords(
 	current: readonly string[],
@@ -210,7 +233,9 @@ export function diffWords(
 	const after = new Set(normalizeWords(next));
 	const seen = baseline == null ? new Set<string>() : new Set(normalizeWords(baseline));
 	return {
-		adds: [...after].filter((w) => !before.has(w)),
+		// `!seen.has(w)` excludes exactly the words the editor was SEEDED with that the dictionary has
+		// since lost. A word in both `seen` and `before` is already excluded by `!before.has(w)`.
+		adds: [...after].filter((w) => !before.has(w) && !seen.has(w)),
 		// Still in `before` too: a word the baseline listed but the dictionary no longer holds needs no
 		// removal, and queueing one could only cancel someone else's concurrent re-add of it.
 		removes: [...seen].filter((w) => !after.has(w) && before.has(w)),
@@ -289,7 +314,7 @@ export interface SettingsService {
 	updateSetting(key: string, value: unknown): Promise<void>;
 	saveDictionaryWords(words: string[], baseline: readonly string[] | null): Promise<DictionarySaveResult>;
 	restoreDismissed(id: string): Promise<boolean>;
-	clearDismissedFindings(scope: 'all' | 'legacy'): Promise<number>;
+	clearDismissedFindings(scope: 'all' | 'legacy'): Promise<DismissedClearResult>;
 	/** One dispatcher for the Phase-2 dialog to forward its webview messages into. */
 	handleMessage(message: unknown): Promise<unknown>;
 }
@@ -447,51 +472,61 @@ export function createSettingsService(deps: SettingsServiceDeps): SettingsServic
 		},
 
 		async restoreDismissed(id): Promise<boolean> {
-			const entries = await loadDismissed(deps.dismissedStore);
-			const entry = entries.find((candidate) => candidate.id === id);
-			if (!entry) return false;
-
+			// The linter is resolved BEFORE the transaction: getLinter() runs applyConfiguration, which
+			// takes this same lock to re-hydrate the ignore state, so awaiting it from inside would
+			// deadlock. See the rules on withDismissalTransaction.
 			const linter = await deps.getLinter();
-			const raw = await deps.loadIgnoredLintsRaw();
-			// Everything still ignored, minus this entry's hashes. Every value here is a decimal
-			// string lifted out by regex — no u64 is ever a JS number on this path.
-			await rebuildIgnoreState(linter, hashesWithoutEntry(raw, entry));
-			await persistIgnoreStateAndPoke(linter);
-			// Only drop the row once harper's own state actually moved.
-			await removeDismissed(deps.dismissedStore, id);
-			return true;
+			// ONE TRANSACTION over all three pieces of a dismissal — harper's in-engine ignore set, the
+			// persisted payload mirroring it, and the side table. Locking only the side-table half let
+			// two Restores milliseconds apart each rebuild the ignore set from its own stale copy of the
+			// payload, putting the first entry's hash back while both rows were correctly removed: the
+			// finding stayed suppressed forever, un-restorable, resurfacing as an unnameable "legacy"
+			// entry that only the destructive bulk clear can remove.
+			return withDismissalTransaction(deps.dismissedStore, async () => {
+				const entries = await loadDismissed(deps.dismissedStore);
+				const entry = entries.find((candidate) => candidate.id === id);
+				if (!entry) return false;
+
+				const raw = await deps.loadIgnoredLintsRaw();
+				// Everything still ignored, minus this entry's hashes. Every value here is a decimal
+				// string lifted out by regex — no u64 is ever a JS number on this path.
+				await rebuildIgnoreState(linter, hashesWithoutEntry(raw, entry));
+				await persistIgnoreStateAndPoke(linter);
+				// Only drop the row once harper's own state actually moved.
+				await removeDismissedInTransaction(deps.dismissedStore, id);
+				return true;
+			});
 		},
 
-		async clearDismissedFindings(scope): Promise<number> {
-			const linter = await deps.getLinter();
-			const raw = await deps.loadIgnoredLintsRaw();
-			const entries = await loadDismissed(deps.dismissedStore);
+		async clearDismissedFindings(scope): Promise<DismissedClearResult> {
+			const linter = await deps.getLinter(); // outside the transaction — see restoreDismissed
+			return withDismissalTransaction(deps.dismissedStore, async () => {
+				const raw = await deps.loadIgnoredLintsRaw();
+				const entries = await loadDismissed(deps.dismissedStore);
 
-			if (scope === 'all') {
-				// COUNT DISMISSALS, NOT HASHES. One user-visible Dismiss routinely produces several
-				// context hashes — that is exactly what ignoreFinding's multi-pass loop is for, since
-				// harper surfaces overlapping findings on a span one at a time — so returning the hash
-				// count would tell a user who dismissed two things that three were cleared. A side-table
-				// row IS one dismissal; unattributed legacy hashes carry no record of how many dismissals
-				// produced them, so they are counted as the ignored findings they are and reported under
-				// that name by the dialog.
-				const cleared = entries.length + legacyCount(raw, entries);
-				await linter.clearIgnoredLints();
+				if (scope === 'all') {
+					// TWO UNITS, REPORTED SEPARATELY, because no single honest number exists. A side-table
+					// row IS one user-visible Dismiss. An unattributed legacy hash is not: one Dismiss
+					// routinely produces several of them (harper surfaces overlapping findings on a span one
+					// at a time, which is what ignoreFinding's multi-pass loop is for), and nothing records
+					// how many dismissals produced them. Summing the two and calling the total "dismissals"
+					// tells a user who dismissed 3 things before v1.4.0 that 7 were cleared.
+					const result = { dismissals: entries.length, legacy: legacyCount(raw, entries) };
+					await linter.clearIgnoredLints();
+					await persistIgnoreStateAndPoke(linter);
+					await clearDismissedInTransaction(deps.dismissedStore);
+					return result;
+				}
+
+				// 'legacy': keep every hash the side table accounts for, drop the rest. The entries
+				// themselves are untouched — they still describe live ignores.
+				const covered = coveredHashes(entries);
+				const hashes = extractHashes(raw);
+				const keep = hashes.filter((hash) => covered.has(hash));
+				await rebuildIgnoreState(linter, keep);
 				await persistIgnoreStateAndPoke(linter);
-				await clearDismissed(deps.dismissedStore);
-				return cleared;
-			}
-
-			// 'legacy': keep every hash the side table accounts for, drop the rest. The entries
-			// themselves are untouched — they still describe live ignores. The count here is a hash
-			// count by necessity (see above) and the dialog labels it "legacy findings", not
-			// "dismissals".
-			const covered = coveredHashes(entries);
-			const hashes = extractHashes(raw);
-			const keep = hashes.filter((hash) => covered.has(hash));
-			await rebuildIgnoreState(linter, keep);
-			await persistIgnoreStateAndPoke(linter);
-			return hashes.length - keep.length;
+				return { dismissals: 0, legacy: hashes.length - keep.length };
+			});
 		},
 
 		async handleMessage(message): Promise<unknown> {
@@ -524,7 +559,10 @@ export function createSettingsService(deps: SettingsServiceDeps): SettingsServic
 				case 'settings:restoreDismissed':
 					return { ok: await service.restoreDismissed(String(msg.id)) };
 				case 'settings:clearDismissed':
-					return { ok: true, cleared: await service.clearDismissedFindings(msg.scope === 'legacy' ? 'legacy' : 'all') };
+					return {
+						ok: true,
+						...(await service.clearDismissedFindings(msg.scope === 'legacy' ? 'legacy' : 'all')),
+					};
 				default:
 					return null;
 			}

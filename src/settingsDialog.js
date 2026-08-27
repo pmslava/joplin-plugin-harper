@@ -287,12 +287,13 @@
 
 	/**
 	 * The user's rule edits that no completed write has confirmed yet, in the order they were made.
-	 * Each entry is { rule: name, value: true | false | null }, where null means "Default" (delete
-	 * the key — absence is what Default means, see rule 2 in the header).
+	 * Each entry is { seq, rule, value }, where value is true | false | null and null means "Default"
+	 * (delete the key — absence is what Default means, see rule 2 in the header). `seq` is a
+	 * monotonic stamp; every write retires edits by seq, never by position, because the queue shifts
+	 * underneath a write while it is in flight.
 	 *
 	 * SERIALIZING THE SENDS IS NOT ENOUGH ON ITS OWN. `settings:applyRuleOverrides` REPLACES the
-	 * stored map wholesale, and every reply carries the authoritative map the service stored — so two
-	 * things have to be true, and neither was:
+	 * stored map wholesale, and every reply carries the authoritative map the service stored, so:
 	 *
 	 *   1. a payload must be built at SEND time, from whatever the map is by then. A payload
 	 *      snapshotted at CLICK time predates the earlier write's reply, so sending it overwrites that
@@ -302,17 +303,39 @@
 	 *      = reply.overrides` alone loses them, and since the repaint is gated on the last write in a
 	 *      burst, they vanish from the UI as well as from the setting.
 	 *
-	 * So each write records how many queued edits its payload carried; when its reply lands, exactly
-	 * those are retired and every later one is re-applied on top of the authoritative map. A bulk
-	 * Reset / Disable All carries none of its own, which is right: it deliberately supersedes
-	 * everything queued before it, and only edits made after it was sent survive it.
+	 * THE LINEARIZATION, stated once so both write kinds agree on it:
+	 *
+	 *   * A RELATIVE write (a rule toggle, a group flip) carries the whole current map, so it confirms
+	 *     every edit that existed when it was SENT. Later edits are replayed on top of its reply.
+	 *   * A BULK write (Reset, Disable All) carries nothing of the user's; the service computes the
+	 *     roster from scratch. It supersedes exactly the edits that existed when the user CLICKED it,
+	 *     and must preserve every edit made after that click.
+	 *
+	 * Click time and send time are the same instant only when the chain is empty. A bulk action queued
+	 * behind a slow earlier write sits in `applyChain` for a full round trip, and using its send-time
+	 * position retired — and discarded — every toggle the user made while it waited, silently
+	 * reverting an explicit change. Hence: relative writes stamp at send, bulk writes stamp at click.
 	 */
 	var queuedEdits = [];
+	var editSeq = 0;
 
 	function setRuleState(name, next) {
 		if (next === 'default') delete state.overrides[name];
 		else state.overrides[name] = next === 'on';
-		queuedEdits.push({ rule: name, value: next === 'default' ? null : next === 'on' });
+		queuedEdits.push({
+			seq: ++editSeq,
+			rule: name,
+			value: next === 'default' ? null : next === 'on',
+		});
+	}
+
+	/** Drop every edit a write has now confirmed (or superseded), keeping the ones made after it. */
+	function retireEditsThrough(seq) {
+		var kept = [];
+		for (var i = 0; i < queuedEdits.length; i++) {
+			if (queuedEdits[i].seq > seq) kept.push(queuedEdits[i]);
+		}
+		queuedEdits = kept;
 	}
 
 	/** A plain, boolean-only copy of the override map — what a write actually sends. */
@@ -350,23 +373,27 @@
 	 *
 	 * `build` returns the message to send; `adopt` takes the reply's authoritative override map.
 	 */
-	function queueRuleWrite(build, pendingStatus) {
+	function queueRuleWrite(build, pendingStatus, isBulk) {
 		applyPending++;
 		setRulesStatus(pendingStatus || 'Saving…');
+		// A BULK action supersedes what the user had done when they CLICKED it — stamped here, because
+		// by the time it is sent it may have waited a whole round trip behind an earlier write, and
+		// everything they did in that window is theirs to keep.
+		var supersedesThrough = editSeq;
 		applyChain = applyChain.then(
 			function () {
 				// Built HERE, when it is this write's turn to go out — never at click time. See the note
 				// on queuedEdits: a payload frozen at click time predates the previous write's reply and
 				// would overwrite it wholesale.
 				var message = build();
-				// Everything the user has edited so far rides along in that payload (or, for a bulk
-				// action, is deliberately superseded by it). Edits made from now on do not, so they are
-				// what has to be replayed when this write's reply lands.
-				var carried = queuedEdits.length;
+				// A RELATIVE write carries the whole map as it stands right now, so it confirms every
+				// edit made up to this instant. A bulk write carries none of them and uses its click
+				// stamp instead.
+				var through = isBulk ? supersedesThrough : editSeq;
 				return send(message).then(
 					function (reply) {
 						applyPending--;
-						queuedEdits = queuedEdits.slice(carried);
+						retireEditsThrough(through);
 						// The service returns the sparse map it actually stored, so the UI adopts that
 						// rather than trusting its own optimistic copy — plus the edits it could not know
 						// about, which are still unsaved and still on screen.
@@ -385,7 +412,7 @@
 						// the next write's payload carries them again. Replaying them a second time on top of
 						// a later reply would be a no-op at best and could resurrect an edit the user has
 						// since undone.
-						queuedEdits = queuedEdits.slice(carried);
+						retireEditsThrough(through);
 						setRulesStatus('Could not save: ' + errorText(error), true);
 					},
 				);
@@ -801,7 +828,18 @@
 		var expanded = groupExpanded(group.id, needle);
 
 		function toggleExpanded() {
-			toggleGroupExpanded(group.id, needle);
+			// THE NEEDLE IS RECOMPUTED AT CLICK TIME, never the one captured when this row was painted.
+			// The search box updates `state.search` synchronously but defers `renderRules()` by 140 ms,
+			// so for that whole window the rows on screen carry the PREVIOUS needle. Routing the write by
+			// it sent the flip into the wrong map: a tap right after typing wrote to `expandedGroups`,
+			// the immediate repaint force-opened the group anyway, and the collapse only surfaced once
+			// the search was cleared — the invisible side effect `searchExpanded` exists to remove.
+			// Flushing the pending render keeps the repaint below the definitive one.
+			if (searchTimer) {
+				clearTimeout(searchTimer);
+				searchTimer = null;
+			}
+			toggleGroupExpanded(group.id, currentNeedle());
 			renderRules();
 		}
 
@@ -858,11 +896,16 @@
 		return box;
 	}
 
+	/** The live search needle. ONE definition, so a click and a render can never disagree on it. */
+	function currentNeedle() {
+		return state.search.trim().toLowerCase();
+	}
+
 	function renderRules() {
 		var host = document.getElementById('hs-rules-groups');
 		if (!host) return;
 		clear(host);
-		var needle = state.search.trim().toLowerCase();
+		var needle = currentNeedle();
 		var shown = 0;
 		for (var i = 0; i < state.groups.length; i++) {
 			var node = renderGroup(state.groups[i], needle);
@@ -935,9 +978,15 @@
 		reset.type = 'button';
 		reset.id = 'hs-reset-rules';
 		reset.addEventListener('click', function () {
-			queueRuleWrite(function () {
-				return { type: 'settings:resetRules' };
-			}, 'Resetting…');
+			// isBulk: the service computes the roster from scratch, so this supersedes what the user had
+			// done when they clicked — and nothing they do while it waits its turn in the chain.
+			queueRuleWrite(
+				function () {
+					return { type: 'settings:resetRules' };
+				},
+				'Resetting…',
+				true,
+			);
 		});
 		toolbar.appendChild(reset);
 
@@ -945,9 +994,13 @@
 		disableAll.type = 'button';
 		disableAll.id = 'hs-disable-all-rules';
 		disableAll.addEventListener('click', function () {
-			queueRuleWrite(function () {
-				return { type: 'settings:disableAllRules' };
-			}, 'Disabling…');
+			queueRuleWrite(
+				function () {
+					return { type: 'settings:disableAllRules' };
+				},
+				'Disabling…',
+				true,
+			);
 		});
 		toolbar.appendChild(disableAll);
 		section.appendChild(toolbar);
@@ -992,13 +1045,22 @@
 	 * setGeneralStatus, setDismissedStatus); this one now does too, so it lands on whatever nodes are
 	 * currently on screen, and harmlessly on none when the tab is elsewhere.
 	 */
-	function paintDictionary() {
+	function paintDictionary(untouched) {
+		var next = state.dictionaryWords.join('\n');
 		var area = document.getElementById('hs-dictionary');
-		if (area) area.value = state.dictionaryWords.join('\n');
+		// MERGE, DO NOT CLOBBER. The box is editable for the whole round trip — the Save button is
+		// disabled but the textarea never is, and a tab switch even brings back an enabled one — so
+		// overwriting it unconditionally throws away whatever the user typed while the save ran, with a
+		// cheerful "Saved." over the top and no hint anything was dropped. It is only ours to repaint
+		// while it still holds one of the values we last put there: what was on screen when Save was
+		// pressed, or what a re-render seeded it with. `untouched` carries both.
+		var mine = !area || !untouched || untouched.indexOf(area.value) !== -1;
+		if (area && mine) area.value = next;
 		var count = document.getElementById('hs-dictionary-count');
 		if (count) count.textContent = state.dictionaryWords.length + ' words';
 		var save = document.getElementById('hs-save-dictionary');
 		if (save) save.disabled = false;
+		return mine;
 	}
 
 	function renderDictionary(root) {
@@ -1040,6 +1102,10 @@
 			// the dialog loaded — a word synced from another device, the 500 words in an external file
 			// just configured on the General tab — reads as an explicit deletion.
 			var baseline = state.dictionaryWords.slice();
+			// The two values the box may legitimately hold when the reply lands: what was on screen at
+			// send time, and what a re-render would have seeded it with. Anything else is typing the
+			// user has done since, which the repaint must not eat.
+			var untouched = [area.value, baseline.join('\n')];
 			setDictionaryStatus('Saving…');
 			save.disabled = true;
 			send({ type: 'settings:saveDictionary', words: words, baseline: baseline })
@@ -1051,12 +1117,14 @@
 					// that same truth rather than a list already out of date.
 					state.dictionaryWords =
 						reply && reply.words ? reply.words.slice() : words.slice().sort();
-					paintDictionary();
-					if (!adds.length && !removes.length) {
-						setDictionaryStatus('Saved. Nothing changed.');
-					} else {
-						setDictionaryStatus('Saved. ' + adds.length + ' added, ' + removes.length + ' removed.');
-					}
+					var repainted = paintDictionary(untouched);
+					var summary =
+						!adds.length && !removes.length
+							? 'Saved. Nothing changed.'
+							: 'Saved. ' + adds.length + ' added, ' + removes.length + ' removed.';
+					// Say so when the box was left alone, or the user is looking at their own unsaved
+					// text under a message that says everything is saved.
+					setDictionaryStatus(repainted ? summary : summary + ' Your unsaved edits were kept.');
 				})
 				.catch(function (error) {
 					var current = document.getElementById('hs-save-dictionary');
@@ -1084,6 +1152,25 @@
 		var date = new Date(iso);
 		if (isNaN(date.getTime())) return String(iso);
 		return date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
+	}
+
+	/**
+	 * What a clear removed, in the two units that exist.
+	 *
+	 * A side-table row is one user-visible Dismiss. An unattributed legacy hash is one ignored
+	 * FINDING — one Dismiss routinely makes several, and nothing records how many made the legacy
+	 * ones. Summing them and calling the total "dismissals" told a user who dismissed 3 things before
+	 * the side table existed that 7 were cleared, which is the exact over-count this wording exists to
+	 * avoid. So each count keeps its own noun and no total is invented.
+	 */
+	function describeCleared(reply) {
+		var dismissals = (reply && reply.dismissals) || 0;
+		var legacy = (reply && reply.legacy) || 0;
+		var parts = [];
+		if (dismissals) parts.push(dismissals + (dismissals === 1 ? ' dismissal' : ' dismissals'));
+		if (legacy) parts.push(legacy + (legacy === 1 ? ' legacy finding' : ' legacy findings'));
+		if (!parts.length) return 'Nothing to clear.';
+		return 'Cleared ' + parts.join(' and ') + '.';
 	}
 
 	function setDismissedStatus(text, isError) {
@@ -1175,7 +1262,7 @@
 					.then(function (reply) {
 						state.dismissed.legacyCount = 0;
 						renderDismissedList();
-						setDismissedStatus('Cleared ' + ((reply && reply.cleared) || 0) + ' legacy findings.');
+						setDismissedStatus(describeCleared(reply));
 					})
 					.catch(function (error) {
 						clearLegacy.disabled = false;
@@ -1226,7 +1313,7 @@
 				.then(function (reply) {
 					state.dismissed = { entries: [], legacyCount: 0 };
 					renderDismissedList();
-					setDismissedStatus('Cleared ' + ((reply && reply.cleared) || 0) + ' dismissals.');
+					setDismissedStatus(describeCleared(reply));
 				})
 				.catch(function (error) {
 					setDismissedStatus('Could not clear: ' + error.message, true);
