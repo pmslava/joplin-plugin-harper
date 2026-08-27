@@ -22,14 +22,18 @@ const DIST_DIR = path.join(REPO_ROOT, 'dist');
  * merge core can be unit-tested as a FUNCTION rather than only through the bundle's side effects.
  * It is the very same source webpack compiles into dist/index.js — no second copy to drift.
  */
-function loadTsModule(relPath) {
+function loadTsModule(relPath, requireShim) {
 	const source = fs.readFileSync(path.join(REPO_ROOT, relPath), 'utf8');
 	const js = ts.transpileModule(source, {
 		compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2019 },
 	}).outputText;
 	const mod = { exports: {} };
+	// `requireShim` lets a module with a sibling src/ import be loaded here too: the transpiled code
+	// asks for './dismissedLog', which plain require() would resolve relative to test/ (and to a .ts
+	// file at that). The caller hands back the already-loaded module instead. Type-only imports (e.g.
+	// harper.js) are elided by the transpile, so they never reach this.
 	// eslint-disable-next-line no-new-func
-	new Function('exports', 'module', 'require', js)(mod.exports, mod, require);
+	new Function('exports', 'module', 'require', js)(mod.exports, mod, requireShim || require);
 	return mod.exports;
 }
 const { mergeDictionary } = loadTsModule('src/dictionaryMerge.ts');
@@ -1412,6 +1416,451 @@ async function main() {
 			const put = bstate.notePuts[bstate.notePuts.length - 1];
 			assert.ok(/(^|\n)Alreadyknown(\n|$)/.test(put.body), 'the note keeps its existing word');
 			assert.deepStrictEqual(bstate.settings.pendingWords, [], 'pendingWords cleared after the deferred flush');
+		});
+	}
+
+	// =========================================================================
+	// v1.4.0 SETTINGS OVERHAUL — dismissed-findings side table + service layer
+	// =========================================================================
+
+	const dismissedLog = loadTsModule('src/dismissedLog.ts');
+	// settingsService.ts imports './dismissedLog' for real (not just types), so hand it the copy we
+	// just loaded rather than letting require() resolve it relative to test/.
+	const settingsSvc = loadTsModule('src/settingsService.ts', (id) =>
+		id === './dismissedLog' ? dismissedLog : require(id),
+	);
+
+	// ---- pure: the u64 hash discipline --------------------------------------
+	// These two real hashes came out of harper 2.7.0's contextHash() for "teh" and "beleive". Both
+	// are 20-digit u64s, i.e. FAR past Number.MAX_SAFE_INTEGER (9007199254740991) — which is the
+	// entire reason src/dismissedLog.ts refuses to let a hash become a JS number.
+	const REAL_HASH_A = '11940613493308079398';
+	const REAL_HASH_B = '9722060015410969502';
+	const REAL_PAYLOAD = `{"context_hashes":[${REAL_HASH_A},${REAL_HASH_B}]}`;
+
+	await test('u64: extractHashes lifts context hashes out as EXACT decimal strings', () => {
+		const hashes = dismissedLog.extractHashes(REAL_PAYLOAD);
+		assert.deepStrictEqual(hashes, [REAL_HASH_A, REAL_HASH_B], 'both hashes recovered verbatim');
+		assert.ok(
+			hashes.every((h) => typeof h === 'string'),
+			'hashes are strings, never numbers',
+		);
+	});
+
+	await test('u64: the naive JSON.parse route DOES corrupt these hashes (the trap being avoided)', () => {
+		// This is the bug the regex exists to prevent, asserted rather than described: parsing the
+		// payload as JSON silently rounds the u64s, and re-stringifying writes a DIFFERENT integer, so
+		// harper's ignores stop matching and every dismissed finding quietly comes back.
+		const naive = JSON.parse(REAL_PAYLOAD).context_hashes.map((n) => String(n));
+		assert.notStrictEqual(naive[0], REAL_HASH_A, 'JSON.parse changes the first hash');
+		assert.notStrictEqual(naive[1], REAL_HASH_B, 'JSON.parse changes the second hash');
+		// ...and the safe path does not.
+		assert.deepStrictEqual(
+			dismissedLog.extractHashes(REAL_PAYLOAD),
+			[REAL_HASH_A, REAL_HASH_B],
+			'the regex path is lossless where JSON.parse is not',
+		);
+	});
+
+	await test('u64: buildIgnoredLintsPayload rebuilds harper\'s payload BYTE-IDENTICALLY', () => {
+		const rebuilt = dismissedLog.buildIgnoredLintsPayload(dismissedLog.extractHashes(REAL_PAYLOAD));
+		assert.strictEqual(rebuilt, REAL_PAYLOAD, 'round trip is byte-exact');
+		assert.strictEqual(
+			dismissedLog.buildIgnoredLintsPayload([]),
+			'{"context_hashes":[]}',
+			'an empty keep-set is still a well-formed (no-op) payload',
+		);
+		assert.strictEqual(
+			dismissedLog.buildIgnoredLintsPayload(['12', 'not-a-hash', '12']),
+			'{"context_hashes":[12]}',
+			'junk is dropped and duplicates collapse, so the payload can never be malformed JSON',
+		);
+	});
+
+	await test('legacyCount counts only the hashes no side-table entry accounts for', () => {
+		const entries = [
+			{ id: REAL_HASH_A, hashes: [REAL_HASH_A], ruleName: 'The', problemText: 'teh', dismissedAt: '' },
+		];
+		assert.strictEqual(dismissedLog.legacyCount(REAL_PAYLOAD, entries), 1, 'B is legacy, A is not');
+		assert.deepStrictEqual(dismissedLog.legacyHashes(REAL_PAYLOAD, entries), [REAL_HASH_B], 'B named');
+		assert.strictEqual(dismissedLog.legacyCount(REAL_PAYLOAD, []), 2, 'no entries => everything legacy');
+		assert.strictEqual(dismissedLog.legacyCount('', entries), 0, 'no ignore state => nothing legacy');
+	});
+
+	await test('hashesWithoutEntry yields the keep-set for un-ignoring exactly one entry', () => {
+		const entry = { id: REAL_HASH_A, hashes: [REAL_HASH_A], ruleName: 'The', problemText: 'teh', dismissedAt: '' };
+		assert.deepStrictEqual(
+			dismissedLog.hashesWithoutEntry(REAL_PAYLOAD, entry),
+			[REAL_HASH_B],
+			'the restored entry\'s hash is dropped and every other survives',
+		);
+	});
+
+	await test('parseEntries tolerates corrupt state and drops rows that could never be restored', () => {
+		assert.deepStrictEqual(dismissedLog.parseEntries('not json at all'), [], 'corrupt => empty');
+		assert.deepStrictEqual(dismissedLog.parseEntries(''), [], 'empty => empty');
+		const parsed = dismissedLog.parseEntries(
+			JSON.stringify({
+				version: 1,
+				entries: [
+					{ id: REAL_HASH_A, hashes: [REAL_HASH_A], ruleName: 'The', problemText: 'teh', dismissedAt: 'x' },
+					{ id: 'orphan', hashes: [], ruleName: 'X', problemText: 'y', dismissedAt: 'z' },
+				],
+			}),
+		);
+		assert.strictEqual(parsed.length, 1, 'the hash-less row is dropped (un-restorable, un-matchable)');
+		assert.strictEqual(parsed[0].id, REAL_HASH_A, 'the usable row survives intact');
+	});
+
+	// ---- pure: settings-service helpers -------------------------------------
+	await test('normalizeRuleOverrides keeps explicit booleans and DROPS null (sparse = only what the user set)', () => {
+		assert.deepStrictEqual(
+			settingsSvc.normalizeRuleOverrides({ A: true, B: false, C: null, D: undefined }),
+			{ A: true, B: false },
+			'null/undefined mean "Default", which is expressed by ABSENCE',
+		);
+		assert.deepStrictEqual(settingsSvc.normalizeRuleOverrides({}), {}, 'empty stays empty');
+	});
+
+	await test('diffWords computes the dictionary editor\'s add/remove sets against the current list', () => {
+		const diff = settingsSvc.diffWords(['alpha', 'beta'], ['beta', 'gamma']);
+		assert.deepStrictEqual(diff.adds, ['gamma'], 'gamma is new');
+		assert.deepStrictEqual(diff.removes, ['alpha'], 'alpha was deleted');
+		const noop = settingsSvc.diffWords(['a', 'b'], ['b', 'a']);
+		assert.deepStrictEqual(noop, { adds: [], removes: [] }, 'reordering is not an edit');
+	});
+
+	await test('ruleDisplayLabel derives a label from the rule name (harper returns label:null for all 823)', () => {
+		assert.strictEqual(settingsSvc.ruleDisplayLabel('AmazonNames'), 'Amazon Names');
+		assert.strictEqual(settingsSvc.ruleDisplayLabel('HTMLTags'), 'HTML Tags');
+		assert.strictEqual(settingsSvc.ruleDisplayLabel('SpelledNumbers'), 'Spelled Numbers');
+	});
+
+	// ---- pure: explicit removals in the three-way merge ----------------------
+	await test('merge removals: a STATED deletion beats a concurrent addition (reverse of the normal rule)', () => {
+		// "alpha" is being added by the pending buffer AND removed by the editor. Normally addition
+		// wins; an explicit removal is the user's stated intent, so it wins instead.
+		const out = mergeDictionary({
+			base: ['alpha', 'beta'],
+			note: ['alpha', 'beta'],
+			file: null,
+			pending: ['alpha'],
+			removals: ['alpha'],
+		});
+		assert.deepStrictEqual(out.result, ['beta'], 'alpha is gone despite being pending');
+		assert.ok(out.deleted.includes('alpha'), 'reported as a deletion');
+		assert.strictEqual(out.noteChanged, true, 'the note still lists it, so the note must be rewritten');
+	});
+
+	await test('merge removals: a stated deletion applies even on a FIRST RUN, where inference is skipped', () => {
+		const out = mergeDictionary({
+			base: null, // first run: deletion INFERENCE is skipped entirely
+			note: ['alpha', 'beta'],
+			file: null,
+			pending: [],
+			removals: ['alpha'],
+		});
+		assert.deepStrictEqual(out.result, ['beta'], 'the stated removal still lands');
+		assert.strictEqual(out.firstRun, true, 'and it really was a first run');
+	});
+
+	await test('merge removals: omitting the field is exactly the pre-v1.4.0 behaviour', () => {
+		const without = mergeDictionary({ base: ['a'], note: ['a', 'b'], file: null, pending: [] });
+		const empty = mergeDictionary({ base: ['a'], note: ['a', 'b'], file: null, pending: [], removals: [] });
+		assert.deepStrictEqual(without, empty, 'absent and empty removals agree');
+		assert.deepStrictEqual(without.result, ['a', 'b'], 'and the result is the plain merge');
+	});
+
+	// ---- integration: dismiss -> record -> restore, against the REAL linter --
+	// Own fixture: a fresh dataDir and a fresh engine, with NO dictionary note and NO external file,
+	// so nothing here interacts with the reconcile machinery the blocks above exercise.
+	{
+		const sdDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-settings-'));
+		const sdState = await run({
+			dataDir: sdDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+		});
+		const sh = sdState.contentScriptMessageHandlers['harperCm'];
+		const metaPath = path.join(sdDir, 'dismissedMeta.json');
+		const ignorePath = path.join(sdDir, 'ignoredLints.json');
+		const readEntries = () => {
+			try {
+				return JSON.parse(fs.readFileSync(metaPath, 'utf8')).entries;
+			} catch {
+				return [];
+			}
+		};
+		const readIgnoreRaw = () => {
+			try {
+				return fs.readFileSync(ignorePath, 'utf8');
+			} catch {
+				return '';
+			}
+		};
+
+		const TEXT_A = 'I saw teh cat.';
+		const TEXT_B = 'I beleive it.';
+		let entryA = null;
+		let entryB = null;
+		let hashesBeforeRestore = [];
+
+		await test('dismiss records a side-table entry with the rule, the flagged text, a date and >=1 hash STRING', async () => {
+			const lint = (await sh({ type: 'lint', text: TEXT_A })).find((l) => l.problemText === 'teh');
+			assert.ok(lint, 'precondition: "teh" is flagged');
+			await sh({ type: 'ignoreLint', text: TEXT_A, start: lint.start, end: lint.end, ruleName: lint.ruleName });
+
+			const entries = readEntries();
+			assert.strictEqual(entries.length, 1, 'exactly one entry per user-visible Dismiss');
+			const entry = entries[0];
+			assert.ok(entry.hashes.length >= 1, 'at least one context hash captured');
+			assert.ok(
+				entry.hashes.every((h) => typeof h === 'string' && /^\d+$/.test(h)),
+				'every hash is a decimal STRING, never a number',
+			);
+			assert.strictEqual(entry.id, entry.hashes[0], 'id is the first hash (stable)');
+			assert.strictEqual(entry.problemText, 'teh', 'the flagged span is recorded');
+			assert.ok(entry.ruleName.length > 0, 'the rule name is recorded');
+			assert.ok(!Number.isNaN(Date.parse(entry.dismissedAt)), 'dismissedAt is a parseable ISO date');
+			// The privacy-scoped field list: nothing beyond these five is stored.
+			assert.deepStrictEqual(
+				Object.keys(entry).sort(),
+				['dismissedAt', 'hashes', 'id', 'problemText', 'ruleName'],
+				'no field beyond the agreed privacy-scoped set is persisted',
+			);
+		});
+
+		await test('a second dismiss adds a second entry, and the real hashes exceed Number.MAX_SAFE_INTEGER', async () => {
+			const lint = (await sh({ type: 'lint', text: TEXT_B })).find((l) => l.problemText === 'beleive');
+			assert.ok(lint, 'precondition: "beleive" is flagged');
+			await sh({ type: 'ignoreLint', text: TEXT_B, start: lint.start, end: lint.end, ruleName: lint.ruleName });
+
+			const entries = readEntries();
+			assert.strictEqual(entries.length, 2, 'both dismissals are indexed');
+			entryA = entries.find((e) => e.problemText === 'teh');
+			entryB = entries.find((e) => e.problemText === 'beleive');
+			assert.ok(entryA && entryB, 'both entries are identifiable by their flagged text');
+
+			hashesBeforeRestore = dismissedLog.extractHashes(readIgnoreRaw());
+			// A single user-visible Dismiss can ignore SEVERAL overlapping findings on the same span
+			// (that is what the 20-pass loop is for), so the count is not two — but the side table must
+			// account for every hash harper holds, which is the invariant that actually matters.
+			assert.strictEqual(
+				hashesBeforeRestore.length,
+				entryA.hashes.length + entryB.hashes.length,
+				'the two entries account for exactly the hashes harper is holding',
+			);
+			assert.strictEqual(
+				dismissedLog.legacyCount(readIgnoreRaw(), entries),
+				0,
+				'nothing is orphaned: a freshly recorded dismissal is never "legacy"',
+			);
+			// The precondition that makes the u64 test below meaningful: if harper ever started
+			// emitting small hashes this would fail loudly rather than silently testing nothing.
+			const unsafe = hashesBeforeRestore.filter((h) => String(Number(h)) !== h);
+			assert.ok(unsafe.length > 0, `at least one hash is past 2^53 (got ${hashesBeforeRestore.join(', ')})`);
+		});
+
+		await test('restoreDismissed makes the finding reappear on re-lint and shrinks ignoredLints', async () => {
+			const res = await sh({ type: 'settings:restoreDismissed', id: entryA.id });
+			assert.strictEqual(res.ok, true, 'the restore reports success');
+
+			const againA = (await sh({ type: 'lint', text: TEXT_A })).filter((l) => l.problemText === 'teh');
+			assert.ok(againA.length >= 1, 'the restored finding is flagged again');
+			const stillB = (await sh({ type: 'lint', text: TEXT_B })).filter((l) => l.problemText === 'beleive');
+			assert.strictEqual(stillB.length, 0, 'the OTHER dismissal is untouched and still suppressed');
+
+			const after = dismissedLog.extractHashes(readIgnoreRaw());
+			assert.strictEqual(
+				after.length,
+				hashesBeforeRestore.length - entryA.hashes.length,
+				'ignoredLints shrank by exactly the restored entry\'s hashes',
+			);
+			assert.deepStrictEqual(readEntries().map((e) => e.id), [entryB.id], 'only the restored row is gone');
+		});
+
+		await test('u64 regression: an untouched hash survives a record+restore cycle BYTE-IDENTICALLY', async () => {
+			const raw = readIgnoreRaw();
+			// The whole point: entry B's hash was rewritten by the clear-then-reimport that the restore
+			// performs, and it must come back out of that cycle as the exact same digits. A JSON.parse
+			// round trip anywhere on this path would have rounded it.
+			for (const hash of entryB.hashes) {
+				assert.ok(raw.includes(hash), `hash ${hash} is still present verbatim in the persisted payload`);
+			}
+			assert.deepStrictEqual(
+				dismissedLog.extractHashes(raw),
+				entryB.hashes,
+				'the surviving ignore state is exactly the untouched entry\'s hashes, undamaged',
+			);
+			// And the file is still harper's own shape, so importIgnoredLints will accept it on restart.
+			assert.ok(/^\{"context_hashes":\[.*\]\}$/.test(raw.trim()), `payload keeps harper's shape: ${raw}`);
+		});
+
+		await test('settings snapshot carries the structured tree, concrete defaults and the sparse overrides', async () => {
+			const snap = await sh({ type: 'settings:snapshot', includeDescriptions: false });
+			assert.ok(snap.structured && Array.isArray(snap.structured.settings), 'structured tree present');
+			const groups = snap.structured.settings.filter((s) => s.Group);
+			assert.ok(groups.length >= 10, `the structured config exposes group nodes (got ${groups.length})`);
+			const defaultKeys = Object.keys(snap.defaults);
+			assert.ok(defaultKeys.length > 500, `defaults enumerate the whole rule roster (got ${defaultKeys.length})`);
+			assert.ok(
+				defaultKeys.every((k) => typeof snap.defaults[k] === 'boolean'),
+				'every default is a CONCRETE boolean (this, not Bool.state, is what "Default" resolves to)',
+			);
+			assert.strictEqual(snap.descriptionsHtml, null, 'descriptions omitted when not requested (lazy-capable)');
+			assert.strictEqual(snap.settings.dialect, 'American', 'primitive settings ride along');
+			assert.strictEqual(snap.settings.ignoreNonEnglish, false, 'including the new ignoreNonEnglish');
+			assert.ok('dictionaryPath' in snap.settings, 'dictionaryPath is present on desktop');
+			assert.ok(Array.isArray(snap.dictionaryWords), 'the effective word list rides along');
+		});
+
+		await test('rule descriptions are served on demand, one HTML entry per rule', async () => {
+			const descriptions = await sh({ type: 'settings:descriptions' });
+			const keys = Object.keys(descriptions);
+			assert.ok(keys.length > 500, `descriptions cover the roster (got ${keys.length})`);
+			assert.ok(
+				keys.every((k) => typeof descriptions[k] === 'string' && descriptions[k].length > 0),
+				'every description is a non-empty string',
+			);
+		});
+
+		await test('legacy count: ignore hashes with no side-table entry are counted as legacy', async () => {
+			// Simulate dismissals made BEFORE this feature existed: harper still holds the ignores, but
+			// nothing readable describes them, so the UI can only offer a bulk clear.
+			fs.writeFileSync(metaPath, '', 'utf8');
+			const live = dismissedLog.extractHashes(readIgnoreRaw());
+			assert.ok(live.length >= 1, 'precondition: harper still holds at least one ignore');
+			const snap = await sh({ type: 'settings:snapshot', includeDescriptions: false });
+			assert.strictEqual(snap.dismissed.entries.length, 0, 'no readable entries remain');
+			assert.strictEqual(snap.dismissed.legacyCount, live.length, 'every unaccounted hash counts as legacy');
+		});
+
+		await test('clearDismissed("all") wipes harper\'s ignore state and the side table together', async () => {
+			const res = await sh({ type: 'settings:clearDismissed', scope: 'all' });
+			assert.strictEqual(res.ok, true, 'the clear reports success');
+			assert.deepStrictEqual(dismissedLog.extractHashes(readIgnoreRaw()), [], 'no ignore hashes left');
+			assert.deepStrictEqual(readEntries(), [], 'no side-table rows left');
+			const back = (await sh({ type: 'lint', text: TEXT_B })).filter((l) => l.problemText === 'beleive');
+			assert.ok(back.length >= 1, 'the previously suppressed finding is flagged again');
+		});
+
+		await test('applyRuleOverrides round-trip: sparse write, ruleOverrides setting content, reset restores defaults', async () => {
+			const before = (await sh({ type: 'lint', text: 'This is an test.' })).filter((l) => l.ruleName === 'AnA');
+			assert.ok(before.length >= 1, 'precondition: AnA fires on "an test"');
+
+			const applied = await sh({
+				type: 'settings:applyRuleOverrides',
+				overrides: { AnA: false, SomeRuleLeftOnDefault: null },
+			});
+			assert.deepStrictEqual(applied.overrides, { AnA: false }, 'null keys are dropped — the map stays sparse');
+			assert.strictEqual(
+				sdState.settings.ruleOverrides,
+				'{"AnA":false}',
+				'persisted in the same hand-editable JSON format users already have',
+			);
+			const after = (await sh({ type: 'lint', text: 'This is an test.' })).filter((l) => l.ruleName === 'AnA');
+			assert.strictEqual(after.length, 0, 'AnA no longer fires');
+
+			const snap = await sh({ type: 'settings:snapshot', includeDescriptions: false });
+			assert.deepStrictEqual(snap.flatConfig, { AnA: false }, 'the snapshot echoes the sparse map back');
+
+			await sh({ type: 'settings:resetRules' });
+			assert.strictEqual(sdState.settings.ruleOverrides, '', 'reset returns the setting to its pristine default');
+			const reset = (await sh({ type: 'lint', text: 'This is an test.' })).filter((l) => l.ruleName === 'AnA');
+			assert.ok(reset.length >= 1, 'AnA fires again once the override is reset');
+		});
+
+		await test('updateSetting writes allowlisted keys through joplin.settings and REJECTS anything else', async () => {
+			await sh({ type: 'settings:updateSetting', key: 'ignoreNonEnglish', value: true });
+			assert.strictEqual(sdState.settings.ignoreNonEnglish, true, 'ignoreNonEnglish written');
+			await sh({ type: 'settings:updateSetting', key: 'debounceMs', value: 99999 });
+			assert.strictEqual(sdState.settings.debounceMs, 10000, 'out-of-range values are clamped to the declared max');
+
+			let rejected = false;
+			try {
+				await sh({ type: 'settings:updateSetting', key: 'syncBase', value: 'tampered' });
+			} catch {
+				rejected = true;
+			}
+			assert.ok(rejected, 'an internal, non-allowlisted key cannot be written from the dialog');
+
+			let badDialect = false;
+			try {
+				await sh({ type: 'settings:updateSetting', key: 'dialect', value: 'Klingon' });
+			} catch {
+				badDialect = true;
+			}
+			assert.ok(badDialect, 'an unknown dialect is rejected rather than stored');
+
+			await sh({ type: 'settings:updateSetting', key: 'ignoreNonEnglish', value: false });
+			await sh({ type: 'settings:updateSetting', key: 'debounceMs', value: 500 });
+		});
+
+		await test('Indian is an accepted dialect end to end (harper 2.7.0 Dialect.Indian = 4)', async () => {
+			await sh({ type: 'settings:updateSetting', key: 'dialect', value: 'Indian' });
+			assert.strictEqual(sdState.settings.dialect, 'Indian', 'the Indian dialect is stored');
+			// setDialect rebuilds the engine; the plugin's onChange re-applies configuration right
+			// after, so a lint must still work rather than throwing or returning nothing.
+			const lints = await sh({ type: 'lint', text: 'I beleive this is teh answer.' });
+			assert.ok(Array.isArray(lints) && lints.length >= 1, 'linting still works under the Indian dialect');
+			await sh({ type: 'settings:updateSetting', key: 'dialect', value: 'American' });
+		});
+	}
+
+	// ---- integration: the MOBILE side-table path (settings-backed, zero fs) --
+	{
+		const mobileDismissDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-mobile-dismiss-'));
+		const mdState = await run({
+			dataDir: mobileDismissDir,
+			installationDir: DIST_DIR,
+			// Any joplin.require() on mobile is a bug — the plugin iframe has no Node.
+			require: (name) => {
+				throw new Error(`mobile must not require(${name})`);
+			},
+			versionInfo: { version: '3.7.2', platform: 'mobile' },
+		});
+		const mh = mdState.contentScriptMessageHandlers['harperCm'];
+
+		await test('mobile: the dismissed side table lives in a private setting, writes NO file, and does not loop', async () => {
+			assert.ok(mdState.registeredSettings.dismissedMeta, 'dismissedMeta is registered on mobile');
+			assert.strictEqual(mdState.registeredSettings.dismissedMeta.public, false, 'and it is private');
+
+			const text = 'I saw teh cat.';
+			const lint = (await mh({ type: 'lint', text })).find((l) => l.problemText === 'teh');
+			assert.ok(lint, 'precondition: "teh" is flagged');
+			await mh({ type: 'ignoreLint', text, start: lint.start, end: lint.end, ruleName: lint.ruleName });
+
+			const entries = dismissedLog.parseEntries(mdState.settings.dismissedMeta);
+			assert.strictEqual(entries.length, 1, 'the entry landed in the settings value, not a file');
+			assert.strictEqual(entries[0].problemText, 'teh', 'with the flagged span recorded');
+			assert.ok(
+				dismissedLog.extractHashes(mdState.settings.ignoredLints).length >= 1,
+				'harper\'s own ignore payload is persisted alongside it',
+			);
+			assert.deepStrictEqual(fs.readdirSync(mobileDismissDir), [], 'the mobile run wrote no files at all');
+
+			// The internal keys must be excluded from the settings onChange reconfigure, or writing the
+			// side table would trigger a reconfigure that writes it again.
+			const rewrites = mdState.settingWrites.filter((w) => w.key === 'dismissedMeta');
+			assert.strictEqual(rewrites.length, 1, 'one dismiss => exactly one side-table write (no feedback loop)');
+
+			const after = (await mh({ type: 'lint', text })).filter((l) => l.problemText === 'teh');
+			assert.strictEqual(after.length, 0, 'and the dismissal actually suppresses the finding');
+		});
+
+		await test('mobile: restoreDismissed works off the settings-backed store too', async () => {
+			const entry = dismissedLog.parseEntries(mdState.settings.dismissedMeta)[0];
+			const res = await mh({ type: 'settings:restoreDismissed', id: entry.id });
+			assert.strictEqual(res.ok, true, 'restore succeeds on mobile');
+			assert.deepStrictEqual(
+				dismissedLog.parseEntries(mdState.settings.dismissedMeta),
+				[],
+				'the row is gone from the settings-backed table',
+			);
+			const back = (await mh({ type: 'lint', text: 'I saw teh cat.' })).filter((l) => l.problemText === 'teh');
+			assert.ok(back.length >= 1, 'the finding is flagged again');
+			assert.deepStrictEqual(fs.readdirSync(mobileDismissDir), [], 'still zero filesystem writes');
 		});
 	}
 
