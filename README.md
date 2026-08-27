@@ -40,7 +40,7 @@ suggestion:
   between sessions, without disabling the rule everywhere.
 - **Disable a rule.** The toggle in the card header turns off the rule that produced the finding,
   everywhere, from then on.
-- **Dialects.** Check against American, British, Australian, or Canadian English.
+- **Dialects.** Check against American, British, Australian, Canadian, or Indian English.
 
 ## Your dictionary
 
@@ -91,9 +91,10 @@ Open **Tools → Options → Harper** on desktop, or **Configuration → Plugins
 | --- | --- | --- |
 | **Enable Harper grammar checking** | On | Master switch. When off, no underlines are shown. |
 | **Dictionary note** | *(empty)* | The Joplin note that holds your shared word list. Set automatically by the **Harper: Create dictionary note** command. See [Your dictionary](#your-dictionary). |
-| **English dialect** | American | Which English variety Harper checks against: American, British, Australian, or Canadian. |
+| **English dialect** | American | Which English variety Harper checks against: American, British, Australian, Canadian, or Indian. |
 | **Lint debounce (ms)** | `500` | How long the editor waits after you stop typing before re-checking, in milliseconds (0–10000). Changes apply immediately. |
 | **Underline style** | Squiggly | How findings are underlined: *Squiggly (default)* for Harper's wavy underline, or *Solid line* for a straight 2 px line with a light tint. Either way the colour is the issue type's. Changes apply immediately. |
+| **Ignore non-English text** | Off | Skip text that Harper detects as not English. Useful for multilingual notes. |
 | **External dictionary file** | *(empty)* | *Desktop only.* Absolute path to a plain-text dictionary (one word per line). See [Your dictionary](#your-dictionary). |
 | **Rule overrides (JSON)** | *(empty)* | *Advanced.* A JSON object of `{"RuleName": true \| false}` applied on top of the defaults, e.g. `{"SpelledNumbers": false}`. Invalid JSON is ignored. |
 

@@ -251,10 +251,13 @@ export function createSettingsService(deps: SettingsServiceDeps): SettingsServic
 	}
 
 	async function readPrimarySettings(): Promise<PrimarySettings> {
+		// `0` is a legitimate debounce (lint immediately), so this cannot use `|| 500` — that would
+		// show the dialog 500 for a user who deliberately set no delay, and saving would undo it.
+		const rawDebounce = Number(await deps.getSetting('debounceMs'));
 		const settings: PrimarySettings = {
 			enabled: (await deps.getSetting('enabled')) !== false,
 			dialect: (await deps.getSetting('dialect')) || 'American',
-			debounceMs: Number(await deps.getSetting('debounceMs')) || 500,
+			debounceMs: Number.isFinite(rawDebounce) ? rawDebounce : 500,
 			underlineStyle: (await deps.getSetting('underlineStyle')) === 'solid' ? 'solid' : 'squiggly',
 			ignoreNonEnglish: (await deps.getSetting('ignoreNonEnglish')) === true,
 			dictionaryNoteId: (await deps.getSetting('dictionaryNoteId')) || '',

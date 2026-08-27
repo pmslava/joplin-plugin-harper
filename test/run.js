@@ -1797,6 +1797,17 @@ async function main() {
 			await sh({ type: 'settings:updateSetting', key: 'debounceMs', value: 500 });
 		});
 
+		await test('snapshot reports a debounce of 0 as 0 (a falsy-but-valid value must survive the round trip)', async () => {
+			// `0` means "lint immediately" and is inside the setting's declared range. A `|| 500`
+			// fallback would report 500 back to the dialog, and saving that would silently undo the
+			// user's choice — so the round trip is asserted rather than assumed.
+			await sh({ type: 'settings:updateSetting', key: 'debounceMs', value: 0 });
+			assert.strictEqual(sdState.settings.debounceMs, 0, 'zero is stored, not coerced');
+			const snap = await sh({ type: 'settings:snapshot', includeDescriptions: false });
+			assert.strictEqual(snap.settings.debounceMs, 0, 'and zero is what the dialog reads back');
+			await sh({ type: 'settings:updateSetting', key: 'debounceMs', value: 500 });
+		});
+
 		await test('Indian is an accepted dialect end to end (harper 2.7.0 Dialect.Indian = 4)', async () => {
 			await sh({ type: 'settings:updateSetting', key: 'dialect', value: 'Indian' });
 			assert.strictEqual(sdState.settings.dialect, 'Indian', 'the Indian dialect is stored');
