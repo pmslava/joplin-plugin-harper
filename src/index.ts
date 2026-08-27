@@ -396,6 +396,42 @@ async function addPendingRemoval(word: string): Promise<void> {
 	await joplin.settings.setValue(PENDING_REMOVALS_KEY, current);
 }
 
+/**
+ * RETIRE the entries a reconcile pass actually consumed — never the whole buffer.
+ *
+ * A pass SNAPSHOTS a buffer near its start and only reaches its commit several awaits later (the
+ * note `data.get`, the L3-gated `data.put`, the atomic file rewrite, the base write). Every one of
+ * those awaits is a point where the plugin's own event loop can run `addPendingWord` /
+ * `addPendingRemoval` for a word the user just acted on — the editor's "Add to dictionary", or the
+ * settings dialog's word editor. Writing `[]` at the end would throw those away: the word was never
+ * in the merge (it arrived after the snapshot), never reached the note or the file, and its only
+ * record was the buffer that just got wiped. Silent data loss, and the narrower the window the
+ * harder it is to ever notice.
+ *
+ * So the commit re-reads the buffer and keeps `current − consumed`, which leaves exactly the
+ * entries that arrived mid-pass. They are picked up whole by the next pass, which is idempotent.
+ *
+ * SET semantics, deliberately: `addPendingWord`/`addPendingRemoval` already refuse to enqueue a word
+ * the buffer holds, so a duplicate can only come from a hand-edited setting or an older build, and
+ * it carries no information the pass did not already consume. Removing every copy is therefore
+ * right; removing one copy per snapshotted occurrence would strand the survivor in the buffer
+ * forever, since each later pass would consume and re-strand it.
+ *
+ * No consumed entries, or nothing of them left to drop, means no settings write at all.
+ */
+async function retirePendingEntries(
+	key: string,
+	consumed: string[],
+	read: () => Promise<string[]>,
+): Promise<void> {
+	if (!consumed.length) return;
+	const current = await read();
+	const done = new Set(consumed);
+	const survivors = current.filter((w) => !done.has(w));
+	if (survivors.length === current.length) return; // nothing this pass consumed is still queued
+	await joplin.settings.setValue(key, survivors);
+}
+
 // -----------------------------------------------------------------------------
 // syncBase (v1.3.0): the last successfully reconciled word set, persisted as a JSON array in a
 // PRIVATE String setting. Settings writes are safe on both platforms at any time (L4), including
@@ -667,7 +703,8 @@ async function pokeForceLint(): Promise<void> {
 // This replaces v1.2.0's additive flush+mirror. ONE function owns the whole dictionary round trip:
 //
 //   read sides -> mergeDictionary(base, note, file, pending) -> write the sides that differ ->
-//   persist the new base -> clear the flushed pending buffer -> hand the result to the engine.
+//   persist the new base -> retire the pending entries this pass flushed (NOT the whole buffer —
+//   see retirePendingEntries) -> hand the result to the engine.
 //
 // WRITE DISCIPLINE (unchanged from v1.2.0, and still the only note-write path in the plugin):
 //   * the note is written with `joplin.data.put` ONLY when `editorOpen === false` (L3 — a plugin note
@@ -747,8 +784,10 @@ async function runReconcile(reason: string): Promise<string[]> {
 			// side IS configured and merely unreadable this pass (unsynced note, offline drive), the
 			// buffer must survive: clearing it would let that side put the word back when it returns.
 			const anyDurableSideConfigured = !!cfg.dictionaryNoteId || (!isMobile() && !!cfg.dictionaryPath);
-			if (removals.length && !anyDurableSideConfigured) {
-				await joplin.settings.setValue(PENDING_REMOVALS_KEY, []);
+			if (!anyDurableSideConfigured) {
+				// Only the removals THIS pass read are retired: `readPendingWords` above is an await, so a
+				// removal queued since the snapshot has not been applied to anything yet and must survive.
+				await retirePendingEntries(PENDING_REMOVALS_KEY, removals, readPendingRemovals);
 			}
 			return lastEngineWords;
 		}
@@ -816,11 +855,15 @@ async function runReconcile(reason: string): Promise<string[]> {
 		const committed = noteWritten && fileWritten && allSidesPresent;
 		if (committed) {
 			await writeSyncBase(merged.result);
-			if (pending.length) await joplin.settings.setValue('pendingWords', []);
+			// Retire only what THIS pass merged and wrote — see retirePendingEntries. Anything enqueued
+			// while the pass was in flight (the note read, the note write, the file rewrite are all
+			// awaits the user's "Add to dictionary" can land inside) is kept for the next pass, which
+			// is idempotent and will merge it exactly as if it had arrived a tick later.
+			await retirePendingEntries('pendingWords', pending, readPendingWords);
 			// Removals retire on exactly the same condition as pending additions: every side that
 			// needed writing was written, and every configured side was present. Until then the buffer
 			// is what stops a not-yet-rewritten side from resurrecting the word on the next pass.
-			if (removals.length) await joplin.settings.setValue(PENDING_REMOVALS_KEY, []);
+			await retirePendingEntries(PENDING_REMOVALS_KEY, removals, readPendingRemovals);
 		}
 
 		if (merged.deleted.length || merged.added.length) {
