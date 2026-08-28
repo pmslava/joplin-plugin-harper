@@ -12,8 +12,8 @@ jobs:
     name: Harness (desktop + mobile)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
@@ -33,9 +33,9 @@ jobs:
       # Must be >= the plugin's manifest app_min_version. Keep in sync with scripts/setup-e2e.sh.
       JOPLIN_E2E_VERSION: 3.6.14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
@@ -52,7 +52,7 @@ jobs:
       # Cache the downloaded Joplin AppImage so reruns skip the ~150 MB download.
       # setup-e2e.sh re-extracts it (fast) when the squashfs-root is absent.
       - name: Cache Joplin AppImage
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .e2e-cache/Joplin.AppImage
           key: joplin-appimage-${{ env.JOPLIN_E2E_VERSION }}
@@ -66,7 +66,7 @@ jobs:
         # Always upload, including when the suite fails or the job hits its timeout — the traces are
         # the whole point of the artifact and are needed precisely when something went wrong.
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-report
           path: |
