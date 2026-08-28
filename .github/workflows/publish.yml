@@ -24,6 +24,8 @@ name: Publish to npm
 #    token, and npm then treats authentication as already configured and never starts the OIDC
 #    exchange (actions/setup-node#1551). Without it there is no .npmrc, and npm publishes to the
 #    default registry, which is registry.npmjs.org anyway.
+#    (setup-node v7 dropped the placeholder-token export, actions/setup-node#1558, but `registry-url`
+#    still writes that .npmrc auth line, so this workflow keeps leaving the input out.)
 #  - NODE_AUTH_TOKEN is deliberately not set, for the same reason.
 #  - Provenance attestations are generated automatically when publishing this way, so `--provenance`
 #    is not passed.
@@ -44,9 +46,9 @@ jobs:
       # Lets the job mint the OIDC token that npm exchanges for publish rights.
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
@@ -110,9 +112,14 @@ jobs:
       # switch only the registry-facing steps to a runtime supported by npm trusted publishing
       # (Node 22.14.0 or newer).
       - name: Use a current Node runtime for trusted publishing
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
+          # This step only swaps the Node runtime; the npm cache was already handled by the
+          # setup-node step at the top of the job. setup-node v5 started caching automatically when
+          # package.json declares a `packageManager`, so opt out explicitly to keep this step's
+          # behaviour identical to the v4 one it replaces.
+          package-manager-cache: false
 
       # Trusted publishing requires npm 11.5.1 or later. Stay on npm 11 for reproducible behavior;
       # Node 24 satisfies both npm 11's engine requirements and npm's trusted-publishing runtime
