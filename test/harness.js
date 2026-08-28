@@ -25,6 +25,9 @@ function makeJoplin(options) {
     const state = {
         settings,
         registeredSettings: null,
+        // One entry per registerSettings() call, holding that call's keys in order — the evidence for
+        // "the surface switch is registered FIRST, and alone, so it can be read before the rest".
+        registerSettingsCalls: [],
         // STRICT settings fidelity: the exact set of keys the plugin registered via
         // settings.registerSettings THIS run. settings.value()/values() throw 'Unknown key' for any
         // key not in here, mirroring real Joplin (a key registered on desktop only — dictionaryPath —
@@ -36,6 +39,20 @@ function makeJoplin(options) {
         panelScripts: [],
         toolbarButtons: [],
         menus: [],
+        // HARPER v1.4.0 (settings dialog): the dialog's construction, recorded so a test can assert the
+        // pieces that make it usable at all — the CSS+JS assets, the single Close button, and
+        // setFitToContent(false) (without which the dialog has no real viewport).
+        dialogScripts: [],
+        dialogHtml: {},
+        dialogButtons: {},
+        dialogFitToContent: {},
+        menuItems: [],
+        // Every views.*.onMessage handler by view handle, so the DIALOG's endpoint can be driven
+        // directly (state.panelMessageHandler only ever holds the last one registered).
+        viewMessageHandlers: {},
+        // Every panels.postMessage(handle, message) — the reopen nudge is fire-and-forget, so this is
+        // the only way to see it happened.
+        viewPostedMessages: [],
         commands: [],
         // HARPER: every joplin.commands.execute(name, ...args), in order.
         commandExecutions: [],
@@ -47,6 +64,7 @@ function makeJoplin(options) {
         // Every settings.setValue, so a test can assert a render wrote no profile/setting (the outside-results peek is read-only).
         settingWrites: [],
         onStart: null,
+        sectionDescription: '',
         panelMessageHandler: null,
         // HARPER: every joplin.contentScripts.register(type, id, path) call, in order.
         contentScripts: [],
@@ -76,6 +94,31 @@ function makeJoplin(options) {
         timeouts: [],
         // Set to a DialogResult to make the next dialogs.open() return it instead of a cancel.
         dialogResult: null,
+        // Optional awaited hook run at the START of every data.put, before the write is recorded or
+        // applied: `async (noteId, body) => {}`. Lets a test act while a reconcile pass is suspended
+        // mid-write (see the pending-buffer race regressions in run.js).
+        beforeNotePut: null,
+        // The same idea one stage EARLIER: an awaited hook at the start of every single-note data.get,
+        // `async (noteId, query) => {}`. A reconcile pass reads the dictionary note long before it
+        // writes anything, and the buffer snapshots straddle that read — so the window that a
+        // beforeNotePut injection is already past is only reachable from here.
+        beforeNoteGet: null,
+        // An awaited hook run once a settings.setValue is VISIBLE but before the onChange handlers:
+        // `async (key, value) => {}`. The dictionary editor's save spends its whole duration in
+        // per-word settings writes, so this is where a test can start a COMPETING reconcile partway
+        // through one — a pass that has read the buffers as they stood after some of the words but
+        // before the rest.
+        afterSettingWrite: null,
+        // The mirror, run BEFORE the value is applied: `async (key, value) => {}`. Awaiting here parks
+        // a read-modify-write between its read and its write, which is the only way to hold open the
+        // window a buffer clobber needs — and, run against a correct implementation, the way to prove
+        // a competing writer is made to queue behind it rather than racing into that window.
+        beforeSettingWrite: null,
+        // An awaited hook at the start of every settings.value: `async (key) => {}`. `loadSettings`
+        // rewrites cfg through eight sequential reads, so this is the only way to park INSIDE that
+        // window — after the dictionary identity has flipped but before the merge base is reset, the
+        // one span where cfg and syncBase genuinely disagree.
+        beforeSettingRead: null,
     }
 
     const notes = options.notes || {}
@@ -129,9 +172,19 @@ function makeJoplin(options) {
         },
         versionInfo: async () => options.versionInfo,
         settings: {
-            registerSection: async () => {},
+            // HARPER v1.4.0: keep the section's description — it is the only in-app pointer to the
+            // "Harper: Settings…" command, and Joplin renders it as literal text (no markup allowed).
+            registerSection: async (name, section) => { state.sectionDescription = (section || {}).description || '' },
+            // ADDITIVE, like the real API. The plugin registers in TWO passes — the `manageInDialog`
+            // surface switch alone first, so its value can be read, then everything else with `public:`
+            // derived from it — and Joplin merges both into one set. Overwriting here instead would
+            // have made the switch vanish from `registeredSettings` the moment the second call landed,
+            // and every assertion about it silently read `undefined`.
             registerSettings: async (defs) => {
-                state.registeredSettings = defs
+                state.registeredSettings = Object.assign(state.registeredSettings || {}, defs)
+                // The ORDER of the registration calls is itself part of the contract (the switch has to
+                // exist before it is read), so each call's key list is recorded as its own batch.
+                state.registerSettingsCalls.push(Object.keys(defs))
                 for (const key of Object.keys(defs)) {
                     state.registeredKeys.add(key)
                     if (!(key in settings)) settings[key] = defs[key].value
@@ -141,6 +194,7 @@ function makeJoplin(options) {
             // plugin-<id>.<key>). This is what makes reading an unregistered setting a HARD failure in
             // the harness — the fidelity gap that let the mobile dictionaryPath read pass silently.
             value: async (key) => {
+                if (state.beforeSettingRead) await state.beforeSettingRead(key)
                 if (!state.registeredKeys.has(key)) {
                     throw new Error(`Unknown key: plugin-${PLUGIN_ID}.${key} (Calling api.joplin.settings.value)`)
                 }
@@ -158,8 +212,10 @@ function makeJoplin(options) {
                 return out
             },
             setValue: async (key, value) => {
+                if (state.beforeSettingWrite) await state.beforeSettingWrite(key, value)
                 state.settingWrites.push({ key, value })
                 settings[key] = value
+                if (state.afterSettingWrite) await state.afterSettingWrite(key, value)
                 for (const handler of state.settingHandlers) await handler({ keys: [key] })
             },
             onChange: async (handler) => { state.settingHandlers.push(handler) },
@@ -180,21 +236,32 @@ function makeJoplin(options) {
             panels: {
                 create: async (id) => { state.panels.push(id); return `panel-${id}` },
                 addScript: async (handle, script) => { state.panelScripts.push(script) },
-                onMessage: async (handle, handler) => { state.panelMessageHandler = withTimerCapture(handler) },
+                // HARPER v1.4.0: the settings DIALOG registers its handler here too — panels.onMessage
+                // accepts a dialog handle (same WebviewController underneath), which is the only way to
+                // talk to a dialog webview. Keyed by handle so the panel and the dialog can coexist.
+                onMessage: async (handle, handler) => {
+                    state.panelMessageHandler = withTimerCapture(handler)
+                    state.viewMessageHandlers[handle] = withTimerCapture(handler)
+                },
+                postMessage: (handle, message) => { state.viewPostedMessages.push({ handle, message }) },
                 setHtml: async (handle, html) => { state.setHtmlCalls++; state.callLog.push('setHtml'); state.panelHtml[handle] = html },
                 show: async () => {},
                 visible: async () => true,
             },
             dialogs: {
                 create: async (id) => { state.dialogs.push(id); return `dialog-${id}` },
-                addScript: async () => {},
-                setHtml: async () => {},
-                setButtons: async () => {},
+                addScript: async (handle, script) => { state.dialogScripts.push({ handle, script }) },
+                setHtml: async (handle, html) => { state.dialogHtml[handle] = html },
+                setButtons: async (handle, buttons) => { state.dialogButtons[handle] = buttons },
+                setFitToContent: async (handle, status) => { state.dialogFitToContent[handle] = status },
                 open: async () => state.dialogResult || { id: 'cancel' },
                 showMessageBox: async (message) => { state.messageBoxes.push(message); return 0 },
             },
             toolbarButtons: {
                 create: async (id, command, location) => { state.toolbarButtons.push({ id, command, location }) },
+            },
+            menuItems: {
+                create: async (id, command, location, options) => { state.menuItems.push({ id, command, location, options }) },
             },
             menus: {
                 create: async (id, label, items, location) => { state.menus.push({ id, label, location }) },
@@ -262,6 +329,7 @@ function makeJoplin(options) {
                 if (pathParts[0] === 'notes') {
                     // Bare ['notes'] is the search field's "recent notes" suggestion fetch.
                     if (pathParts.length === 1) return { items: options.recentNotes || [], has_more: false }
+                    if (state.beforeNoteGet) await state.beforeNoteGet(pathParts[1], query)
                     const note = notes[pathParts[1]]
                     if (!note) throw new Error('Not Found')
                     // ['notes', id, 'tags'] lists the tags currently on a note (tag picker).
@@ -271,6 +339,10 @@ function makeJoplin(options) {
                 throw new Error(`Unexpected data.get: ${pathParts}`)
             },
             put: async (pathParts, _q, body) => {
+                // HARPER: an optional AWAITED hook, set by a test after run(). A note write is the widest
+                // await inside a reconcile pass, so this is where a test injects the concurrent user
+                // action (add-to-dictionary, a queued removal) that the pending-buffer race is about.
+                if (state.beforeNotePut) await state.beforeNotePut(pathParts[1], body)
                 // `fields` keeps the whole PUT body so a test can assert the exact shape (e.g. that a tick
                 // writes a numeric todo_completed); `body` stays the note-body string the older checks read.
                 state.notePuts.push({ id: pathParts[1], body: body.body, fields: body })

@@ -23,6 +23,13 @@
  * survives a concurrent deletion of the same word on the other side. Deletions therefore need
  * agreement-by-silence; additions need only one voice.
  *
+ * EXPLICIT REMOVALS (v1.4.0, the dictionary editor's remove half) are the one exception, and the
+ * mirror image of P: `result` has R subtracted last, so a stated deletion beats a concurrent
+ * addition and applies even on a first run. Everything else here infers intent from what the sides
+ * look like; R *is* the intent, so it does not get out-voted by an inference.
+ *
+ *     result  = ((B \ (deleted \ added)) ∪ added) \ R      with added already R-free
+ *
  * ABSENT SIDES infer NO deletions: the side is passed as `null`, contributes nothing to `deleted`, and
  * the whole base survives this pass. An *empty but readable* side is NOT absent — it is passed as `[]`
  * and its deletions are honoured, because emptying the dictionary note is a legitimate user action.
@@ -54,6 +61,17 @@ export interface MergeInput {
 	file: readonly string[] | null;
 	/** Words added via add-to-dictionary and not yet folded into a durable side. */
 	pending: readonly string[];
+	/**
+	 * Words the user EXPLICITLY deleted (the dictionary editor's remove half), not yet folded into a
+	 * durable side. The exact mirror of `pending`, and the only way to express a deletion that no side
+	 * has performed yet. Optional: omitting it is the pre-v1.4.0 behaviour exactly.
+	 *
+	 * An explicit removal is not an inference from a side's silence, so — unlike the `B \ N` rule — it
+	 * applies on a FIRST RUN too, and it BEATS a concurrent addition of the same word (the reverse of
+	 * the normal conflict rule). Both follow from the same principle: the rules below guess at intent
+	 * from what the sides look like, whereas this is the user's intent, stated.
+	 */
+	removals?: readonly string[];
 }
 
 export interface MergeOutput {
@@ -98,6 +116,7 @@ export function mergeDictionary(input: MergeInput): MergeOutput {
 	const note = input.note == null ? null : toSet(input.note);
 	const file = input.file == null ? null : toSet(input.file);
 	const pending = toSet(input.pending);
+	const removals = toSet(input.removals);
 	const sides: Set<string>[] = [];
 	if (note) sides.push(note);
 	if (file) sides.push(file);
@@ -117,6 +136,9 @@ export function mergeDictionary(input: MergeInput): MergeOutput {
 	// add-to-dictionary of a word the base already knows still wins against a remote deletion.
 	const added = new Set<string>(pending);
 	for (const side of sides) for (const w of side) if (!base.has(w)) added.add(w);
+	// An explicit removal cancels the word's additions BEFORE the conflict rule below reads `added`,
+	// so "addition wins over deletion" cannot resurrect a word the user just deleted in the editor.
+	for (const w of removals) added.delete(w);
 
 	// deleted = (B \ N) ∪ (B \ F), over PRESENT sides only; additions win over deletions.
 	// SKIPPED on a first run: the base is then the UNION of the sides, so a word only one side holds
@@ -137,6 +159,11 @@ export function mergeDictionary(input: MergeInput): MergeOutput {
 	const result = new Set<string>();
 	for (const w of base) if (!dropped.has(w)) result.add(w);
 	for (const w of added) result.add(w);
+	// Applied last and unconditionally — including on a first run, where deletion INFERENCE is
+	// skipped but a stated deletion still stands. `deleted` (base \ result) picks these up for free,
+	// and `noteChanged`/`fileChanged` go true for any side that still lists the word, which is what
+	// makes the reconcile rewrite that side.
+	for (const w of removals) result.delete(w);
 
 	return {
 		result: sortWords(result),

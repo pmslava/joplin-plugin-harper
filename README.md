@@ -40,7 +40,11 @@ suggestion:
   between sessions, without disabling the rule everywhere.
 - **Disable a rule.** The toggle in the card header turns off the rule that produced the finding,
   everywhere, from then on.
-- **Dialects.** Check against American, British, Australian, or Canadian English.
+- **Dialects.** Check against American, British, Australian, Canadian, or Indian English.
+- **A settings screen for everything else.** **Harper: Settings…** opens a searchable browser for all
+  823 rules — each with its description shown inline — a dictionary editor, and the list of findings
+  you dismissed, with a Restore button on each. Desktop and mobile (see
+  [The settings dialog](#the-settings-dialog) below).
 
 ## Your dictionary
 
@@ -83,17 +87,51 @@ the plugin keeps them in sync with each other. A word added on your phone reache
 Joplin sync, then the file — and from there any external tool that reads it. Deletions travel the
 same way, in every direction.
 
+## The settings dialog
+
+Run the command **Harper: Settings…** for the full settings screen. On desktop it is in
+**Tools → Harper: Settings…**, or type it into the command palette (`Ctrl+P`, then `:`). On mobile
+it is in the note's **…** menu. It works the same on both.
+
+It has four sections:
+
+- **General.** The everyday options — the master switch, dialect, debounce, underline style, and the
+  two dictionary sources. By default this is the only place they are edited; see
+  [Settings](#settings) below for the switch that moves them to Joplin's own options page instead.
+- **Rules.** All 823 of Harper's checks, in the 15 groups Harper ships them in. Every rule shows what
+  it does right under its name — no clicking to find out. Search by rule name or by that description,
+  expand a group to see its rules, and set any rule to **On**, **Off**, or **Default**. Set a whole
+  group at once from the selector in its header. **Reset to Default Rules** and **Disable All Rules**
+  do what they say. Changes apply straight away — there is nothing to save.
+- **Dictionary.** Your whole word list in one text box, one word per line. Edit it, press **Save
+  dictionary**, and the changes go wherever your dictionary lives — the note, the file, or both.
+- **Dismissed.** Every finding you dismissed from a suggestion card, with the rule, the flagged text
+  and the date. **Restore** puts one back. **Clear all** clears the lot.
+
 ## Settings
 
 Open **Tools → Options → Harper** on desktop, or **Configuration → Plugins → Harper** on mobile.
+
+**Where the settings live is itself a setting.** Out of the box the Harper window owns all of them,
+and this page holds a single switch:
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| **Manage settings in the Harper window** | On | Where the basic settings are edited. **On:** they live in the Harper window and this page stays minimal. **Off:** they appear on this page instead, and **Harper: Settings…** leaves the Tools menu (desktop) or the note toolbar (mobile). Either way the rule browser, the dictionary editor and the dismissed findings exist *only* in the Harper window — on desktop it stays reachable from the command palette. Takes effect after a Joplin restart, and applies per device (it does not sync). |
+
+The settings below are the ones that switch moves. With it **on** they are edited in the Harper
+window's **General** tab; with it **off** they appear on this page. Their values and behaviour are
+identical either way, and the two surfaces stay in step — change something in either and the other
+reflects it.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
 | **Enable Harper grammar checking** | On | Master switch. When off, no underlines are shown. |
 | **Dictionary note** | *(empty)* | The Joplin note that holds your shared word list. Set automatically by the **Harper: Create dictionary note** command. See [Your dictionary](#your-dictionary). |
-| **English dialect** | American | Which English variety Harper checks against: American, British, Australian, or Canadian. |
+| **English dialect** | American | Which English variety Harper checks against: American, British, Australian, Canadian, or Indian. |
 | **Lint debounce (ms)** | `500` | How long the editor waits after you stop typing before re-checking, in milliseconds (0–10000). Changes apply immediately. |
 | **Underline style** | Squiggly | How findings are underlined: *Squiggly (default)* for Harper's wavy underline, or *Solid line* for a straight 2 px line with a light tint. Either way the colour is the issue type's. Changes apply immediately. |
+| **Ignore non-English text** | Off | Skip text that Harper detects as not English. Useful for multilingual notes. |
 | **External dictionary file** | *(empty)* | *Desktop only.* Absolute path to a plain-text dictionary (one word per line). See [Your dictionary](#your-dictionary). |
 | **Rule overrides (JSON)** | *(empty)* | *Advanced.* A JSON object of `{"RuleName": true \| false}` applied on top of the defaults, e.g. `{"SpelledNumbers": false}`. Invalid JSON is ignored. |
 
