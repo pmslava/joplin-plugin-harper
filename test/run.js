@@ -5791,6 +5791,183 @@ async function main() {
 		});
 	}
 
+	// ---- sandbox proxy: read-and-call discipline over the whole source tree --
+	// `joplin` is not an object, it is sandboxProxy(wrappedTarget). Its get trap PUSHES the property
+	// name onto a SHARED pending-call path and only the apply trap POPS a segment. So a member read
+	// that is not immediately called leaves that path permanently one segment too long, and every
+	// later call on it is rejected host-side with "Property or method X does not exist in ..." (the
+	// laurent22/joplin#4569 class). `const c = joplin.clipboard; typeof c.writeText` is the canonical
+	// way to break it, and probing buys nothing anyway: a proxy member is always truthy and always
+	// typeof 'function'. The plugin API can never be feature-detected by inspection -- only called and
+	// caught. This audit is ported from joplin-plugin-cockpit, where the bug ate the clipboard actions.
+	await test('sandbox proxy: no joplin.* member is ever read without being called in the same expression', () => {
+		// mobile-spike/src is a separate spike package, but its code runs against the same real proxy
+		// on a real device, so it is held to the same rule. api/ is vendored Joplin typings, not ours.
+		const roots = [path.join(REPO_ROOT, 'src'), path.join(REPO_ROOT, 'mobile-spike', 'src')];
+		const files = [];
+		const walk = (dir) => {
+			for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+				const full = path.join(dir, entry.name);
+				if (entry.isDirectory()) walk(full);
+				else if (/\.(ts|js)$/.test(entry.name)) files.push(full);
+			}
+		};
+		for (const root of roots) walk(root);
+		// A sentinel, not a count: prove the walk really reached the plugin entry points rather than
+		// passing vacuously over an empty list.
+		const found = files.map((file) => path.relative(REPO_ROOT, file).split(path.sep).join('/'));
+		for (const sentinel of ['src/index.ts', 'src/contentScript.ts', 'mobile-spike/src/index.ts']) {
+			assert.ok(found.includes(sentinel), `the audit must reach ${sentinel}; it walked ${found.length} file(s)`);
+		}
+
+		// Comments, string/template literals and regex literals are blanked out first (newlines kept so
+		// the reported line numbers stay true): plenty of prose in this repo says "joplin." and several
+		// regexes contain slashes that would otherwise swallow real code. A ${...} interpolation is
+		// re-entered as code, so a call written inside a template is still audited.
+		const blankNonCode = (source) => {
+			let out = '';
+			let i = 0;
+			const n = source.length;
+			let prev = '';
+			while (i < n) {
+				const c = source[i];
+				const next = source[i + 1];
+				if (c === '/' && next === '/') {
+					while (i < n && source[i] !== '\n') {
+						out += ' ';
+						i++;
+					}
+					continue;
+				}
+				if (c === '/' && next === '*') {
+					while (i < n && !(source[i] === '*' && source[i + 1] === '/')) {
+						out += source[i] === '\n' ? '\n' : ' ';
+						i++;
+					}
+					out += '  ';
+					i += 2;
+					continue;
+				}
+				if (c === '"' || c === "'") {
+					out += ' ';
+					i++;
+					while (i < n && source[i] !== c) {
+						if (source[i] === '\\') {
+							out += '  ';
+							i += 2;
+							continue;
+						}
+						out += source[i] === '\n' ? '\n' : ' ';
+						i++;
+					}
+					out += ' ';
+					i++;
+					prev = 'x';
+					continue;
+				}
+				if (c === '`') {
+					out += ' ';
+					i++;
+					while (i < n) {
+						if (source[i] === '\\') {
+							out += '  ';
+							i += 2;
+							continue;
+						}
+						if (source[i] === '`') {
+							out += ' ';
+							i++;
+							break;
+						}
+						if (source[i] === '$' && source[i + 1] === '{') {
+							out += '  ';
+							i += 2;
+							let depth = 1;
+							const start = i;
+							while (i < n && depth) {
+								if (source[i] === '{') depth++;
+								else if (source[i] === '}') depth--;
+								if (!depth) break;
+								i++;
+							}
+							out += blankNonCode(source.slice(start, i));
+							out += ' ';
+							i++;
+							continue;
+						}
+						out += source[i] === '\n' ? '\n' : ' ';
+						i++;
+					}
+					prev = 'x';
+					continue;
+				}
+				// A `/` in operand position opens a regex literal; in operator position it is division.
+				if (c === '/' && /[=(,:[!&|?{};+\-*%^~<>]/.test(prev || '(')) {
+					out += ' ';
+					i++;
+					let inClass = false;
+					while (i < n) {
+						if (source[i] === '\\') {
+							out += '  ';
+							i += 2;
+							continue;
+						}
+						if (source[i] === '[') inClass = true;
+						else if (source[i] === ']') inClass = false;
+						else if (source[i] === '/' && !inClass) break;
+						else if (source[i] === '\n') break;
+						out += ' ';
+						i++;
+					}
+					out += ' ';
+					i++;
+					while (i < n && /[a-z]/.test(source[i])) {
+						out += ' ';
+						i++;
+					}
+					prev = 'x';
+					continue;
+				}
+				out += c;
+				if (!/\s/.test(c)) prev = c;
+				i++;
+			}
+			return out;
+		};
+
+		const offenders = [];
+		for (const file of files) {
+			// `(joplin as any).x()` is the same one-get-then-call shape, so the cast is normalised away
+			// rather than left to hide the expression from the audit. Padded to keep offsets intact.
+			const code = blankNonCode(fs.readFileSync(file, 'utf8')).replace(
+				/\(\s*joplin\s+as\s+any\s*\)/g,
+				' joplin        ',
+			);
+			// The bare `joplin` identifier (the import) is not a member read and never matches: the
+			// group is +. A COMPUTED member that is called at once -- joplin.workspace[event](handler)
+			// -- is one get plus one apply and is correct, so the rule is about the next character, not
+			// the syntax: whatever follows the chain must be `(`. Namespace capture
+			// (`const s = joplin.settings`) is deliberately forbidden too, even though the proxy
+			// nominally tolerates it: the moment the capture is read twice the path is wrong again.
+			const re = /\bjoplin\s*(?:\.\s*[A-Za-z_$][\w$]*|\[[^\]]+\])+/g;
+			let match;
+			while ((match = re.exec(code)) !== null) {
+				const after = (code.slice(match.index + match[0].length).match(/^\s*(\S)/) || [])[1];
+				if (after === '(') continue;
+				const line = code.slice(0, match.index).split('\n').length;
+				const where = path.relative(REPO_ROOT, file).split(path.sep).join('/');
+				offenders.push(`${where}:${line} -> ${match[0].replace(/\s+/g, '')}`);
+			}
+		}
+		assert.strictEqual(
+			offenders.length,
+			0,
+			'a joplin.* member was read without being called in the same expression, which corrupts the ' +
+				'sandbox proxy path for every later call on it:\n        ' +
+				offenders.join('\n        '),
+		);
+	});
+
 	// ---- version quadruple --------------------------------------------------
 	// The four version fields (package.json, src/manifest.json, and BOTH package-lock fields) must
 	// stay pinned together; a stale lockfile drifted them once in the sibling project. Bump all four
