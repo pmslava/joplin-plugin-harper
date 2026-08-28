@@ -4040,7 +4040,8 @@ async function main() {
 			});
 			// A save reconciles TWICE: once to read the current list for the diff, then again inside
 			// applyWordEdits to land the edit. It is the SECOND one that reaches the write gates, so
-			// that is the one to park.
+			// that is the one to park. Counting note reads is exact — nothing else reads this note
+			// while the save is running.
 			let noteReads = 0;
 			nrState.beforeNoteGet = async (noteId) => {
 				if (noteId !== 'nrnote') return;
@@ -4062,12 +4063,25 @@ async function main() {
 			// but the epoch bracket used to wrap every settings key, so the pass was abandoned and the
 			// save replied with a word list missing the word it had just added. The dialog then re-seeded
 			// its textarea AND its baseline from that reply, under "Saved. 1 added, 0 removed."
+			// Fire the unrelated change and wait for its handler to actually REACH `loadSettings` —
+			// deterministically, off the first settings read that function makes. A wall-clock sleep
+			// here made this test flaky: too short and the handler had not run at all, so the test
+			// proved nothing either way. In the pre-fix build the epoch bump happens BEFORE
+			// loadSettings, so this signal guarantees the bump has landed by the time we release.
+			let onHandlerRunning = null;
+			const handlerRunning = new Promise((r) => {
+				onHandlerRunning = r;
+			});
+			nrState.beforeSettingRead = async (key) => {
+				if (key !== 'enabled') return;
+				nrState.beforeSettingRead = null;
+				onHandlerRunning();
+			};
 			const unrelated = nrState.setSetting('ignoreNonEnglish', true);
-			await waitFor(() => false, 40);
+			await handlerRunning;
 			release();
 			const reply = await save;
 			await unrelated;
-			await waitFor(() => false, 200);
 
 			assert.deepStrictEqual(reply.adds, ['Newword'], 'the save reports the addition');
 			assert.ok(
@@ -4080,36 +4094,61 @@ async function main() {
 			await nrState.setSetting('ignoreNonEnglish', false);
 		});
 
-		await test('a repoint still abandons: narrowing the epoch did not narrow the protection', async () => {
-			// The other direction of the same condition — the keys that DO move identity must still
-			// invalidate a pass in flight.
-			nrState.notes.nrnote2 = { id: 'nrnote2', body: '# other\n\nOwnwordnr\n', updated_time: 300 };
-			await nrState.setSetting('pendingWords', ['Buffnr']);
-			let release = null;
-			let onParked = null;
-			const parked = new Promise((r) => {
-				onParked = r;
-			});
-			const open = new Promise((r) => {
-				release = r;
-			});
-			nrState.beforeNotePut = async (noteId) => {
-				if (noteId !== 'nrnote') return;
-				nrState.beforeNotePut = null;
-				onParked();
-				await open;
-			};
-			const pass = nrState.noteSelectionChangeHandler();
-			await parked;
-			const repoint = nrState.setSetting('dictionaryNoteId', 'nrnote2');
-			await waitFor(() => false, 60);
-			release();
-			await Promise.all([pass, repoint]);
-			await waitFor(() => false, 300);
-
+		await test('a reconcile started inside the loadSettings window writes nothing', async () => {
+			// THE DIRECTION THE NARROWING COULD BREAK. `loadSettings` rewrites cfg through eight
+			// sequential reads, and the dictionary identity flips partway through — so between that
+			// flip and `resetSyncBase` the configuration names the NEW note while the merge base still
+			// describes the old one. A pass starting there reads a pair that was never simultaneously
+			// true, and nothing changes for its duration, so no epoch COMPARISON can catch it: only the
+			// bracket marking the whole span as a transition does. Parking at a durable write instead
+			// would prove nothing, because the identity comparison in passIsStale catches a repoint
+			// there whether or not the epoch is involved at all.
+			nrState.notes.nrwindow = { id: 'nrwindow', body: '# other\n\nWindowwordnr\n', updated_time: 400 };
 			assert.ok(
-				nrState.notes.nrnote2.body.includes('Ownwordnr'),
-				`the newly-pointed note keeps its own word: ${JSON.stringify(nrState.notes.nrnote2.body)}`,
+				await waitFor(() => (nrState.settings.syncBase || '').includes('Newword')),
+				'precondition: settled on the current note',
+			);
+			const fileBefore = fs.readFileSync(nrFile, 'utf8');
+			assert.ok(fileBefore.includes('Zorbulon') && fileBefore.includes('Quixnar'));
+
+			// Park inside loadSettings, on the read that follows dictionaryNoteId.
+			let release2 = null;
+			let onParked2 = null;
+			const parked2 = new Promise((r) => {
+				onParked2 = r;
+			});
+			const open2 = new Promise((r) => {
+				release2 = r;
+			});
+			nrState.beforeSettingRead = async (key) => {
+				if (key !== 'ruleOverrides') return;
+				nrState.beforeSettingRead = null; // park once; the competing pass must run freely
+				onParked2();
+				await open2;
+			};
+			const repoint = nrState.setSetting('dictionaryNoteId', 'nrwindow');
+			await parked2;
+
+			// A reconcile starting in that window — the 60 s poll, or a note selection change.
+			await nrState.noteSelectionChangeHandler();
+
+			release2();
+			await repoint;
+			await waitFor(() => false, 200);
+
+			// Without the bracket the pass merges the NEW note against the OLD base, reads every word
+			// the new note lacks as a deletion, and truncates the user's external dictionary file.
+			const fileAfter = fs.readFileSync(nrFile, 'utf8');
+			assert.ok(
+				fileAfter.includes('Zorbulon') && fileAfter.includes('Quixnar'),
+				`the external dictionary file keeps its words: ${JSON.stringify(fileAfter)}`,
+			);
+			// ...and the base ends up describing the union the repoint's own fresh pass adopts, never
+			// the shrunken set the abandoned pass computed.
+			const baseAfter = nrState.settings.syncBase || '';
+			assert.ok(
+				baseAfter.includes('Zorbulon') && baseAfter.includes('Windowwordnr'),
+				`the merge base is the first-run union: ${baseAfter}`,
 			);
 		});
 	}
@@ -4129,6 +4168,96 @@ async function main() {
 		});
 		const sph = spState.contentScriptMessageHandlers['harperCm'];
 
+		await test('applyConfiguration does not publish a stale pass into the engine either', async () => {
+			// THE SECOND ENGINE-PUBLISH SITE. `reconcileAndApply` is not the only caller of
+			// importWordsIntoLinter — `applyConfiguration` is the other, and it is the one the settings
+			// onChange handler uses for every key. Guarding only the first left the exact failure the
+			// flag exists for still reachable: a stale pass clear-then-importing over a word `addWord`
+			// had just put into the engine directly.
+			const acDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-applyconf-'));
+			const acFile = path.join(acDir, 'dict.txt');
+			fs.writeFileSync(acFile, 'Alphaac\nBetaac\n', 'utf8');
+			const acState = await run({
+				dataDir: acDir,
+				installationDir: DIST_DIR,
+				require: requireStub,
+				versionInfo: { version: '3.6.14', platform: 'desktop' },
+				initialSettings: { dictionaryNoteId: 'acnote', dictionaryPath: acFile },
+				notes: {
+					acnote: { id: 'acnote', body: '# h\n\nAlphaac\nBetaac\n', updated_time: 100 },
+					acother: { id: 'acother', body: '# other\n\nOtherac\n', updated_time: 200 },
+				},
+			});
+			const ach = acState.contentScriptMessageHandlers['harperCm'];
+			assert.ok(
+				await waitFor(() => (acState.settings.syncBase || '').includes('Alphaac')),
+				'precondition: converged',
+			);
+			// An editor is open, so the note write is L3-deferred and no durable-write gate is reached —
+			// the pass falls all the way through to the engine publish.
+			await ach({ type: 'getConfig' });
+			await ach({ type: 'addWord', word: 'Gammaac' });
+			assert.strictEqual(
+				(await ach({ type: 'lint', text: 'Gammaac is fine.' })).length,
+				0,
+				'precondition: the freshly added word is accepted',
+			);
+
+			// An UNRELATED key change routes through applyConfiguration too, and `addWord` has already
+			// nulled importedWordsKey, so the clobbering import cannot be skipped by the memo. A
+			// dialect change would also reach here, but it rebuilds the WASM instance and empties the
+			// engine outright, which would mask the thing under test. Park the pass it starts.
+			let releasePass = null;
+			let onPassParked = null;
+			const passParked = new Promise((r) => {
+				onPassParked = r;
+			});
+			const passOpen = new Promise((r) => {
+				releasePass = r;
+			});
+			acState.beforeNoteGet = async (noteId) => {
+				if (noteId !== 'acnote') return;
+				acState.beforeNoteGet = null;
+				onPassParked();
+				await passOpen;
+			};
+			const unrelated = acState.setSetting('underlineStyle', 'solid');
+			await passParked;
+
+			// Repoint the dictionary while that pass is parked, so it comes back stale. Parked inside
+			// resetSyncBase so the two handler invocations genuinely overlap.
+			let releaseRepoint = null;
+			let onRepointParked = null;
+			const repointParked = new Promise((r) => {
+				onRepointParked = r;
+			});
+			const repointOpen = new Promise((r) => {
+				releaseRepoint = r;
+			});
+			acState.beforeSettingWrite = async (key, value) => {
+				if (key !== 'syncBase' || value !== '') return;
+				acState.beforeSettingWrite = null;
+				onRepointParked();
+				await repointOpen;
+			};
+			const repoint = acState.setSetting('dictionaryNoteId', 'acother');
+			await repointParked;
+
+			// The stale pass now resolves and applyConfiguration decides whether to publish it. Awaiting
+			// the settings write itself is the deterministic signal that its handler has finished.
+			releasePass();
+			await unrelated;
+			const flagged = (await ach({ type: 'lint', text: 'Gammaac is fine.' })).map((l) => l.problemText);
+			assert.deepStrictEqual(
+				flagged,
+				[],
+				`the engine still holds the word addWord imported directly: ${JSON.stringify(flagged)}`,
+			);
+
+			releaseRepoint();
+			await repoint;
+		});
+
 		await test('a born-stale pass does not push its phantom word set into the live engine', async () => {
 			assert.ok(
 				await waitFor(() => (spState.settings.syncBase || '').includes('Alphasp')),
@@ -4142,6 +4271,17 @@ async function main() {
 				(await sph({ type: 'lint', text: 'Alphasp and Betasp are fine.' })).length,
 				0,
 				'precondition: both custom words are accepted',
+			);
+
+			// A word imported STRAIGHT into the engine by add-to-dictionary, which also nulls the
+			// re-import memo. This is what makes the test discriminate the `published` flag rather than
+			// just the phantom list: with the flag gone, the abandoned pass's `.words` (the previous
+			// good list, which predates this add) is clear-then-imported and takes the word back out.
+			await sph({ type: 'addWord', word: 'Deltasp' });
+			assert.strictEqual(
+				(await sph({ type: 'lint', text: 'Deltasp is fine.' })).length,
+				0,
+				'precondition: the freshly added word is accepted',
 			);
 
 			// Repoint the external file to one holding only Alphasp, parked inside resetSyncBase — the
@@ -4173,9 +4313,10 @@ async function main() {
 			// The phantom: a deletion inferred from a base belonging to the configuration that has just
 			// gone away. Nothing durable moved — but the engine used to be handed it anyway, so a lint
 			// landing here flagged a word nobody had deleted.
-			const flagged = (await sph({ type: 'lint', text: 'Alphasp and Betasp are fine.' })).map(
-				(l) => l.problemText,
-			);
+			const flagged = (await sph({
+				type: 'lint',
+				text: 'Alphasp and Betasp and Deltasp are fine.',
+			})).map((l) => l.problemText);
 			assert.deepStrictEqual(
 				flagged,
 				[],

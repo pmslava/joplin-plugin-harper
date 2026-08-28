@@ -111,6 +111,11 @@ function makeJoplin(options) {
         // window a buffer clobber needs — and, run against a correct implementation, the way to prove
         // a competing writer is made to queue behind it rather than racing into that window.
         beforeSettingWrite: null,
+        // An awaited hook at the start of every settings.value: `async (key) => {}`. `loadSettings`
+        // rewrites cfg through eight sequential reads, so this is the only way to park INSIDE that
+        // window — after the dictionary identity has flipped but before the merge base is reset, the
+        // one span where cfg and syncBase genuinely disagree.
+        beforeSettingRead: null,
     }
 
     const notes = options.notes || {}
@@ -178,6 +183,7 @@ function makeJoplin(options) {
             // plugin-<id>.<key>). This is what makes reading an unregistered setting a HARD failure in
             // the harness — the fidelity gap that let the mobile dictionaryPath read pass silently.
             value: async (key) => {
+                if (state.beforeSettingRead) await state.beforeSettingRead(key)
                 if (!state.registeredKeys.has(key)) {
                     throw new Error(`Unknown key: plugin-${PLUGIN_ID}.${key} (Calling api.joplin.settings.value)`)
                 }

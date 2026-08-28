@@ -803,7 +803,23 @@ async function applyConfiguration(
 
 	// Dictionary: reconcile the sources (three-way merge, incl. deletions) and clear-then-import the
 	// result, so a word deleted on any side stops being accepted by the engine immediately.
-	await importWordsIntoLinter(linter, fresh ? await reconcileFresh(reason) : await reconcileDictionary(reason));
+	//
+	// A STALE PASS PUBLISHES NOTHING, HERE TOO. This is the second of exactly two callers of
+	// importWordsIntoLinter, and it used to take the `.words`-only wrapper and import unconditionally —
+	// so an abandoned pass reached through the settings-change path still clear-then-imported, wiping a
+	// word `addWord` had just imported into the engine directly. The dialect branch makes that
+	// deterministic rather than lucky, since it nulls `importedWordsKey` immediately beforehand and the
+	// memo can no longer skip the clobbering import.
+	//
+	// SKIPPING IS THE RIGHT ANSWER FOR THE INIT CALLER TOO (getLinter, fresh=false, brand-new empty
+	// engine). Leaving the engine's word set alone can never delete anything, whereas importing a list
+	// computed against a configuration that no longer exists can; and an abandon is only ever caused by
+	// the settings onChange handler, which finishes by awaiting `linterPromise` and running its own
+	// fresh `applyConfiguration`. So the words arrive a moment later by the same path that displaced
+	// them. On a genuinely empty engine the two behaviours also coincide, because an abandoned pass
+	// returns the last published list — which at init is empty.
+	const dictionary = fresh ? await reconcileFreshResult(reason) : await reconcileDictionaryResult(reason);
+	if (dictionary.published) await importWordsIntoLinter(linter, dictionary.words);
 
 	// Rule overrides on top of defaults. GUARDED, like the ignored-lints import below: this runs
 	// inside the memoized `linterPromise`, so a throw here is cached for the whole session — every
