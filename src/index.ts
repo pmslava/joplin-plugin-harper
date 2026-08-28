@@ -35,6 +35,32 @@ import { SettingsService, createSettingsService, parseRuleOverridesJson } from '
 
 const CONTENT_SCRIPT_ID = 'harperCm';
 const SECTION = 'harper';
+/**
+ * THE SURFACE SWITCH (v1.4.0). Which of the two editing surfaces owns the BASIC settings.
+ *
+ * The plugin has two of them — Joplin's native Options → Harper page, and the custom "Harper:
+ * Settings…" window — and showing the same eight fields twice is the confusing part, not a feature.
+ * This one Bool decides which is live:
+ *
+ *   ON  (default): the basic settings register `public:false`, so the native page shows only this
+ *                  switch; the Harper window owns them, and the desktop Tools menu item exists.
+ *   OFF:           the basic settings register `public:true` exactly as before, and NO Tools menu
+ *                  item is created.
+ *
+ * `public:false` is a PURE VISIBILITY change — the values persist, every internal read still works,
+ * and the dialog keeps editing them — so nothing below this line in the file has to know about it.
+ * The command stays registered in BOTH modes: the rule browser, the dictionary editor and the
+ * dismissed-findings restore exist only in the window, so the command palette must still reach it.
+ */
+const MANAGE_IN_DIALOG_KEY = 'manageInDialog';
+/**
+ * The switch's value AS OF STARTUP. Deliberately NOT part of `cfg` and never re-read: registration
+ * is a startup-time act with no Joplin API to undo it, so a flip mid-session cannot move a field or
+ * a menu item either way. The setting's own description says "Restart Joplin to apply", and the
+ * onChange handler skips this key rather than pretending otherwise with a reconfigure that changes
+ * nothing. Defaults to true so a read that never happened still means "the Harper window owns them".
+ */
+let manageInDialog = true;
 const DICTIONARY_NOTE_TITLE = 'Harper Dictionary';
 // Canonical dictionary-note header. Lines starting with '# ' (hash + space) are comments and are
 // skipped on parse; every other non-blank line is one word. Written verbatim as the first body line.
@@ -1811,6 +1837,18 @@ async function openSettingsDialog(): Promise<void> {
  * DESKTOP gets a Tools menu item (and the command palette for free). MOBILE has no menus at all, so
  * the note toolbar — which surfaces plugin buttons in the note's "..." overflow menu — is the only
  * place a plugin can put a top-level action there.
+ *
+ * THE COMMAND IS REGISTERED UNCONDITIONALLY, in every mode and on both platforms. Only the visible
+ * ENTRY POINT answers to the surface switch, and it does so identically on the two platforms: with
+ * the switch off the native page carries the basic settings, and an entry beside it is exactly the
+ * duplication the switch exists to remove.
+ *
+ * The two platforms are NOT equally forgiving about that, which is why the switch's description
+ * differs. On desktop the command palette still opens the window, so nothing is ever unreachable. On
+ * mobile the toolbar button is the only way in — no menus, no palette — so switching off really does
+ * put the rule browser, the dictionary editor and the dismissed findings out of reach until the
+ * switch is turned back on from this same native page. That is the user's explicit choice, made per
+ * device (the setting is File storage, so it does not travel), and the mobile copy states it.
  */
 async function registerSettingsDialogCommand(): Promise<void> {
 	await joplin.commands.register({
@@ -1821,6 +1859,8 @@ async function registerSettingsDialogCommand(): Promise<void> {
 			await openSettingsDialog();
 		},
 	});
+
+	if (!manageInDialog) return; // the native page owns the settings this session — no second entry
 
 	if (isMobile()) {
 		await joplin.views.toolbarButtons.create(
@@ -1983,24 +2023,115 @@ async function handleMessage(message: IncomingMessage | unknown): Promise<unknow
 // -----------------------------------------------------------------------------
 // Settings registration. Platform is resolved BEFORE this runs, so externalDictionaryPath (a
 // FilePath-style setting unsupported on mobile) is registered on DESKTOP ONLY; everything else on both.
+//
+// TWO registerSettings CALLS, in this order, and the order is the whole design:
+//   1. the surface switch ALONE — it must exist before it can be read, and reading an unregistered
+//      key throws "Unknown key" in real Joplin;
+//   2. read it;
+//   3. everything else, with `public:` derived from what step 2 returned.
+// registerSettings is additive in Joplin, so two calls register one combined set.
 // -----------------------------------------------------------------------------
+
+/**
+ * The switch's own description, per platform — because the entry point it names differs. Desktop
+ * opens the window from the Tools menu; mobile has no menus at all and reaches it from the note
+ * toolbar, so naming a Tools menu there would describe nothing the user can find.
+ *
+ * The copy argues the default rather than just stating it: the window holds all four things, this
+ * page can only ever hold one of them, and THAT asymmetry is the reason the window wins by default.
+ * Then it says exactly what turning the switch off moves, and what it costs — the fields come here,
+ * the entry point goes away. Nothing else: earlier drafts that enumerated the window's contents a
+ * second time, or offered the command palette as a consolation for the missing menu item, buried
+ * the actual choice.
+ */
+function manageInDialogDescription(): string {
+	// Written out in full per platform rather than assembled from shared fragments: this is approved
+	// copy, and the three places the two versions diverge (how the window is opened, what Joplin calls
+	// this screen, what the entry point disappears from) are exactly the places a clever template
+	// would quietly get wrong.
+	if (isMobile()) {
+		return (
+			'Harper\'s settings live in their own window — open a note and choose Harper: Settings… ' +
+			'from the toolbar menu. The window holds everything: the basic settings, the rule browser, ' +
+			'the dictionary editor, and the dismissed findings. This Joplin configuration screen can ' +
+			'show only the basic settings — that is why this switch is on by default. Turn it off and ' +
+			'the basic settings appear here instead, while Harper: Settings… disappears from the ' +
+			'toolbar menu. Restart Joplin to apply.'
+		);
+	}
+	return (
+		'Harper\'s settings live in their own window — open it with Tools → Harper: Settings…. The ' +
+		'window holds everything: the basic settings, the rule browser, the dictionary editor, and ' +
+		'the dismissed findings. This Joplin options page can show only the basic settings — that is ' +
+		'why this switch is on by default. Turn it off and the basic settings appear here instead, ' +
+		'while Harper: Settings… disappears from the Tools menu. Restart Joplin to apply.'
+	);
+}
+
+/**
+ * The SECTION banner, matched to the mode that is actually active.
+ *
+ * PLAIN TEXT ONLY — Joplin renders a section description as literal text, so a link here would show
+ * up as raw markup. It is one line in every case, because the switch's own description sits a few
+ * pixels below it and makes the full argument; a second paragraph here would be the same text twice.
+ *
+ * ON: the page is otherwise empty, so the banner's whole job is to say where the settings went and
+ * how to get there — spelled out as the real path, per platform, since this is the one line a user
+ * who cannot find the fields will actually read.
+ *
+ * OFF: the fields are right here and the banner has nothing left to route anyone to, so it says only
+ * what the section is. (The window is then reachable from the command palette on desktop; nothing on
+ * this screen advertises that, which is the approved trade for a page that no longer needs a banner.)
+ */
+function sectionDescription(): string {
+	if (!manageInDialog) return 'Harper grammar checker settings.';
+	if (isMobile()) {
+		return (
+			'Harper grammar checker. Settings are managed in the Harper window: open a note and ' +
+			'choose Harper: Settings… from the toolbar menu.'
+		);
+	}
+	return 'Harper grammar checker. Settings are managed in the Harper window: Tools → Harper: Settings….';
+}
+
 async function registerSettings(): Promise<void> {
+	// STEP 1 + 2 — the switch, registered alone and FIRST, then read. Always `public: true`: it is the
+	// one control that must stay reachable on the native page in either mode, or a user who turned the
+	// basic settings off would have no way to turn them back on.
+	//
+	// This runs BEFORE registerSection deliberately: the section's own wording depends on the answer.
+	// Joplin resolves a setting's `section` when the settings SCREEN is built, long after onStart, and
+	// registerSetting itself never looks the section up — so registering into a section that is
+	// declared a few lines later is safe, and the e2e opens the real Options page to prove it.
+	await joplin.settings.registerSettings({
+		[MANAGE_IN_DIALOG_KEY]: {
+			value: true,
+			type: SettingItemType.Bool,
+			public: true,
+			section: SECTION,
+			label: 'Manage settings in the Harper window',
+			description: manageInDialogDescription(),
+			storage: SettingStorage.File,
+		},
+	});
+	// Default TRUE, so anything that is not an explicit `false` means "the Harper window owns them".
+	manageInDialog = (await joplin.settings.value(MANAGE_IN_DIALOG_KEY)) !== false;
+
 	await joplin.settings.registerSection(SECTION, {
 		label: 'Harper',
-		// PLAIN TEXT ONLY — Joplin renders a section description as literal text, so a link here would
-		// show up as raw markup. The pointer is to the command name, which works on both platforms
-		// (command palette on desktop, the note "..." menu on mobile).
-		description:
-			'Harper grammar checker settings. To browse the full rule list, edit your dictionary or ' +
-			'restore dismissed findings, run the "Harper: Settings…" command.',
+		description: sectionDescription(),
 		iconName: 'fas fa-spell-check',
 	});
+
+	// STEP 3 — the rest. `basicPublic` is the ONLY thing the switch changes here: same keys, same
+	// defaults, same types, same section, same storage, registered unconditionally in both modes.
+	const basicPublic = !manageInDialog;
 
 	const defs: Record<string, any> = {
 		enabled: {
 			value: true,
 			type: SettingItemType.Bool,
-			public: true,
+			public: basicPublic,
 			section: SECTION,
 			label: 'Enable Harper grammar checking',
 			description: 'When off, no grammar/spelling underlines are shown.',
@@ -2009,7 +2140,7 @@ async function registerSettings(): Promise<void> {
 		dialect: {
 			value: 'American',
 			type: SettingItemType.String,
-			public: true,
+			public: basicPublic,
 			isEnum: true,
 			section: SECTION,
 			label: 'English dialect',
@@ -2026,7 +2157,7 @@ async function registerSettings(): Promise<void> {
 		debounceMs: {
 			value: 500,
 			type: SettingItemType.Int,
-			public: true,
+			public: basicPublic,
 			section: SECTION,
 			minimum: 0,
 			maximum: 10000,
@@ -2040,7 +2171,7 @@ async function registerSettings(): Promise<void> {
 		underlineStyle: {
 			value: 'squiggly',
 			type: SettingItemType.String,
-			public: true,
+			public: basicPublic,
 			isEnum: true,
 			section: SECTION,
 			label: 'Underline style',
@@ -2057,7 +2188,7 @@ async function registerSettings(): Promise<void> {
 		ignoreNonEnglish: {
 			value: false,
 			type: SettingItemType.Bool,
-			public: true,
+			public: basicPublic,
 			section: SECTION,
 			label: 'Ignore non-English text',
 			description:
@@ -2068,7 +2199,7 @@ async function registerSettings(): Promise<void> {
 		dictionaryNoteId: {
 			value: '',
 			type: SettingItemType.String,
-			public: true,
+			public: basicPublic,
 			section: SECTION,
 			label: 'Dictionary note id',
 			description:
@@ -2080,7 +2211,7 @@ async function registerSettings(): Promise<void> {
 		ruleOverrides: {
 			value: '',
 			type: SettingItemType.String,
-			public: true,
+			public: basicPublic,
 			advanced: true,
 			section: SECTION,
 			label: 'Rule overrides (JSON)',
@@ -2147,7 +2278,7 @@ async function registerSettings(): Promise<void> {
 		defs.dictionaryPath = {
 			value: '',
 			type: SettingItemType.String,
-			public: true,
+			public: basicPublic,
 			section: SECTION,
 			label: 'External dictionary file (desktop)',
 			description:
@@ -2253,13 +2384,22 @@ joplin.plugins.register({
 			// INTERNAL bookkeeping keys are written BY the reconcile itself. Reacting to them would make
 			// a reconcile call itself back (and, in the worst case, deadlock on its own in-flight
 			// promise), so they are filtered out here — nothing user-visible changed.
+			//
+			// MANAGE_IN_DIALOG_KEY is filtered for a different reason: it changes NOTHING at runtime.
+			// It is read once, during registration, and there is no Joplin API to re-register a setting
+			// or a menu item — so a flip takes effect at the next start, exactly as its description
+			// says. Reacting would run a full reconfigure (loadSettings, an engine reconcile, a relint)
+			// to arrive at the identical state, which is churn at best and, since a reconcile is a real
+			// dictionary pass, needless risk at worst. A batch that ALSO carries a real key is
+			// unaffected: that key survives this filter and drives the reconfigure as usual.
 			const external = (keys || []).filter(
 				(k) =>
 					k !== 'pendingWords' &&
 					k !== 'ignoredLints' &&
 					k !== SYNC_BASE_KEY &&
 					k !== PENDING_REMOVALS_KEY &&
-					k !== DISMISSED_META_KEY,
+					k !== DISMISSED_META_KEY &&
+					k !== MANAGE_IN_DIALOG_KEY,
 			);
 			if (!external.length) return;
 

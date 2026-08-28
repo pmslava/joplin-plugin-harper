@@ -25,6 +25,9 @@ function makeJoplin(options) {
     const state = {
         settings,
         registeredSettings: null,
+        // One entry per registerSettings() call, holding that call's keys in order — the evidence for
+        // "the surface switch is registered FIRST, and alone, so it can be read before the rest".
+        registerSettingsCalls: [],
         // STRICT settings fidelity: the exact set of keys the plugin registered via
         // settings.registerSettings THIS run. settings.value()/values() throw 'Unknown key' for any
         // key not in here, mirroring real Joplin (a key registered on desktop only — dictionaryPath —
@@ -172,8 +175,16 @@ function makeJoplin(options) {
             // HARPER v1.4.0: keep the section's description — it is the only in-app pointer to the
             // "Harper: Settings…" command, and Joplin renders it as literal text (no markup allowed).
             registerSection: async (name, section) => { state.sectionDescription = (section || {}).description || '' },
+            // ADDITIVE, like the real API. The plugin registers in TWO passes — the `manageInDialog`
+            // surface switch alone first, so its value can be read, then everything else with `public:`
+            // derived from it — and Joplin merges both into one set. Overwriting here instead would
+            // have made the switch vanish from `registeredSettings` the moment the second call landed,
+            // and every assertion about it silently read `undefined`.
             registerSettings: async (defs) => {
-                state.registeredSettings = defs
+                state.registeredSettings = Object.assign(state.registeredSettings || {}, defs)
+                // The ORDER of the registration calls is itself part of the contract (the switch has to
+                // exist before it is read), so each call's key list is recorded as its own batch.
+                state.registerSettingsCalls.push(Object.keys(defs))
                 for (const key of Object.keys(defs)) {
                     state.registeredKeys.add(key)
                     if (!(key in settings)) settings[key] = defs[key].value

@@ -272,6 +272,11 @@ async function main() {
 	});
 
 	// ---- settings registration ----------------------------------------------
+	// NOTE ON `public:` THROUGHOUT THIS RUN — this is the DEFAULT profile, so the `manageInDialog`
+	// surface switch is ON and the basic settings are registered public:FALSE (hidden from Joplin's
+	// native Options page; the Harper window owns them). Everything else about them — key, default,
+	// type, section, enum options — is identical in both modes, which is what these assertions pin.
+	// The two-mode matrix itself lives in its own block further down.
 	await test("settings section 'harper' + all 5 keys registered with correct defaults", () => {
 		const defs = state.registeredSettings;
 		assert.ok(defs, 'registerSettings was called');
@@ -283,7 +288,6 @@ async function main() {
 		assert.strictEqual(defs.dictionaryPath.value, '', 'dictionaryPath default empty');
 		assert.strictEqual(defs.ruleOverrides.value, '', 'ruleOverrides default empty');
 		for (const k of keys) assert.strictEqual(defs[k].section, 'harper', `${k} in section harper`);
-		for (const k of keys) assert.strictEqual(defs[k].public, true, `${k} is public`);
 		assert.strictEqual(defs.dialect.isEnum, true, 'dialect isEnum');
 		assert.ok(defs.dialect.options && defs.dialect.options.British, 'dialect exposes British option');
 		assert.strictEqual(defs.ruleOverrides.advanced, true, 'ruleOverrides is advanced');
@@ -293,14 +297,13 @@ async function main() {
 	// Harper issue #1710 ("Prefer solid line to squiggly"). The setting is a public enum on BOTH
 	// platforms (the mobile half is asserted inside the mobile run below), defaulting to the squiggle
 	// so every existing install keeps the look it has.
-	await test("setting 'underlineStyle' is a public enum in section harper, default 'squiggly', with both options", () => {
+	await test("setting 'underlineStyle' is an enum in section harper, default 'squiggly', with both options", () => {
 		const def = state.registeredSettings.underlineStyle;
 		assert.ok(def, 'underlineStyle is registered');
 		assert.strictEqual(def.value, 'squiggly', "underlineStyle default is 'squiggly'");
 		// Same SettingItemType as the other String enum (dialect) — compared by reference rather than a
 		// magic number so the assertion can't drift from Joplin's enum.
 		assert.strictEqual(def.type, state.registeredSettings.dialect.type, 'underlineStyle is a String setting');
-		assert.strictEqual(def.public, true, 'underlineStyle is public');
 		assert.strictEqual(def.isEnum, true, 'underlineStyle isEnum');
 		assert.strictEqual(def.section, 'harper', 'underlineStyle in section harper');
 		assert.deepStrictEqual(
@@ -342,6 +345,391 @@ async function main() {
 		assert.ok(description.includes('Harper: Settings…'), 'it names the command');
 		assert.ok(!/[<>]|\]\(/.test(description), `plain text only, got: ${description}`);
 	});
+
+	// =========================================================================
+	// v1.4.0 THE SURFACE SWITCH — `manageInDialog`, both modes x both platforms.
+	// =========================================================================
+	// One Bool decides which of the two editing surfaces is live: Joplin's native Options → Harper
+	// page, or the custom "Harper: Settings…" window. The whole feature is two consequences of one
+	// value read at registration time, and this block is the matrix for both of them:
+	//
+	//                    | basic settings on the native page | dialog entry point
+	//   ------------------------------------------------------------------------
+	//   ON  (default)    | public:false  (hidden)            | created
+	//   OFF              | public:true   (shown)             | NOT created
+	//
+	// ...on desktop (Tools menu item) and on mobile (note-toolbar button) alike. The COMMAND is
+	// registered in all four cells — on desktop the command palette is the fallback that keeps the
+	// rule browser reachable with no menu item, and a command that vanished would strand it.
+	//
+	// The mechanism that makes this possible is the REGISTRATION ORDER, which the first test pins:
+	// the switch has to be registered before it can be read, and read before the keys whose `public:`
+	// flag depends on it. Reading an unregistered key throws "Unknown key" in real Joplin (the strict
+	// harness stub mirrors that), so getting this order wrong is a startup crash, not a cosmetic slip.
+	{
+		/** The eight settings whose visibility the switch moves. */
+		const BASIC_KEYS = [
+			'enabled',
+			'dialect',
+			'debounceMs',
+			'underlineStyle',
+			'ignoreNonEnglish',
+			'dictionaryNoteId',
+			'dictionaryPath',
+			'ruleOverrides',
+		];
+		/** The private bookkeeping keys, which are public:false in BOTH modes and must stay that way. */
+		const INTERNAL_KEYS = ['pendingWords', 'pendingRemovals', 'ignoredLints', 'dismissedMeta', 'syncBase'];
+
+		const bootMode = (platform, manageInDialog) =>
+			run({
+				dataDir: fs.mkdtempSync(path.join(os.tmpdir(), `harper-surface-${platform}-`)),
+				installationDir: DIST_DIR,
+				require:
+					platform === 'mobile'
+						? (name) => {
+								throw new Error(`[mobile] joplin.require(${name}) must never run`);
+							}
+						: requireStub,
+				versionInfo:
+					platform === 'mobile'
+						? { version: '3.7.2', platform: 'mobile' }
+						: { version: '3.6.14', platform: 'desktop' },
+				// `undefined` means "leave it unset", which is how the DEFAULT (ON) is exercised as a
+				// real user's fresh profile would exercise it — via the registered default, not a
+				// pre-seeded value that would hide a wrong default.
+				initialSettings: manageInDialog === undefined ? {} : { manageInDialog },
+			});
+
+		await test('registration ORDER: the switch is registered first and alone, then read, then the rest', async () => {
+			const s = await bootMode('desktop', undefined);
+			const calls = s.registerSettingsCalls;
+			assert.strictEqual(calls.length, 2, `exactly two registerSettings passes, got ${calls.length}`);
+			assert.deepStrictEqual(
+				calls[0],
+				['manageInDialog'],
+				'the FIRST pass registers the surface switch and nothing else — it must exist to be read',
+			);
+			for (const key of BASIC_KEYS) {
+				assert.ok(calls[1].includes(key), `"${key}" is registered in the second pass, after the read`);
+			}
+			assert.ok(
+				!calls[1].includes('manageInDialog'),
+				'the switch is not registered twice (a re-register would reset its stored value)',
+			);
+		});
+
+		await test('the switch itself: public Bool in section harper, default TRUE, File storage', async () => {
+			const s = await bootMode('desktop', undefined);
+			const def = s.registeredSettings.manageInDialog;
+			assert.ok(def, 'manageInDialog is registered');
+			assert.strictEqual(def.value, true, 'it defaults to ON — the Harper window owns the settings');
+			assert.strictEqual(def.type, s.registeredSettings.enabled.type, 'it is a Bool, like `enabled`');
+			assert.strictEqual(def.section, 'harper', 'in section harper');
+			assert.strictEqual(
+				def.storage,
+				s.registeredSettings.enabled.storage,
+				'File storage, like the rest — so it lives in settings.json and does NOT sync between devices',
+			);
+			assert.strictEqual(def.label, 'Manage settings in the Harper window', 'the agreed label');
+			// ALWAYS public, in both modes: it is the only way back once the basic settings are hidden.
+			assert.strictEqual(def.public, true, 'public with the switch ON');
+			const off = await bootMode('desktop', false);
+			assert.strictEqual(
+				off.registeredSettings.manageInDialog.public,
+				true,
+				'and public with the switch OFF — a user who turned the fields on must still find the switch',
+			);
+		});
+
+		// THE APPROVED COPY, VERBATIM. These four strings were signed off word for word, so they are
+		// pinned as exact literals rather than probed with regexes: a "harmless" rewording is the one
+		// kind of drift a behavioural assertion would wave through. The regex checks below still run —
+		// they say WHY each sentence is there, so a future deliberate rewrite fails with a reason
+		// attached rather than just a diff.
+		const APPROVED = {
+			switchDesktop:
+				"Harper's settings live in their own window — open it with Tools → Harper: Settings…. The window holds everything: the basic settings, the rule browser, the dictionary editor, and the dismissed findings. This Joplin options page can show only the basic settings — that is why this switch is on by default. Turn it off and the basic settings appear here instead, while Harper: Settings… disappears from the Tools menu. Restart Joplin to apply.",
+			switchMobile:
+				"Harper's settings live in their own window — open a note and choose Harper: Settings… from the toolbar menu. The window holds everything: the basic settings, the rule browser, the dictionary editor, and the dismissed findings. This Joplin configuration screen can show only the basic settings — that is why this switch is on by default. Turn it off and the basic settings appear here instead, while Harper: Settings… disappears from the toolbar menu. Restart Joplin to apply.",
+			bannerOnDesktop:
+				'Harper grammar checker. Settings are managed in the Harper window: Tools → Harper: Settings….',
+			bannerOnMobile:
+				'Harper grammar checker. Settings are managed in the Harper window: open a note and choose Harper: Settings… from the toolbar menu.',
+			bannerOff: 'Harper grammar checker settings.',
+		};
+
+		await test('the approved copy is delivered VERBATIM — switch description and section banner', async () => {
+			// The punctuation is the trap. This copy carries an em dash, a right arrow and an ellipsis,
+			// each of which has a lookalike ASCII spelling ("-", "->", "...") that reads the same in a
+			// diff while shipping different text — so the literals above hold the real characters and
+			// these comparisons are exact. (The apostrophe is deliberately the ASCII one, matching the
+			// approved text and the rest of this codebase's copy.)
+			const dOn = await bootMode('desktop', undefined);
+			const mOn = await bootMode('mobile', undefined);
+			assert.strictEqual(
+				dOn.registeredSettings.manageInDialog.description,
+				APPROVED.switchDesktop,
+				'desktop switch description matches the approved copy character for character',
+			);
+			assert.strictEqual(
+				mOn.registeredSettings.manageInDialog.description,
+				APPROVED.switchMobile,
+				'mobile switch description matches the approved copy character for character',
+			);
+			assert.strictEqual(dOn.sectionDescription, APPROVED.bannerOnDesktop, 'desktop ON banner');
+			assert.strictEqual(mOn.sectionDescription, APPROVED.bannerOnMobile, 'mobile ON banner');
+			assert.strictEqual(
+				(await bootMode('desktop', false)).sectionDescription,
+				APPROVED.bannerOff,
+				'desktop OFF banner',
+			);
+			assert.strictEqual(
+				(await bootMode('mobile', false)).sectionDescription,
+				APPROVED.bannerOff,
+				'mobile OFF banner (the same line on both platforms — it routes nowhere)',
+			);
+		});
+
+		await test('the switch description names a real entry point on each platform, and says restart', async () => {
+			const desktop = (await bootMode('desktop', undefined)).registeredSettings.manageInDialog.description;
+			const mobile = (await bootMode('mobile', undefined)).registeredSettings.manageInDialog.description;
+			// The entry point it NAMES has to be the one that platform actually has — both where the
+			// window is opened from, and where "Harper: Settings…" disappears from when it is off.
+			assert.ok(
+				/open it with Tools → Harper: Settings…/.test(desktop),
+				`desktop copy opens the window from the Tools menu: ${desktop}`,
+			);
+			assert.ok(
+				/disappears from the Tools menu/.test(desktop),
+				`desktop copy says what turning it off removes: ${desktop}`,
+			);
+			// Mobile has NO Tools menu — promising one would describe nothing that exists on the device
+			// the user is holding.
+			assert.ok(!/Tools/.test(mobile), `mobile copy must not promise a Tools menu: ${mobile}`);
+			assert.ok(
+				/choose Harper: Settings… from the toolbar menu/.test(mobile),
+				`mobile copy opens the window from the note toolbar: ${mobile}`,
+			);
+			assert.ok(
+				/disappears from the toolbar menu/.test(mobile),
+				`mobile copy says what turning it off removes: ${mobile}`,
+			);
+			// Each platform names the screen the way Joplin itself names it: desktop has an "options
+			// page", mobile a "configuration screen". Calling both by one name would send half the
+			// users looking for something their app does not have.
+			assert.ok(/This Joplin options page/.test(desktop), `desktop copy: ${desktop}`);
+			assert.ok(/This Joplin configuration screen/.test(mobile), `mobile copy: ${mobile}`);
+			for (const [label, text] of [['desktop', desktop], ['mobile', mobile]]) {
+				// The ARGUMENT for the default, not just the fact of it: the window holds all four
+				// things, this screen can hold only one of them, and that is the reason.
+				assert.ok(
+					/The window holds everything: the basic settings, the rule browser, the dictionary editor, and the dismissed findings\./.test(
+						text,
+					),
+					`${label} copy says what the window holds`,
+				);
+				assert.ok(
+					/can show only the basic settings — that is why this switch is on by default/.test(text),
+					`${label} copy gives the reason the switch is on by default`,
+				);
+				assert.ok(
+					/Turn it off and the basic settings appear here instead/.test(text),
+					`${label} copy says what turning it off gains`,
+				);
+				assert.ok(/Restart Joplin to apply/.test(text), `${label} copy says a restart is needed`);
+				// Joplin renders setting descriptions as literal text — markup would show up raw.
+				assert.ok(!/[<>]|\]\(/.test(text), `${label} copy is plain text, got: ${text}`);
+			}
+		});
+
+		// ---- THE MATRIX: four cells, one loop --------------------------------
+		for (const platform of ['desktop', 'mobile']) {
+			const entryPoint = platform === 'mobile' ? 'note-toolbar button' : 'Tools menu item';
+			const hasEntryPoint = (s) =>
+				platform === 'mobile'
+					? s.toolbarButtons.some((b) => b.command === 'harper.openSettings')
+					: s.menuItems.some((m) => m.command === 'harper.openSettings');
+			// The OTHER platform's entry point must never appear — mobile has no menus at all, and a
+			// desktop note-toolbar button would be a second, duplicate Harper entry.
+			const hasForeignEntryPoint = (s) =>
+				platform === 'mobile'
+					? s.menuItems.some((m) => m.command === 'harper.openSettings')
+					: s.toolbarButtons.some((b) => b.command === 'harper.openSettings');
+			// dictionaryPath is DESKTOP-ONLY (its fs read and FilePath UX do not exist on mobile), so
+			// the mobile cells assert on the seven keys that are actually registered there.
+			const keysHere = BASIC_KEYS.filter((k) => platform === 'desktop' || k !== 'dictionaryPath');
+
+			await test(`${platform} + switch ON (default): basics are public:false, and the ${entryPoint} IS created`, async () => {
+				const s = await bootMode(platform, undefined);
+				for (const key of keysHere) {
+					const def = s.registeredSettings[key];
+					assert.ok(def, `"${key}" is still REGISTERED — hiding is not unregistering`);
+					assert.strictEqual(def.public, false, `"${key}" is hidden from the native page`);
+				}
+				if (platform === 'mobile') {
+					assert.ok(
+						!s.registeredSettings.dictionaryPath,
+						'dictionaryPath stays desktop-only regardless of the switch',
+					);
+				}
+				assert.ok(hasEntryPoint(s), `the ${entryPoint} is created`);
+				assert.ok(!hasForeignEntryPoint(s), `and not the other platform's entry point`);
+				assert.ok(
+					s.commands.some((c) => c.name === 'harper.openSettings'),
+					'the command is registered',
+				);
+			});
+
+			await test(`${platform} + switch OFF: basics are public:true, and NO ${entryPoint} is created`, async () => {
+				const s = await bootMode(platform, false);
+				for (const key of keysHere) {
+					const def = s.registeredSettings[key];
+					assert.ok(def, `"${key}" is registered`);
+					assert.strictEqual(def.public, true, `"${key}" is shown on the native page, exactly as before`);
+				}
+				assert.ok(!hasEntryPoint(s), `no ${entryPoint} — the native page owns the settings this session`);
+				assert.ok(!hasForeignEntryPoint(s), `and no entry point from the other platform either`);
+				// THE COMMAND SURVIVES. On desktop that is the command palette keeping the rule browser,
+				// the dictionary editor and the dismissed findings reachable with no menu item. On mobile
+				// there is no palette, so this is only the registration — the description says plainly
+				// that the window goes out of reach there until the switch is turned back on.
+				assert.ok(
+					s.commands.some((c) => c.name === 'harper.openSettings'),
+					'the command is STILL registered — no mode may unregister the only route to the rules UI',
+				);
+			});
+
+			await test(`${platform}: the switch is a pure visibility change — values and internals are untouched`, async () => {
+				const on = await bootMode(platform, undefined);
+				const off = await bootMode(platform, false);
+				// Same keys, same defaults, same types, same section: `public` is the ONLY field that moves.
+				assert.deepStrictEqual(
+					Object.keys(on.registeredSettings).sort(),
+					Object.keys(off.registeredSettings).sort(),
+					'both modes register exactly the same key set',
+				);
+				for (const key of Object.keys(on.registeredSettings)) {
+					const a = Object.assign({}, on.registeredSettings[key], { public: null });
+					const b = Object.assign({}, off.registeredSettings[key], { public: null });
+					assert.deepStrictEqual(a, b, `"${key}" differs only in its public flag between the modes`);
+				}
+				// The private bookkeeping keys stay private in BOTH modes — the switch must not leak
+				// pendingWords or the dismissed index onto the settings page in either direction.
+				for (const s of [on, off]) {
+					for (const key of INTERNAL_KEYS) {
+						assert.strictEqual(
+							s.registeredSettings[key].public,
+							false,
+							`"${key}" is internal and stays public:false`,
+						);
+					}
+				}
+				// And the plugin still WORKS with the fields hidden: a hidden setting is readable,
+				// writable, and drives the engine exactly as a public one does.
+				const h = on.contentScriptMessageHandlers['harperCm'];
+				const config = await h({ type: 'getConfig' });
+				assert.strictEqual(config.enabled, true, 'a public:false `enabled` still reads back');
+				await on.setSetting('debounceMs', 900);
+				assert.strictEqual(
+					(await h({ type: 'getConfig' })).debounceMs,
+					900,
+					'and a public:false `debounceMs` still round-trips through a write',
+				);
+			});
+
+			await test(`${platform}: the section description matches the mode that is actually active`, async () => {
+				const on = (await bootMode(platform, undefined)).sectionDescription;
+				const off = (await bootMode(platform, false)).sectionDescription;
+				for (const [mode, text] of [['ON', on], ['OFF', off]]) {
+					assert.ok(text, `${mode}: the harper section registered a description`);
+					assert.ok(!/[<>]|\]\(/.test(text), `${mode}: plain text only, got: ${text}`);
+					// One line, always: the switch's own description sits directly below and makes the
+					// full argument, so a second paragraph here would be the same text twice.
+					assert.ok(text.length < 160, `${mode}: the banner stays to one line (${text.length} chars)`);
+				}
+				assert.notStrictEqual(on, off, 'the two modes do not describe the page the same way');
+
+				// ON — the page is otherwise EMPTY, so the banner's whole job is to route: it names the
+				// window and spells out the real path to it, per platform.
+				assert.ok(
+					/Settings are managed in the Harper window/.test(on),
+					`ON: the banner says where the settings went, got: ${on}`,
+				);
+				assert.ok(on.includes('Harper: Settings…'), 'ON: and names the command that opens it');
+				if (platform === 'mobile') {
+					assert.ok(/toolbar menu/.test(on), `ON mobile: the banner gives the toolbar path, got: ${on}`);
+					assert.ok(!/Tools/.test(on), `ON mobile: no Tools menu exists to point at, got: ${on}`);
+				} else {
+					assert.ok(/Tools → Harper: Settings…/.test(on), `ON desktop: the banner gives the menu path, got: ${on}`);
+				}
+
+				// OFF — the fields are on this page, so the banner has nothing left to route anyone to
+				// and says only what the section is. It deliberately does NOT name the command: with the
+				// entry point gone, the window lives in the command palette on desktop and is out of
+				// reach on mobile until the switch goes back on, and the SWITCH's description (right
+				// below) is where that is explained.
+				assert.strictEqual(off, 'Harper grammar checker settings.', 'OFF: the plain section line');
+			});
+		}
+
+		await test('flipping the switch changes nothing at runtime — no reconfigure, no relint, no writes', async () => {
+			// Registration is a startup-time act and Joplin has no API to undo it, so the setting takes
+			// effect on the next start (its description says so). Reacting to the change would run a full
+			// reconfigure — loadSettings, an engine reconcile, a relint — to arrive at the identical
+			// state, which is churn at best and a needless dictionary pass at worst.
+			const s = await bootMode('desktop', undefined);
+			const h = s.contentScriptMessageHandlers['harperCm'];
+			await h({ type: 'getConfig' });
+			const pokesBefore = s.commandExecutions.length;
+			const putsBefore = s.notePuts.length;
+			const writesBefore = s.settingWrites.length;
+
+			await s.setSetting('manageInDialog', false);
+
+			assert.strictEqual(
+				s.commandExecutions.length,
+				pokesBefore,
+				'no editor poke: nothing about the running session changed',
+			);
+			assert.strictEqual(s.notePuts.length, putsBefore, 'and no dictionary note write');
+			assert.strictEqual(
+				s.settingWrites.length,
+				writesBefore + 1,
+				'the only write is the switch itself — no reconcile bookkeeping followed it',
+			);
+			// A batch that ALSO carries a real key must still reconfigure: the filter drops one key, it
+			// does not disarm the handler.
+			const before = s.commandExecutions.length;
+			await s.setSetting('dialect', 'British');
+			assert.ok(
+				s.commandExecutions.length > before,
+				'a real settings change still pokes the editor — the filter is per-key, not a kill switch',
+			);
+		});
+
+		await test('the switch is NOT writable from the settings dialog (it is a native-page concern)', () => {
+			// Surfacing it inside the dialog would be circular — changing where the native page shows
+			// its fields, from the window that exists because they are not shown there. The allowlist is
+			// derived from the validator table, so this is the one place that has to stay honest.
+			const { UPDATABLE_SETTING_KEYS } = loadTsModule('src/settingsService.ts', (id) =>
+				id === './dismissedLog' ? loadTsModule('src/dismissedLog.ts') : require(id),
+			);
+			assert.ok(
+				Array.isArray(UPDATABLE_SETTING_KEYS) && UPDATABLE_SETTING_KEYS.length > 0,
+				'the allowlist loaded',
+			);
+			assert.ok(
+				!UPDATABLE_SETTING_KEYS.includes('manageInDialog'),
+				`updateSetting's allowlist must not carry the switch, got: ${JSON.stringify(UPDATABLE_SETTING_KEYS)}`,
+			);
+			// ...while the eight it SHOULD carry are still there, so this cannot pass by the allowlist
+			// having collapsed to nothing.
+			for (const key of ['enabled', 'dialect', 'debounceMs', 'underlineStyle', 'ruleOverrides']) {
+				assert.ok(UPDATABLE_SETTING_KEYS.includes(key), `"${key}" is still writable from the dialog`);
+			}
+		});
+	}
 
 	await test('opening the dialog builds it once: CSS + JS assets, a single Close button, fit-to-content off', async () => {
 		const command = state.commands.find((c) => c.name === 'harper.openSettings');
@@ -1193,6 +1581,162 @@ async function main() {
 		assert.deepStrictEqual(lifted.state.dictionaryBaseline, ['alpha']);
 	});
 
+	// ---- v1.4.0: rule descriptions are ALWAYS visible ------------------------
+	// The per-rule disclosure arrow is gone. It made the one thing that says what a rule DOES cost a
+	// click, 823 times over, while the group rows above it had shown label + description inline all
+	// along. These three tests pin the replacement: the description renders with no interaction at
+	// all, the lazy fetch still fills rows that were painted before it landed, and the only
+	// disclosure left in the list is the group's.
+	{
+		const RULES_PREAMBLE = `var document = arguments[0];
+			 var state = {
+				overrides: Object.create(null),
+				defaults: { ModalOf: true, Spaces: true },
+				descriptionText: Object.create(null),
+				descriptions: null,
+				search: '',
+				expandedGroups: Object.create(null),
+				searchExpanded: Object.create(null),
+			 };
+			 var searchTimer = null;
+			 function renderRules() {}
+			 function setRuleState() {}
+			 function pushOverrides() {}
+			 function refreshGroupHeader() {}
+			 function refreshRulesSummary() {}`;
+		const RULES_FNS = [
+			'el',
+			'clear',
+			'makeSelect',
+			'ruleDisplayLabel',
+			'ruleMatches',
+			'matchingRules',
+			'ruleState',
+			'groupState',
+			'defaultLabelFor',
+			'cssEscape',
+			'renderRuleRow',
+			'renderGroup',
+		];
+		const GROUP = {
+			id: 'Misc',
+			label: 'Miscellaneous',
+			description: 'A group description, which has always been inline.',
+			rules: ['ModalOf', 'Spaces'],
+		};
+		const liftRules = (document) =>
+			extractDialogFunctions(RULES_FNS, RULES_PREAMBLE, ['state'], [document], [
+				'groupExpanded',
+				'toggleGroupExpanded',
+				'currentNeedle',
+			]);
+
+		await test('a rule row shows its description with NO interaction — no arrow, no click', () => {
+			const document = makeFakeDom();
+			const lifted = liftRules(document);
+			lifted.state.descriptions = {
+				ModalOf: '<p>Corrects <code>modal of</code> to <code>modal have</code>.</p>',
+				Spaces: '<p>Flags runs of repeated spaces.</p>',
+			};
+			lifted.state.expandedGroups.Misc = true;
+
+			const root = document.createElement('div');
+			document.root = root;
+			root.appendChild(lifted.renderGroup(GROUP, ''));
+
+			const rows = document.byClass('hs-rule');
+			assert.strictEqual(rows.length, 2, 'both rules rendered');
+			const descs = document.byClass('hs-rule-desc');
+			assert.strictEqual(descs.length, 2, 'EVERY row carries a description node, unprompted');
+			// TRUSTED harper HTML goes in via innerHTML (the one exception to the textContent rule).
+			assert.strictEqual(
+				descs[0].innerHTML,
+				'<p>Corrects <code>modal of</code> to <code>modal have</code>.</p>',
+				"the first row shows harper's own description for ModalOf",
+			);
+			assert.strictEqual(descs[1].innerHTML, '<p>Flags runs of repeated spaces.</p>');
+
+			// THE ARROW IS GONE from the rows. The group header still has exactly one — that disclosure
+			// is unchanged, and this is what keeps "removed the per-rule fold" from quietly meaning
+			// "removed the group fold too".
+			for (const row of rows) {
+				const arrowsInRow = [];
+				const walk = (n) => {
+					if (String(n.className).split(' ').includes('hs-disclosure')) arrowsInRow.push(n);
+					n.children.forEach(walk);
+				};
+				walk(row);
+				assert.strictEqual(arrowsInRow.length, 0, 'a rule row has no disclosure control at all');
+			}
+			assert.strictEqual(
+				document.byClass('hs-disclosure').length,
+				1,
+				'exactly one disclosure survives in the list: the group header\'s',
+			);
+			// The selector still works — the row lost its fold, not its control.
+			assert.strictEqual(document.byClass('hs-rule-select').length, 2, 'both tri-state selectors render');
+		});
+
+		await test('descriptions arrive late: the row reserves the line, then fills it on the repaint', () => {
+			// They are fetched lazily (~823 HTML strings would roughly triple the first payload), so a
+			// row can be painted before its text exists. The node is rendered EMPTY rather than omitted
+			// so the stylesheet can hold its height, and the repaint on arrival fills it in.
+			const document = makeFakeDom();
+			const lifted = liftRules(document);
+			lifted.state.expandedGroups.Misc = true;
+			const root = document.createElement('div');
+			document.root = root;
+
+			// BEFORE the fetch lands: state.descriptions is null.
+			root.appendChild(lifted.renderGroup(GROUP, ''));
+			let descs = document.byClass('hs-rule-desc');
+			assert.strictEqual(descs.length, 2, 'the description line is RESERVED, not omitted');
+			assert.ok(!descs[0].innerHTML, 'and it is empty while the fetch is in flight');
+			assert.strictEqual(descs[0].textContent, '', 'no "Loading…" placeholder text to flash away');
+
+			// The fetch lands and the list repaints (what ensureDescriptions does).
+			lifted.state.descriptions = { ModalOf: '<p>Late arrival.</p>' };
+			lifted.clear(root);
+			root.appendChild(lifted.renderGroup(GROUP, ''));
+			descs = document.byClass('hs-rule-desc');
+			assert.strictEqual(descs[0].innerHTML, '<p>Late arrival.</p>', 'the row picked the text up');
+			// A rule harper has no description for keeps the same empty reserved line rather than
+			// announcing its absence on every row forever.
+			assert.strictEqual(descs.length, 2, 'the describe-less row still reserves its line');
+			assert.ok(!descs[1].innerHTML, 'and says nothing rather than "No description for this rule."');
+		});
+
+		await test('search still matches on description text, with the fold gone', () => {
+			// Description text has always been part of the search corpus (via state.descriptionText, the
+			// stripped-to-plain-text mirror). Deleting the per-rule fold must not touch that: the corpus
+			// was never keyed on what was expanded.
+			const document = makeFakeDom();
+			const lifted = liftRules(document);
+			lifted.state.descriptions = { ModalOf: '<p>zzuniquezz</p>', Spaces: '<p>nope</p>' };
+			lifted.state.descriptionText.ModalOf = 'zzuniquezz';
+			lifted.state.descriptionText.Spaces = 'nope';
+
+			assert.deepStrictEqual(
+				lifted.matchingRules(GROUP, 'zzuniquezz'),
+				['ModalOf'],
+				'a needle found only in the description still selects its rule',
+			);
+			// And it renders — a search force-opens the groups it matched.
+			const root = document.createElement('div');
+			document.root = root;
+			lifted.state.search = 'zzuniquezz';
+			root.appendChild(lifted.renderGroup(GROUP, 'zzuniquezz'));
+			const rows = document.byClass('hs-rule');
+			assert.strictEqual(rows.length, 1, 'only the matching rule is listed');
+			assert.strictEqual(rows[0].getAttribute('data-rule'), 'ModalOf');
+			assert.strictEqual(
+				document.byClass('hs-rule-desc')[0].innerHTML,
+				'<p>zzuniquezz</p>',
+				'and the description that matched is visible in the result, not hidden behind a click',
+			);
+		});
+	}
+
 	await test('a group arrow collapses what is on screen, whatever the needle has since become', () => {
 		// INV-D. The toggle used to derive its new value from the CURRENT needle rather than from what
 		// was painted, so in the 140 ms debounce window the two disagreed and the arrow fired the wrong
@@ -1223,7 +1767,6 @@ async function main() {
 				search: '',
 				expandedGroups: Object.create(null),
 				searchExpanded: Object.create(null),
-				expandedRules: Object.create(null),
 			 };
 			 var searchTimer = null;
 			 function renderRules() {}
@@ -1337,7 +1880,6 @@ async function main() {
 				search: '',
 				expandedGroups: Object.create(null),
 				searchExpanded: Object.create(null),
-				expandedRules: Object.create(null),
 			 };
 			 var searchTimer = null;
 			 function renderRules() {}
@@ -1804,7 +2346,6 @@ async function main() {
 			const def = mstate.registeredSettings.underlineStyle;
 			assert.ok(def, 'underlineStyle registered on the mobile run too');
 			assert.strictEqual(def.value, 'squiggly', "mobile default is 'squiggly'");
-			assert.strictEqual(def.public, true, 'public on mobile');
 			assert.strictEqual(def.isEnum, true, 'isEnum on mobile');
 			assert.deepStrictEqual(
 				Object.keys(def.options).sort(),

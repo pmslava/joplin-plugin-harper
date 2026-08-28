@@ -335,6 +335,11 @@ body {
 	font-size: 0.9em;
 	margin-top: 4px;
 	overflow-wrap: break-word;
+	/* RESERVE THE LINE. Descriptions are always shown now, but they arrive on a lazy fetch a moment
+	   after the first paint, so for that window the node is rendered empty. Holding one line of
+	   height keeps the rows on screen from growing (and the list from lurching under the pointer)
+	   when the text lands, and gives a rule with no description of its own the same steady shape. */
+	min-height: 1.2em;
 }
 
 .hs-rule-desc p {
@@ -396,9 +401,5 @@ body {
 
 	.hs-rule {
 		flex-wrap: wrap;
-	}
-
-	.hs-rule-select {
-		margin-left: 34px;
 	}
 }

@@ -233,18 +233,32 @@ test.describe.serial('Harper settings dialog', () => {
     expect(shownGroups).toBeLessThan(allGroups);
     await expect(frame.locator(`.hs-rule[data-rule="${RULE}"]`)).toHaveCount(1);
 
-    // Expanding a rule shows harper's own description for it. These ~823 HTML strings are fetched
-    // lazily AFTER the first paint (they would roughly triple the snapshot), so this also proves the
-    // background fetch lands and re-renders.
+    // A rule row shows harper's own description for it WITH NO INTERACTION. The per-rule disclosure
+    // arrow is gone: the description is rendered inline under the name, the way the group rows have
+    // always shown theirs. These ~823 HTML strings are still fetched lazily AFTER the first paint
+    // (bundling them would roughly triple the snapshot), so polling for the text here also proves
+    // the background fetch lands and repaints the rows already on screen.
     const row = frame.locator(`.hs-rule[data-rule="${RULE}"]`);
-    await row.locator('.hs-disclosure').click();
+    // NOT A CLICK IN SIGHT — the assertion is that the arrow is gone from the row, not merely unused.
+    await expect(row.locator('.hs-disclosure')).toHaveCount(0);
     const description = row.locator('.hs-rule-desc');
     await expect(description).toHaveCount(1);
     await expect
       .poll(async () => ((await description.textContent()) || '').trim(), { timeout: 30_000 })
-      .not.toMatch(/^(Loading description…)?$/);
+      .not.toMatch(/^$/);
     // eslint-disable-next-line no-console
     console.log(`[harper-e2e] ${RULE} description = ${JSON.stringify(await description.textContent())}`);
+
+    // And it is not one privileged row: every rule the search left on screen carries its own
+    // description text, which is what "always visible" has to mean to be worth the change.
+    const described = await frame.locator('#hs-rules-groups .hs-rule-desc').evaluateAll((nodes) =>
+      nodes.map((n) => (n.textContent || '').trim()).filter((t) => t.length > 0).length,
+    );
+    const ruleRows = await frame.locator('#hs-rules-groups .hs-rule').count();
+    // eslint-disable-next-line no-console
+    console.log(`[harper-e2e] ${described}/${ruleRows} visible rule rows show a description`);
+    expect(ruleRows).toBeGreaterThan(0);
+    expect(described).toBe(ruleRows);
 
     // A nonsense query filters everything out rather than silently showing all rules.
     await searchRules(frame, 'zzzznotarulezzzz');

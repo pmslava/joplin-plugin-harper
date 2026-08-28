@@ -140,7 +140,8 @@
 		// that search was active, and is thrown away whenever the query changes — so clearing the
 		// search still restores exactly what was open before it, which expandedGroups alone holds.
 		searchExpanded: Object.create(null), // group id -> false (collapsed during this search)
-		expandedRules: Object.create(null), // rule name -> true
+		// No per-RULE expansion map any more: descriptions are always visible, so a rule row has no
+		// hidden half left to remember. Groups are the only thing in this list that expands.
 	};
 
 	var ADDITIONAL_GROUP_ID = '__additional__';
@@ -726,20 +727,29 @@
 	// Section: Rules.
 	// =============================================================================
 
+	/**
+	 * One rule row: name + id, the rule's description underneath, and the tri-state selector.
+	 *
+	 * THE DESCRIPTION IS ALWAYS SHOWN. It used to sit behind a per-row disclosure arrow, which put the
+	 * one thing that says what "ModalOf" actually does behind a click, 823 times over. The GROUP rows
+	 * have always shown their label and description inline; the rule rows now match that, and the
+	 * group-level expand/collapse is the only disclosure left in the list.
+	 *
+	 * The ~823 description strings are fetched LAZILY (bundling them into the snapshot would roughly
+	 * triple it and delay the first paint), so `state.descriptions` is null for the first moment. For
+	 * that window the node is rendered EMPTY rather than omitted, and the stylesheet reserves it a
+	 * line: rows already on screen keep their height when the text lands, instead of the whole list
+	 * lurching under the pointer. Rows painted after the fetch carry their text immediately, and
+	 * `ensureDescriptions` repaints the list once on arrival to fill in the earlier ones.
+	 *
+	 * A rule with no description of its own (harper supplies one for essentially all of them; the
+	 * "Additional Rules" orphans are the exception) keeps that same empty reserved line. "No
+	 * description for this rule." was a fair answer to a deliberate click, but as permanent furniture
+	 * on every such row it is only noise.
+	 */
 	function renderRuleRow(name, group) {
 		var row = el('div', 'hs-rule');
 		row.setAttribute('data-rule', name);
-
-		var toggle = el('button', 'hs-disclosure', state.expandedRules[name] ? '\u25BE' : '\u25B8');
-		toggle.type = 'button';
-		toggle.title = 'Show what this rule does';
-		toggle.setAttribute('aria-label', 'Show what this rule does');
-		toggle.addEventListener('click', function () {
-			state.expandedRules[name] = !state.expandedRules[name];
-			renderRules();
-			ensureDescriptions();
-		});
-		row.appendChild(toggle);
 
 		var main = el('div', 'hs-rule-main');
 		var nameWrap = el('div', 'hs-rule-name');
@@ -747,19 +757,13 @@
 		nameWrap.appendChild(el('code', 'hs-rule-id', name));
 		main.appendChild(nameWrap);
 
-		if (state.expandedRules[name]) {
-			var desc = el('div', 'hs-rule-desc');
-			if (state.descriptions && state.descriptions[name]) {
-				// TRUSTED HTML: harper's own rule descriptions (simple p/code markup). This is the ONLY
-				// innerHTML in this file — everything user-derived goes in via textContent.
-				desc.innerHTML = state.descriptions[name];
-			} else if (state.descriptions) {
-				desc.textContent = 'No description for this rule.';
-			} else {
-				desc.textContent = 'Loading description…';
-			}
-			main.appendChild(desc);
+		var desc = el('div', 'hs-rule-desc');
+		if (state.descriptions && state.descriptions[name]) {
+			// TRUSTED HTML: harper's own rule descriptions (simple p/code markup). This is the ONLY
+			// innerHTML in this file — everything user-derived goes in via textContent.
+			desc.innerHTML = state.descriptions[name];
 		}
+		main.appendChild(desc);
 		row.appendChild(main);
 
 		var select = makeSelect(
