@@ -2,7 +2,7 @@ import { test, expect, Frame, Page } from '@playwright/test';
 import * as fs from 'fs';
 import * as path from 'path';
 import { artifactPath } from './artifacts';
-import { launchJoplin, closeJoplin, pluginSettingKey, JoplinInstance } from './launch';
+import { launchJoplin, closeJoplin, createProfile, pluginSettingKey, JoplinInstance } from './launch';
 import {
   createNotebook,
   createNote,
@@ -214,6 +214,35 @@ test.describe.serial('Harper settings dialog', () => {
       .locator('#harper-settings')
       .screenshot({ path: artifactPath('settings-rules.png') })
       .catch(() => win.screenshot({ path: artifactPath('settings-rules.png') }));
+
+    await closeSettings(win);
+  });
+
+  test('the scroll containers are themed in the light theme too', async () => {
+    // The dark theme is where an unthemed scrollbar is ugly enough to report, and it has its own
+    // describe block below. This is the other half of "verified in both themes": the same rules must
+    // resolve here, because they are written against theme VARIABLES rather than against dark.
+    const { win } = joplin;
+    const frame = await openSettings(win);
+    await openTab(frame, 'rules');
+    await expect
+      .poll(() => frame.locator('#hs-rules-groups .hs-group').count(), { timeout: 30_000 })
+      .toBeGreaterThan(10);
+
+    const metrics = await frame.locator('#harper-settings .hs-scroll').evaluate((el) => {
+      const cs = getComputedStyle(el);
+      return {
+        width: cs.scrollbarWidth,
+        color: cs.scrollbarColor,
+        overflows: el.scrollHeight > el.clientHeight,
+      };
+    });
+    // eslint-disable-next-line no-console
+    console.log(`[harper-e2e] light scrollbar = ${JSON.stringify(metrics)}`);
+    expect(metrics.overflows).toBe(true);
+    expect(metrics.width).toBe('thin');
+    expect(metrics.color).not.toBe('auto');
+    expect(metrics.color).toMatch(/rgba?\(/);
 
     await closeSettings(win);
   });
@@ -568,5 +597,107 @@ test.describe.serial('Harper settings dialog', () => {
 
     await closeSettings(win);
     await expect.poll(() => lintRangeCountForWord(win, PHRASE), { timeout: 30_000 }).toBeGreaterThan(0);
+  });
+});
+
+// -----------------------------------------------------------------------------
+
+/**
+ * E2E — SCROLLBAR THEMING, in Joplin's DARK theme.
+ *
+ * A plugin webview gets the BROWSER-DEFAULT scrollbar, not Joplin's. In the dark theme that is a
+ * bright white track down the side of a dark dialog — the one piece of chrome that visibly does not
+ * belong to the app it is embedded in, and what the user reported.
+ *
+ * This gets its own Joplin instance because the theme is a profile setting fixed at launch, and the
+ * serial group above deliberately runs on the default (light) profile. The assertions read the
+ * COMPUTED style, so an unthemed scrollbar fails as `auto` rather than passing on a stylesheet that
+ * merely loaded; the screenshot is the evidence a human actually looks at.
+ */
+test.describe.serial('Harper settings dialog — dark theme scrollbars', () => {
+  let joplin: JoplinInstance;
+
+  test.beforeAll(async () => {
+    // Same recipe as ui-conformance.spec.ts: theme 2 = Dark, and themeAutoDetect off, or it follows
+    // the (light) xvfb environment and silently overrides the theme we just set.
+    const profileDir = createProfile(true, {});
+    const settingsFile = path.join(profileDir, 'settings.json');
+    const settings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+    settings['theme'] = 2;
+    settings['themeAutoDetect'] = false;
+    fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2), 'utf8');
+    joplin = await launchJoplin({ profileDir });
+
+    const { win } = joplin;
+    await createNotebook(win, 'Harper Dark NB');
+    await createNote(win, 'Harper dark ' + Date.now());
+    await expect.poll(() => editorIsPresent(win), { timeout: 20_000 }).toBe(true);
+    await setEditorBody(win, 'I beleive we should of gone.');
+  });
+
+  test.afterAll(async () => {
+    if (joplin) await closeJoplin(joplin);
+  });
+
+  test('every scroll container is themed, and the dark dialog scrolls without a white track', async () => {
+    const { win } = joplin;
+    const frame = await openSettings(win);
+
+    // The Rules tab is the one that GUARANTEES an overflowing container: 823 rows cannot fit, so the
+    // main scrollbar is really painted rather than merely styled by a rule nothing matched.
+    await openTab(frame, 'rules');
+    await expect
+      .poll(() => frame.locator('#hs-rules-groups .hs-group').count(), { timeout: 30_000 })
+      .toBeGreaterThan(10);
+
+    const scroll = frame.locator('#harper-settings .hs-scroll');
+    const metrics = await scroll.evaluate((el) => {
+      const cs = getComputedStyle(el);
+      return {
+        width: cs.scrollbarWidth,
+        color: cs.scrollbarColor,
+        overflows: el.scrollHeight > el.clientHeight,
+        bodyBg: getComputedStyle(el.ownerDocument!.body).backgroundColor,
+      };
+    });
+    // eslint-disable-next-line no-console
+    console.log(`[harper-e2e] dark scrollbar = ${JSON.stringify(metrics)}`);
+
+    expect(metrics.overflows).toBe(true); // the bar is actually on screen
+    expect(metrics.width).toBe('thin');
+    // Themed, not the browser default. The exact rgb() depends on what the dark theme resolves
+    // --joplin-color-faded to, so this asserts "a real resolved colour", not a literal.
+    expect(metrics.color).not.toBe('auto');
+    expect(metrics.color).toMatch(/rgba?\(/);
+    // Confirms we really are in the dark theme — otherwise the spec proves nothing about the
+    // bright-track report it exists for.
+    const bodyRgb = (metrics.bodyBg.match(/\d+/g) || []).map(Number).slice(0, 3);
+    const luminance = (bodyRgb[0] + bodyRgb[1] + bodyRgb[2]) / 3;
+    expect(luminance).toBeLessThan(128);
+
+    // The inner scrollables get the same treatment. The dictionary textarea is the interesting one:
+    // it is a form control, which is where inherited scrollbar properties are most often dropped.
+    await openTab(frame, 'dictionary');
+    const textarea = await frame.locator('#hs-dictionary').evaluate((el) => {
+      const cs = getComputedStyle(el);
+      return { width: cs.scrollbarWidth, color: cs.scrollbarColor };
+    });
+    // eslint-disable-next-line no-console
+    console.log(`[harper-e2e] dark textarea scrollbar = ${JSON.stringify(textarea)}`);
+    expect(textarea.width).toBe('thin');
+    expect(textarea.color).not.toBe('auto');
+
+    // EVIDENCE: the rules list, scrolled down so the thumb sits well clear of the top.
+    await openTab(frame, 'rules');
+    await scroll.evaluate((el) => {
+      el.scrollTop = 400;
+    });
+    await win.waitForTimeout(300);
+    await frame
+      .locator('#harper-settings')
+      .screenshot({ path: artifactPath('settings-scrollbar-dark.png') })
+      .catch(() => win.screenshot({ path: artifactPath('settings-scrollbar-dark.png') }));
+
+    await closeSettings(win);
   });
 });

@@ -41,6 +41,66 @@ body {
 	-webkit-overflow-scrolling: touch;
 }
 
+/* ---- scrollbars ---------------------------------------------------------- */
+/*
+ * A plugin webview gets the BROWSER-DEFAULT scrollbar, not Joplin's. In the dark theme that is a
+ * bright white track running down the side of a dark dialog — the one piece of chrome that visibly
+ * does not belong to the app it is embedded in.
+ *
+ * Both mechanisms are declared, because which one applies depends on the Chromium the user's Joplin
+ * ships with:
+ *   - `scrollbar-width` / `scrollbar-color` are the standard properties (Chromium 121+). They are
+ *     INHERITED, so setting them on html/body themes every scroll container in the document; the
+ *     known ones are named again below anyway, since form controls are the classic place inheritance
+ *     is quietly dropped.
+ *   - the `::-webkit-scrollbar*` pseudo-elements are the legacy path, for the older Chromium behind
+ *     the plugin's Joplin 3.1 desktop minimum. Where BOTH are understood Chromium honours the
+ *     standard properties and ignores these, which is why the two must describe the same scrollbar.
+ *
+ * Colours are theme variables WITH fallbacks, per the file-level rule: mobile injects a reduced
+ * variable set, and an unresolved var() with no fallback renders as `unset`. A transparent track and
+ * a faded thumb is what Joplin's own UI looks like — the point is to disappear, not to decorate.
+ */
+html,
+body,
+.hs-scroll,
+.hs-textarea,
+#hs-rules-groups,
+#hs-dismissed-list {
+	scrollbar-width: thin;
+	scrollbar-color: var(--joplin-color-faded, #888888) transparent;
+}
+
+/* Universal, and safe to be: this stylesheet is injected into the Harper dialog's own webview and
+   nothing else, so `*` cannot reach a single pixel of Joplin's UI. It is also the only way to be
+   sure every scrollable is covered — including any the markup grows later. */
+*::-webkit-scrollbar {
+	width: 10px;
+	height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+/* The transparent border + padding-box clip is what makes the thumb read as an inset pill with room
+   around it, rather than a bar wedged against the edge of the content. */
+*::-webkit-scrollbar-thumb {
+	background-color: var(--joplin-color-faded, #888888);
+	border-radius: 5px;
+	border: 2px solid transparent;
+	background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+	background-color: var(--joplin-color, #222222);
+}
+
+/* Where a vertical and a horizontal bar meet; default is another bright patch in dark mode. */
+*::-webkit-scrollbar-corner {
+	background: transparent;
+}
+
 .hs-head {
 	margin-bottom: 8px;
 }
