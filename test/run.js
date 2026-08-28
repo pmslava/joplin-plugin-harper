@@ -442,7 +442,7 @@ async function main() {
 			);
 		});
 
-		// THE APPROVED COPY, VERBATIM. These four strings were signed off word for word, so they are
+		// THE APPROVED COPY, VERBATIM. These five strings were signed off word for word, so they are
 		// pinned as exact literals rather than probed with regexes: a "harmless" rewording is the one
 		// kind of drift a behavioural assertion would wave through. The regex checks below still run —
 		// they say WHY each sentence is there, so a future deliberate rewrite fails with a reason

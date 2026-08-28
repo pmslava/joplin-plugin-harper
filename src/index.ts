@@ -43,14 +43,15 @@ const SECTION = 'harper';
  * This one Bool decides which is live:
  *
  *   ON  (default): the basic settings register `public:false`, so the native page shows only this
- *                  switch; the Harper window owns them, and the desktop Tools menu item exists.
- *   OFF:           the basic settings register `public:true` exactly as before, and NO Tools menu
- *                  item is created.
+ *                  switch; the Harper window owns them, and its entry point is created (the Tools
+ *                  menu item on desktop, the note-toolbar button on mobile).
+ *   OFF:           the basic settings register `public:true` exactly as before, and NO entry point
+ *                  is created on either platform.
  *
  * `public:false` is a PURE VISIBILITY change — the values persist, every internal read still works,
  * and the dialog keeps editing them — so nothing below this line in the file has to know about it.
- * The command stays registered in BOTH modes: the rule browser, the dictionary editor and the
- * dismissed-findings restore exist only in the window, so the command palette must still reach it.
+ * The COMMAND stays registered in both modes; only the entry point moves. See
+ * registerSettingsDialogCommand for what that costs on each platform.
  */
 const MANAGE_IN_DIALOG_KEY = 'manageInDialog';
 /**
@@ -2037,12 +2038,11 @@ async function handleMessage(message: IncomingMessage | unknown): Promise<unknow
  * opens the window from the Tools menu; mobile has no menus at all and reaches it from the note
  * toolbar, so naming a Tools menu there would describe nothing the user can find.
  *
- * The copy argues the default rather than just stating it: the window holds all four things, this
- * page can only ever hold one of them, and THAT asymmetry is the reason the window wins by default.
- * Then it says exactly what turning the switch off moves, and what it costs — the fields come here,
- * the entry point goes away. Nothing else: earlier drafts that enumerated the window's contents a
- * second time, or offered the command palette as a consolation for the missing menu item, buried
- * the actual choice.
+ * The copy argues the default rather than merely stating it: the window holds all four things, this
+ * screen can only ever hold one of them, and THAT asymmetry is the reason the window wins by
+ * default. Then it says exactly what turning the switch off trades — the basic settings come here,
+ * the entry point goes away. It stops there; a draft that also offered the command palette as
+ * consolation for the missing menu item buried the actual choice, and it is not true on mobile.
  */
 function manageInDialogDescription(): string {
 	// Written out in full per platform rather than assembled from shared fragments: this is approved
@@ -2101,8 +2101,10 @@ async function registerSettings(): Promise<void> {
 	//
 	// This runs BEFORE registerSection deliberately: the section's own wording depends on the answer.
 	// Joplin resolves a setting's `section` when the settings SCREEN is built, long after onStart, and
-	// registerSetting itself never looks the section up — so registering into a section that is
-	// declared a few lines later is safe, and the e2e opens the real Options page to prove it.
+	// registerSetting itself never looks the section up, so registering into a section that is
+	// declared a few lines below is safe. It is also self-policing in practice: if this order threw,
+	// onStart would throw with it and the plugin would not load at all — which is exactly what the
+	// e2e suite boots a real Joplin to check, on every spec.
 	await joplin.settings.registerSettings({
 		[MANAGE_IN_DIALOG_KEY]: {
 			value: true,

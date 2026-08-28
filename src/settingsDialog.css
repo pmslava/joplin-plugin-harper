@@ -346,6 +346,14 @@ body {
 	margin: 0 0 6px 0;
 }
 
+/* harper wraps each description in <p>, so the trailing one used to add 6px under every rule. That
+   was invisible when a description appeared only on the row you had expanded; now that every row
+   carries one it is 823 rows of slack, which reads as a loose, drifting list. The gap BETWEEN
+   paragraphs is still wanted, so only the last one is trimmed. */
+.hs-rule-desc p:last-child {
+	margin-bottom: 0;
+}
+
 .hs-rule-desc code {
 	font-family: var(--joplin-font-family-monospace, monospace);
 	background-color: var(--joplin-background-color3, rgba(127, 127, 127, 0.12));
