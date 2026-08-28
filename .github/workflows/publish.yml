@@ -48,9 +48,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Same runtime as tests.yml — Node 24, the current LTS line (Node 20 went end-of-life in April
+      # 2026). See the note in tests.yml for why 24 rather than 22.
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
 
       # Resolve the version to publish: on a Release, take it from the tag (e.g. v1.2.0 -> 1.2.0);
@@ -108,9 +110,11 @@ jobs:
           echo "Packing $(node -p "require('./package.json').name")@$PUBLISH_VERSION:"
           npm pack --dry-run --ignore-scripts
 
-      # Keep the project's Node 20 runtime (matching tests.yml) for the build and harness above, then
-      # switch only the registry-facing steps to a runtime supported by npm trusted publishing
-      # (Node 22.14.0 or newer).
+      # The build and harness above now run on Node 24 as well (see the setup-node at the top of the
+      # job), so this step no longer switches version — it is kept as an explicit pin of the runtime
+      # the registry-facing steps below require. npm trusted publishing needs Node 22.14.0 or newer;
+      # stating that requirement here means a later change to the project's build runtime cannot
+      # quietly drop the publish steps onto an unsupported Node.
       - name: Use a current Node runtime for trusted publishing
         uses: actions/setup-node@v7
         with:
