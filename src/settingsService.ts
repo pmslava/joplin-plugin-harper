@@ -13,8 +13,8 @@
  *   1. SETTINGS go through `joplin.settings.setValue`, never straight into `cfg`, so the existing
  *      `settings.onChange` handler does the reconfigure + multi-window poke it already does.
  *   2. DICTIONARY edits go through `applyWordEdits`, which routes into the same pending buffers and
- *      the same reconcile that add-to-dictionary uses — note/file mirroring and deletion propagation
- *      keep working, and nothing here re-implements them.
+ *      the same reconcile that add-to-dictionary uses — the external-file mirror and deletion
+ *      propagation keep working, and nothing here re-implements them.
  *   3. Every mutation ends in `pokeForceLint()`, the existing generation-bump + execCommand pair, so
  *      unfocused note windows refresh too.
  *
@@ -47,26 +47,37 @@ export interface PrimarySettings {
 	debounceMs: number;
 	underlineStyle: string;
 	ignoreNonEnglish: boolean;
+	/**
+	 * THE LEGACY DICTIONARY NOTE (≤ v1.4.x). Read, never written, and never shown as a field: its only
+	 * remaining job is to decide whether this device gets the upgrade notice below. The key stays
+	 * REGISTERED (privately) precisely so this read is legal — Joplin throws "Unknown key" for a
+	 * setting a plugin did not register, so un-registering it would break the read rather than skip it.
+	 */
 	dictionaryNoteId: string;
 	/** v1.5.0: the sync note. Empty means the settings sync is off on this device. */
 	syncNoteId: string;
 	/** Present on desktop only — the setting is not registered on mobile. */
 	dictionaryPath?: string;
+	/** Where the settings export (dialect + rule overrides) is written. Desktop only, as above. */
+	settingsPath?: string;
 }
 
 /**
- * THE UPGRADE NOTICE (v1.5.0) — shown in the Harper window when a v1.4.x user has a dictionary note
- * but no sync note.
+ * THE UPGRADE NOTICE — shown in the Harper window when a ≤ v1.4.x user still has a dictionary note
+ * and has not made a sync note yet.
  *
- * The old note is a plain word list; the new one is machine-readable JSON carrying rules, dismissed
- * findings and words together. There is no honest way to read one as the other, so the plugin says
- * so rather than migrating something it would have to guess at. Deliberately a BANNER and not a
- * popup: nothing about this is urgent, the old note keeps working exactly as it did, and an
- * unprompted dialog for a feature the user has not asked for yet is the wrong trade.
+ * The dictionary note is GONE, not deprecated: nothing reads it, nothing writes it, and the words
+ * that lived in it reach the new world only when the user runs the create command (which folds them
+ * into the seed). So the notice has two jobs and does both plainly — say the old note is dead, and
+ * name the one command that replaces it. Deleting the old note is offered as a courtesy rather than
+ * asked for, because the plugin will not touch it either way and a user may want to keep the list.
+ *
+ * Deliberately a BANNER and not a popup: nothing about this is urgent, and an unprompted dialog for a
+ * feature the user has not asked for yet is the wrong trade.
  */
 export const SYNC_UPGRADE_NOTICE =
-	'Your dictionary note cannot be used for the new settings sync, so make a new one with the ' +
-	'command Harper: Create sync note.';
+	'Your dictionary note is no longer used. Create a sync note with the command Harper: Create ' +
+	'sync note, and delete the old dictionary note if you like.';
 
 /** The notice to show above the tabs, or null when there is nothing to say. */
 export function syncNoticeFor(settings: PrimarySettings): string | null {
@@ -148,17 +159,6 @@ export interface SettingsServiceDeps {
 	applyWordEdits(adds: string[], removes: string[]): Promise<string[]>;
 	/** Accepted `dialect` values, so validation cannot drift from DIALECT_BY_NAME. */
 	dialectNames: string[];
-	/**
-	 * v1.5.0: the harper-ls block for the "Copy Zed settings block" button, plus where (if anywhere)
-	 * the plugin keeps the same bytes as a file. `copied` reports whether the clipboard actually took
-	 * it — a webview cannot reach the clipboard, so the copy happens in the plugin and mobile has no
-	 * clipboard API at all. Optional so a host without it degrades to no button rather than an error.
-	 */
-	getZedSettingsBlock?(opts: { copy: boolean }): Promise<{
-		text: string;
-		filePath: string;
-		copied: boolean;
-	}>;
 }
 
 // =============================================================================
@@ -217,7 +217,7 @@ export function normalizeRuleOverrides(map: Record<string, unknown>): LintConfig
  * Both dictionary formats treat such a line as a comment, so one pasted into the editor can never
  * become a stored word — and without this it would be reported as an ADD, appended to the user's
  * external file, appended a SECOND time by the next rewrite (a non-word line never enters that
- * function's `seen` set), written into the dictionary note, and then dropped again on the next read.
+ * function's `seen` set), broadcast through the sync note, and then dropped again on the next read.
  * The word silently vanishes from the list while the junk lines accrete permanently.
  */
 export function normalizeWords(words: readonly string[]): string[] {
@@ -313,11 +313,17 @@ const SETTING_VALIDATORS: Record<string, (value: unknown, deps: SettingsServiceD
 		if (v !== 'squiggly' && v !== 'solid') throw new Error(`invalid underlineStyle: ${String(v)}`);
 		return v;
 	},
-	dictionaryNoteId: (v) => (typeof v === 'string' ? v.trim() : ''),
+	// `dictionaryNoteId` is deliberately ABSENT: the legacy key is readable (for the notice) but no
+	// longer writable from anywhere, so the dialog cannot resurrect a mechanism that has been removed.
 	syncNoteId: (v) => (typeof v === 'string' ? v.trim() : ''),
 	dictionaryPath: (v, deps) => {
 		// Not registered on mobile — writing it there throws "Unknown key" in real Joplin.
 		if (deps.isMobile()) throw new Error('dictionaryPath is desktop-only');
+		return typeof v === 'string' ? v : '';
+	},
+	settingsPath: (v, deps) => {
+		// Desktop only for the same reason as dictionaryPath: it names a real file on a real disk.
+		if (deps.isMobile()) throw new Error('settingsPath is desktop-only');
 		return typeof v === 'string' ? v : '';
 	},
 	ruleOverrides: (v) => {
@@ -387,7 +393,10 @@ export function createSettingsService(deps: SettingsServiceDeps): SettingsServic
 			syncNoteId: (await deps.getSetting('syncNoteId')) || '',
 		};
 		// Reading an unregistered key throws in real Joplin, so mobile must not even ask.
-		if (!deps.isMobile()) settings.dictionaryPath = (await deps.getSetting('dictionaryPath')) || '';
+		if (!deps.isMobile()) {
+			settings.dictionaryPath = (await deps.getSetting('dictionaryPath')) || '';
+			settings.settingsPath = (await deps.getSetting('settingsPath')) || '';
+		}
 		return settings;
 	}
 
@@ -495,7 +504,7 @@ export function createSettingsService(deps: SettingsServiceDeps): SettingsServic
 
 		async saveDictionaryWords(words, baseline): Promise<DictionarySaveResult> {
 			// Editor semantics as a DIFF, not a wholesale replace: the adds and removes are then fed
-			// into the same buffers add-to-dictionary uses, so the note/file mirror and its deletion
+			// into the same buffers add-to-dictionary uses, so the external-file mirror and its deletion
 			// propagation behave exactly as they do for a single word.
 			//
 			// The posted list is NOT authoritative over the dictionary — only over the words the editor
@@ -577,12 +586,6 @@ export function createSettingsService(deps: SettingsServiceDeps): SettingsServic
 					return service.getRuleDescriptions();
 				case 'settings:applyRuleOverrides':
 					return { ok: true, overrides: await service.applyRuleOverrides(msg.overrides || {}) };
-				case 'settings:zedBlock':
-					// Null (not an error) when the host does not provide it: the dialog reads that as
-					// "not available on this device" and says so, rather than showing a stack trace.
-					return deps.getZedSettingsBlock
-						? await deps.getZedSettingsBlock({ copy: msg.copy === true })
-						: null;
 				case 'settings:resetRules':
 					return { ok: true, overrides: await service.resetRules() };
 				case 'settings:disableAllRules':

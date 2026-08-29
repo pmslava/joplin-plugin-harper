@@ -670,16 +670,24 @@
 		ignoreWrap.appendChild(el('span', null, 'Skip text that is not English'));
 		section.appendChild(field('Ignore non-English text', ignoreWrap, 'Useful for multilingual notes.'));
 
-		// Dictionary note id
+		// Sync note id — THE ONE NOTE FIELD.
+		//
+		// v1.5.0 briefly had two (this and "Dictionary note id"), which asked the user to understand a
+		// distinction that only existed while the old mechanism was being retired. The dictionary note
+		// is gone, so there is one note and one field. A device that still carries a legacy
+		// `dictionaryNoteId` value shows this box EMPTY — because it is empty; the legacy id is not a
+		// sync note and pre-filling it here would invite the user to "confirm" a setting that would
+		// then point the sync at a plain word list. The banner above the tabs is what tells them about
+		// the old note instead (see SYNC_UPGRADE_NOTICE).
 		var noteId = el('input', 'hs-input hs-input-wide');
 		noteId.type = 'text';
-		noteId.id = 'hs-dictionary-note-id';
-		noteId.value = s.dictionaryNoteId || '';
+		noteId.id = 'hs-sync-note-id';
+		noteId.value = s.syncNoteId || '';
 		stopEnterFromClosingTheDialog(noteId);
 		var noteIdBefore = noteId.value;
 		noteId.addEventListener('change', function () {
 			var value = noteId.value.trim();
-			updateSetting('dictionaryNoteId', value, function () {
+			updateSetting('syncNoteId', value, function () {
 				noteId.value = noteIdBefore;
 			}).then(function () {
 				noteIdBefore = noteId.value;
@@ -687,10 +695,11 @@
 		});
 		section.appendChild(
 			field(
-				'Dictionary note id',
+				'Sync note id',
 				noteId,
-				'A Joplin note used as your dictionary, one word per line. It syncs across devices. ' +
-					'Run "Harper: Create dictionary note" to make one. Leave empty to turn it off.',
+				'A Joplin note Harper uses to sync your rules, dictionary and dismissed findings between ' +
+					'devices. It holds machine-readable data, so do not edit it by hand. Run ' +
+					'"Harper: Create sync note" to make one. Leave empty to turn the sync off.',
 			),
 		);
 
@@ -716,6 +725,34 @@
 					'External dictionary file',
 					dictPath,
 					'Absolute path to a plain-text dictionary, one word per line. Leave empty to skip it.',
+				),
+			);
+		}
+
+		// External settings file — DESKTOP ONLY, on the same terms as the dictionary path above, and
+		// placed directly under it because the two together are the "and your other tools see this"
+		// story. Harper OWNS this file and rewrites it wholesale, which the help text says outright.
+		if (Object.prototype.hasOwnProperty.call(s, 'settingsPath')) {
+			var settingsPath = el('input', 'hs-input hs-input-wide');
+			settingsPath.type = 'text';
+			settingsPath.id = 'hs-settings-path';
+			settingsPath.value = s.settingsPath || '';
+			stopEnterFromClosingTheDialog(settingsPath);
+			var settingsPathBefore = settingsPath.value;
+			settingsPath.addEventListener('change', function () {
+				var value = settingsPath.value;
+				updateSetting('settingsPath', value, function () {
+					settingsPath.value = settingsPathBefore;
+				}).then(function () {
+					settingsPathBefore = settingsPath.value;
+				});
+			});
+			section.appendChild(
+				field(
+					'External settings file',
+					settingsPath,
+					'Absolute path to a JSON file where Harper keeps your dialect and rule overrides for ' +
+						'other tools to read. Harper rewrites it when they change. Leave empty to skip it.',
 				),
 			);
 		}
@@ -995,43 +1032,6 @@
 
 	var searchTimer = null;
 
-	/**
-	 * Show the block, always, whether or not the clipboard worked.
-	 *
-	 * A "Copied!" toast the user has to trust is worse than the text itself: a webview cannot reach
-	 * the clipboard on either platform, so the copy happens in the plugin and may quietly not be
-	 * available. Rendering the block means the button is useful even then, and it doubles as the
-	 * answer to "what exactly did it copy?".
-	 */
-	function showZedBlock(reply) {
-		var box = document.getElementById('hs-zed');
-		if (!box) return;
-		clear(box);
-		if (reply.filePath) {
-			box.appendChild(
-				el(
-					'p',
-					'hs-help',
-					'Harper also keeps this block in a file next to your dictionary, at ' + reply.filePath + '.',
-				),
-			);
-		}
-		var area = el('textarea', 'hs-textarea hs-zed-text');
-		area.id = 'hs-zed-text';
-		area.readOnly = true;
-		area.rows = 12;
-		// value, never innerHTML — the content is the plugin's own JSON, but the rule is about the
-		// channel, not about who happens to be on the other end today.
-		area.value = reply.text || '';
-		box.appendChild(area);
-		try {
-			area.focus();
-			area.select();
-		} catch (error) {
-			/* selecting is a convenience; a host that refuses it still shows the text */
-		}
-	}
-
 	function renderRulesSection(root) {
 		var section = el('div', 'hs-section');
 		section.appendChild(
@@ -1090,37 +1090,7 @@
 		});
 		toolbar.appendChild(disableAll);
 
-		// THE ZED BRIDGE (v1.5.0). The same rules, as a block a user pastes into another editor's
-		// settings. Always offered: it is text, not a second sync channel, and a user reading their
-		// rules on a phone may perfectly well want to paste them into a laptop later.
-		var zed = el('button', 'hs-button', 'Copy Zed settings block');
-		zed.type = 'button';
-		zed.id = 'hs-copy-zed';
-		zed.addEventListener('click', function () {
-			setRulesStatus('Building the block…');
-			send({ type: 'settings:zedBlock', copy: true })
-				.then(function (reply) {
-					if (!reply) {
-						setRulesStatus('The Zed settings block is not available on this device.', true);
-						return;
-					}
-					showZedBlock(reply);
-					setRulesStatus(
-						reply.copied
-							? 'Copied. Paste it into Zed\'s settings.json.'
-							: 'Select the block below and copy it into Zed\'s settings.json.',
-					);
-				})
-				.catch(function (error) {
-					setRulesStatus('Could not build the block: ' + errorText(error), true);
-				});
-		});
-		toolbar.appendChild(zed);
 		section.appendChild(toolbar);
-
-		var zedBox = el('div', 'hs-zed');
-		zedBox.id = 'hs-zed';
-		section.appendChild(zedBox);
 
 		var summary = el('div', 'hs-summary');
 		summary.id = 'hs-rules-summary';

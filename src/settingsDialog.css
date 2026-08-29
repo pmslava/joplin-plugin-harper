@@ -456,7 +456,7 @@ body,
 	font-size: 0.88em;
 }
 
-/* ---- v1.5.0: the sync notice and the Zed settings block ------------------ */
+/* ---- v1.5.0: the sync notice --------------------------------------------- */
 
 /*
  * The notice reads as information, not as an alarm: the plugin still works exactly as it did, and
@@ -470,17 +470,6 @@ body,
 	padding: 8px 12px;
 	margin: 0 0 14px 0;
 	font-size: 0.95em;
-}
-
-.hs-zed:empty {
-	display: none;
-}
-
-.hs-zed-text {
-	font-family: var(--joplin-font-family-monospace, monospace);
-	font-size: 0.9em;
-	white-space: pre;
-	margin-top: 8px;
 }
 
 /* ---- narrow screens ------------------------------------------------------ */
