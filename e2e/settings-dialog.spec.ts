@@ -439,7 +439,7 @@ test.describe.serial('Harper settings dialog', () => {
   });
 
   /**
-   * The General tab was rendered by one test and CHANGED by none, so each of its seven controls
+   * The General tab was rendered by one test and CHANGED by none, so each of its eight controls
    * could have been wired to the wrong setting key and both suites would still have passed green:
    * the service rejects an unknown key, the dialog quietly reverts the control and shows "Could not
    * save …", and nothing anywhere looked. Every control is driven here and confirmed OUTSIDE the
@@ -496,14 +496,16 @@ test.describe.serial('Harper settings dialog', () => {
     await frame.locator('#hs-ignore-non-english').uncheck();
     await saved('ignoreNonEnglish', false, 'ignore-non-english uncheck');
 
-    // 5. Dictionary note id (an id that resolves to no note is harmless — there is simply no note
-    //    side — and it is cleared again immediately).
-    await frame.locator('#hs-dictionary-note-id').fill('0123456789abcdef0123456789abcdef');
-    await frame.locator('#hs-dictionary-note-id').blur();
-    await saved('dictionaryNoteId', '0123456789abcdef0123456789abcdef', 'dictionary note id');
-    await frame.locator('#hs-dictionary-note-id').fill('');
-    await frame.locator('#hs-dictionary-note-id').blur();
-    await saved('dictionaryNoteId', '', 'dictionary note id cleared');
+    // 5. Sync note id. Was "#hs-dictionary-note-id" / `dictionaryNoteId` until the dictionary note
+    //    was retired: the General tab has ONE note field now, and this is it. (An id that resolves
+    //    to no note is harmless — the sync simply finds nothing — and it is cleared again
+    //    immediately.)
+    await frame.locator('#hs-sync-note-id').fill('0123456789abcdef0123456789abcdef');
+    await frame.locator('#hs-sync-note-id').blur();
+    await saved('syncNoteId', '0123456789abcdef0123456789abcdef', 'sync note id');
+    await frame.locator('#hs-sync-note-id').fill('');
+    await frame.locator('#hs-sync-note-id').blur();
+    await saved('syncNoteId', '', 'sync note id cleared');
 
     // 6. External dictionary file — desktop only, so the row exists here.
     const dictPath = path.join(joplin.profileDir, 'e2e-dictionary.txt');
@@ -514,7 +516,18 @@ test.describe.serial('Harper settings dialog', () => {
     await frame.locator('#hs-dictionary-path').blur();
     await saved('dictionaryPath', '', 'dictionary path cleared');
 
-    // 7. Enable Harper — reverted immediately, then confirmed in the editor rather than only in the
+    // 7. External settings file — the other desktop-only path row, added when the Zed copy-button was
+    //    replaced by a file the plugin owns. Covered here so this test's "EVERY General-tab control"
+    //    promise stays true; what the file itself contains is sync-upgrade-and-export.spec.ts's job.
+    const exportPath = path.join(joplin.profileDir, 'e2e-harper-settings.json');
+    await frame.locator('#hs-settings-path').fill(exportPath);
+    await frame.locator('#hs-settings-path').blur();
+    await saved('settingsPath', exportPath, 'settings path');
+    await frame.locator('#hs-settings-path').fill('');
+    await frame.locator('#hs-settings-path').blur();
+    await saved('settingsPath', '', 'settings path cleared');
+
+    // 8. Enable Harper — reverted immediately, then confirmed in the editor rather than only in the
     //    file, since this is the one control whose whole job is outside the dialog.
     await frame.locator('#hs-enabled').uncheck();
     await saved('enabled', false, 'enabled off');
@@ -535,7 +548,10 @@ test.describe.serial('Harper settings dialog', () => {
     const { win, profileDir } = joplin;
     const frame = await openSettings(win);
 
-    const noteId = frame.locator('#hs-dictionary-note-id');
+    // The subject is the sync note id: the bug was reported against the note field, and after the
+    // dictionary note was retired the sync note id IS the note field (#hs-dictionary-note-id no
+    // longer exists). The dictionary path below still corroborates it on a second input.
+    const noteId = frame.locator('#hs-sync-note-id');
     await noteId.fill('fedcba9876543210fedcba9876543210');
     await noteId.press('Enter');
     await win.waitForTimeout(1500);
@@ -543,7 +559,7 @@ test.describe.serial('Harper settings dialog', () => {
     expect(await findSettingsFrame(win)).not.toBeNull(); // the dialog is still there
     // ...and Enter still did what the user pressed it for: the `change` event fired and saved.
     await expect
-      .poll(() => readHarperSetting(profileDir, 'dictionaryNoteId'), { timeout: 20_000 })
+      .poll(() => readHarperSetting(profileDir, 'syncNoteId'), { timeout: 20_000 })
       .toBe('fedcba9876543210fedcba9876543210');
 
     // The desktop-only path field is the other `type=text` input, and behaves the same.
@@ -554,7 +570,7 @@ test.describe.serial('Harper settings dialog', () => {
     // Leave the profile as we found it.
     await noteId.fill('');
     await noteId.press('Enter');
-    await expect.poll(() => readHarperSetting(profileDir, 'dictionaryNoteId'), { timeout: 20_000 }).toBe('');
+    await expect.poll(() => readHarperSetting(profileDir, 'syncNoteId'), { timeout: 20_000 }).toBe('');
 
     await closeSettings(win);
   });

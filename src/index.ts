@@ -24,14 +24,25 @@ import { slimBinaryInlined } from 'harper.js/slimBinaryInlined';
 import { resolvePlatform, isMobile } from './platform';
 import { mergeDictionary } from './dictionaryMerge';
 import {
+	DismissedEntry,
 	DismissedStore,
 	appendDismissedInTransaction,
 	buildIgnoredLintsPayload,
 	extractHashes,
+	loadDismissed,
 	makeEntryId,
+	saveDismissed,
 	withDismissalTransaction,
 } from './dismissedLog';
 import { SettingsService, createSettingsService, parseRuleOverridesJson } from './settingsService';
+import {
+	SYNC_NOTE_TITLE,
+	SyncContent,
+	buildSyncNoteBody,
+	parseSyncNoteBody,
+	syncContentKey,
+} from './syncNote';
+import { buildSettingsExportFile } from './settingsExport';
 
 const CONTENT_SCRIPT_ID = 'harperCm';
 const SECTION = 'harper';
@@ -62,13 +73,6 @@ const MANAGE_IN_DIALOG_KEY = 'manageInDialog';
  * nothing. Defaults to true so a read that never happened still means "the Harper window owns them".
  */
 let manageInDialog = true;
-const DICTIONARY_NOTE_TITLE = 'Harper Dictionary';
-// Canonical dictionary-note header. Lines starting with '# ' (hash + space) are comments and are
-// skipped on parse; every other non-blank line is one word. Written verbatim as the first body line.
-const DICTIONARY_NOTE_HEADER =
-	'# Harper Dictionary — one word per line. Lines starting with "# " are comments. ' +
-	'Managed by the Harper Joplin plugin; edits here sync to every device.';
-
 /**
  * The plain-JSON shape sent back to the content script. WASM `Lint`/`Suggestion`
  * handles are NOT serializable across the plugin<->editor IPC boundary, so we flatten
@@ -132,7 +136,16 @@ interface HarperConfig {
 	/** Feeds harper's `isolateEnglish` LintOption: skip spans that do not look like English. */
 	ignoreNonEnglish: boolean;
 	dictionaryPath: string;
+	/**
+	 * THE LEGACY DICTIONARY NOTE (≤ v1.4.x), kept for exactly two reads and nothing else: the upgrade
+	 * notice in the Harper window, and the one-time word fold performed by "Harper: Create sync note".
+	 * The plugin never writes it, never deletes it, and no longer reconciles against it.
+	 */
 	dictionaryNoteId: string;
+	/** v1.5.0: the sync note. When set it owns rules, words and dismissed findings on every device. */
+	syncNoteId: string;
+	/** DESKTOP: where the settings export (dialect + rule overrides) is written. '' turns it off. */
+	settingsPath: string;
 	ruleOverrides: string;
 }
 const cfg: HarperConfig = {
@@ -143,8 +156,13 @@ const cfg: HarperConfig = {
 	ignoreNonEnglish: false,
 	dictionaryPath: '',
 	dictionaryNoteId: '',
+	syncNoteId: '',
+	settingsPath: '',
 	ruleOverrides: '',
 };
+
+const SYNC_NOTE_ID_KEY = 'syncNoteId';
+const SETTINGS_PATH_KEY = 'settingsPath';
 
 export const DIALECT_BY_NAME: Record<string, Dialect> = {
 	American: Dialect.American,
@@ -175,7 +193,13 @@ async function loadSettings(): Promise<void> {
 	// must never call value('dictionaryPath') — skip the read entirely and default to ''. (The old
 	// unconditional read escaped onStart on mobile and killed the whole plugin.)
 	cfg.dictionaryPath = isMobile() ? '' : await read('dictionaryPath', '');
+	// Desktop-only for the same reason as dictionaryPath — it names a real file, and it is registered
+	// on desktop alone, so a mobile read would throw "Unknown key" and take onStart down with it.
+	cfg.settingsPath = isMobile() ? '' : await read(SETTINGS_PATH_KEY, '');
+	// STILL READ, on both platforms: the key stays registered (privately) so this cannot throw, and the
+	// value drives the upgrade notice plus the create-sync-note word fold. Nothing else consults it.
 	cfg.dictionaryNoteId = await read('dictionaryNoteId', '');
+	cfg.syncNoteId = await read(SYNC_NOTE_ID_KEY, '');
 	cfg.ruleOverrides = await read('ruleOverrides', '');
 }
 
@@ -183,18 +207,18 @@ async function loadSettings(): Promise<void> {
 // EDITOR-OPEN TRACKING (the L3 flush guard).
 // =============================================================================
 // L3: a plugin `joplin.data.put` note-write while ANY editor is open EVICTS the mobile editor. So the
-// dictionary-note write (the ONLY note-write this plugin ever does) must never land during an active
-// editing session. We track `editorOpen`:
+// SYNC-NOTE write (since v1.5.0 the only note-write this plugin ever does) must never land during an
+// active editing session. We track `editorOpen`:
 //   - set TRUE by the content script's `getConfig` handshake — a CM6 content script only loads when a
 //     markdown editor is mounted, so a handshake means "an editor is now open".
 //   - set FALSE by `workspace.onNoteSelectionChange` — the previously-open editor is being torn down /
 //     navigated away; the newly-selected note (if any) has no in-progress edits yet.
-// The reconcile issues its data.put ONLY when `editorOpen === false`. Selection-change sets the flag
-// false and THEN reconciles, so words persist to the note the instant the user leaves a note; start
-// reconciles before any editor mounts. A note write needed while an editor is open (e.g. the
-// dictionaryNoteId setting changed mid-edit) is deferred to the next trigger. This makes it structurally
-// impossible for our note-write to reload an active editing session — the mobile eviction (L3) can't
-// fire, and desktop's open editor is likewise never disturbed (documented by the eviction-safety E2E).
+// `flushSyncNote` issues its data.put ONLY when `editorOpen === false`. Selection-change sets the flag
+// false and THEN drains, so local changes reach the note the instant the user leaves a note; start
+// reads the note before any editor mounts. A write needed while an editor is open stays PENDING and is
+// performed at the next drain point. This makes it structurally impossible for our note-write to reload
+// an active editing session — the mobile eviction (L3) can't fire, and desktop's open editor is
+// likewise never disturbed (documented by the eviction-safety E2E).
 let editorOpen = false;
 
 // -----------------------------------------------------------------------------
@@ -256,19 +280,6 @@ function parseWords(content: string): string[] {
 		.map((line) => line.replace(/\r$/, '').trim())
 		// Skip blank lines and '# ' comment lines (the dictionary-note header format).
 		.filter((line) => line.length > 0 && !line.startsWith('# '));
-}
-
-/** Canonical dictionary body: header, blank line, then the words deduped + deterministically sorted. */
-function canonicalDictionaryBody(words: Iterable<string>): string {
-	const set = new Set<string>();
-	for (const w of words) {
-		const t = (w || '').trim();
-		if (t) set.add(t);
-	}
-	// Code-unit sort (not locale-aware) so two devices produce byte-identical bodies from the same set
-	// — the design's ping-pong / conflict mitigation (mobile-product-design.md §1b).
-	const sorted = [...set].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-	return `${DICTIONARY_NOTE_HEADER}\n\n${sorted.join('\n')}\n`;
 }
 
 // Last-seen mtime of the external dictionary; the 60s poll compares against it and
@@ -337,38 +348,21 @@ function readLocalWords(): string[] {
 }
 
 // =============================================================================
-// DICTIONARY NOTE (both platforms) — the synced source of truth for the word list.
+// WHERE THE WORDS COME FROM (v1.5.0).
 // =============================================================================
-// Words come from up to three sources merged into the linter's in-memory set:
-//   1. external FILE   — desktop only (unchanged), read via fs.
-//   2. dictionary NOTE — both platforms (new), read via joplin.data (READS are always safe, L3).
-//   3. pendingWords    — both platforms (new), a settings buffer of add-to-dictionary words not yet
-//                        flushed to the note (settings writes are safe mid-edit, L4).
-let lastNoteUpdatedTime: number | null = null;
+// Three sources are merged into the linter's in-memory set:
+//   1. external FILE   — desktop only, read via fs. The one DURABLE side the merge reconciles against.
+//   2. pendingWords    — both platforms, a settings buffer of add-to-dictionary words not yet folded
+//                        into the file (settings writes are safe mid-edit, L4).
+//   3. userWords.txt   — desktop only, the additive plugin-local fallback used when no file is set.
+//
+// The DICTIONARY NOTE is gone. Until v1.4.x a second Joplin note held a one-word-per-line list and was
+// merged as a second side; v1.5.0 replaced it with the sync note (src/syncNote.ts), which carries
+// words together with rules and dismissed findings and delivers them through the pending buffers
+// above rather than as a merge side of its own. Two synced word lists were one too many, and the note
+// could only ever carry the words — never the rules or the dismissals the same user also wanted.
 
-/**
- * Read the dictionary note's words (both platforms), or null when there is NO note side this pass
- * (no note configured, or the note is not readable right now — deleted, or not yet synced).
- *
- * Same null-vs-empty rule as the file (see readExternalFile): an unreadable note infers no
- * deletions, an empty-but-readable note deletes what the base remembered.
- */
-async function readDictionaryNote(noteId: string = cfg.dictionaryNoteId): Promise<string[] | null> {
-	if (!noteId) return null;
-	try {
-		const note = await joplin.data.get(['notes', noteId], {
-			fields: ['body', 'updated_time'],
-		});
-		const body: string = (note && note.body) || '';
-		lastNoteUpdatedTime = (note && note.updated_time) || null;
-		return parseWords(body);
-	} catch {
-		// Note deleted or not yet synced — no note side; the id stays set so it recovers on sync.
-		return null;
-	}
-}
-
-/** The pendingWords settings buffer (words added but not yet flushed to the note). Both platforms. */
+/** The pendingWords settings buffer (words added but not yet folded into the file). Both platforms. */
 async function readPendingWords(): Promise<string[]> {
 	try {
 		const v = await joplin.settings.value('pendingWords');
@@ -535,11 +529,11 @@ const SYNC_BASE_KEY = 'syncBase';
 // =============================================================================
 // INV-A — DICTIONARY EPOCH: no durable write may outlive the configuration it was computed from.
 // =============================================================================
-// Three pieces of state decide what a reconcile pass MEANS: the dictionary note id, the external
-// file path, and the merge base. A repoint changes all three, and a pass that computed its result
-// from the old ones must not write with them — it would put the old note's words into the newly
-// pointed note, truncate the newly pointed file, or commit a base over the `''` that `resetSyncBase`
-// writes precisely so the next pass adopts the new side instead of inferring deletions from it.
+// Two pieces of state decide what a reconcile pass MEANS: the external file path and the merge base.
+// A repoint changes both, and a pass that computed its result from the old ones must not write with
+// them — it would truncate the newly pointed file, or commit a base over the `''` that
+// `resetSyncBase` writes precisely so the next pass adopts the new side instead of inferring
+// deletions from it.
 //
 // Rounds of point-fixes taught the shape this has to take. Capturing the identity at pass start was
 // not enough (the base was still read live). Re-checking the identity ONCE before the write block was
@@ -601,7 +595,6 @@ function captureDictionaryEpoch(): number {
 /** What a pass is reconciling against: captured once, asserted at every durable write. */
 interface PassSnapshot {
 	epoch: number;
-	noteId: string;
 	dictPath: string;
 	reason: string;
 }
@@ -613,18 +606,13 @@ let warnedStalePass: string | null = null;
  * write. Called immediately before each durable write — never once for the whole block.
  */
 function passIsStale(pass: PassSnapshot, what: string): boolean {
-	if (
-		dictionaryEpoch === pass.epoch &&
-		cfg.dictionaryNoteId === pass.noteId &&
-		(isMobile() || cfg.dictionaryPath === pass.dictPath)
-	) {
+	if (dictionaryEpoch === pass.epoch && (isMobile() || cfg.dictionaryPath === pass.dictPath)) {
 		return false;
 	}
 	// Say what actually happened. "Repointed mid-pass" was printed for every abandon, including ones
 	// where the identity never moved at all, which sent anyone reading the log after the wrong cause.
 	let why: string;
 	if (pass.epoch < 0) why = 'it started while the dictionary was being repointed';
-	else if (cfg.dictionaryNoteId !== pass.noteId) why = 'the dictionary note was repointed mid-pass';
 	else if (!isMobile() && cfg.dictionaryPath !== pass.dictPath) {
 		why = 'the external dictionary file was repointed mid-pass';
 	} else why = 'the dictionary configuration changed mid-pass';
@@ -948,6 +936,13 @@ function waitForRefresh(clientGeneration: number): Promise<{ generation: number 
 async function pokeForceLint(): Promise<void> {
 	// Resolve every parked subscription FIRST (all windows), then poke the focused editor.
 	bumpConfigGeneration();
+	// THE SYNC-NOTE WRITE HOOK (v1.5.0). Every mutation of synced state in this plugin — a rule
+	// toggle from any of its three paths, a dismiss, a restore, a clear, a dictionary add or remove,
+	// a reconcile that moved the word set — ends here. Hooking the one function rather than the seven
+	// call sites is what makes "when local synced state changes, write the note" true by construction
+	// instead of by inventory. The write is debounced and skipped when the content is unchanged, so
+	// the calls that change nothing synced (an underline-style toggle, a dialect switch) cost nothing.
+	scheduleSyncNoteWrite();
 	try {
 		await joplin.commands.execute('editor.execCommand', { name: 'harper.forceLint' });
 	} catch {
@@ -964,16 +959,16 @@ async function pokeForceLint(): Promise<void> {
 //   persist the new base -> retire the pending entries this pass flushed (NOT the whole buffer —
 //   see retirePendingEntries) -> hand the result to the engine.
 //
-// WRITE DISCIPLINE (unchanged from v1.2.0, and still the only note-write path in the plugin):
-//   * the note is written with `joplin.data.put` ONLY when `editorOpen === false` (L3 — a plugin note
-//     write while an editor is open evicts the mobile editor). A needed note write that arrives while
-//     an editor is open is simply not performed; the reconcile is idempotent, so the next trigger
-//     (selection change, poll, settings change) does it.
+// WRITE DISCIPLINE:
+//   * the reconcile writes NO NOTE AT ALL since v1.5.0. The dictionary note is gone, and the sync
+//     note is written by flushSyncNote (which keeps the L3 editor-open gate for its own data.put).
+//     So a reconcile pass touches only the filesystem and private settings — both L4-safe at any
+//     moment, on both platforms.
 //   * the file is rewritten in place, atomically, and only when its content actually changes.
-//   * `syncBase` is advanced ONLY when every side that needed writing was written AND every
+//   * `syncBase` is advanced ONLY when the file was written if it needed writing AND every
 //     configured side was actually PRESENT this pass. A partial pass leaves the base alone, so
 //     nothing is ever "forgotten" between two halves of a reconcile; an absent-side pass likewise
-//     leaves it alone, so the side that was missing cannot look like it deleted the other side's
+//     leaves it alone, so the side that was missing cannot look like it deleted the pending
 //     additions when it comes back. See the COMMIT block in runReconcile.
 //
 // Concurrent callers join the in-flight pass instead of racing it, and `lastEngineWords` keeps the
@@ -1074,9 +1069,9 @@ async function reconcileFresh(reason: string): Promise<string[]> {
 async function runReconcile(reason: string): Promise<ReconcileResult> {
 	try {
 		if (!isMobile() && !cachedLocalWordsPath) cachedLocalWordsPath = await localWordsPath();
-		// The desktop plugin-local list (userWords.txt) is written ONLY when neither an external file
-		// nor a dictionary note is configured, and it has never been mirrored into either side. It stays
-		// exactly what it was in v1.2.0: an additive-only local fallback, outside the merge.
+		// The desktop plugin-local list (userWords.txt) is written ONLY when no external file is
+		// configured, and it is never mirrored into the file. It stays exactly what it was in v1.2.0:
+		// an additive-only local fallback, outside the merge.
 		const local = readLocalWords();
 
 		// THE SNAPSHOT THIS PASS IS RECONCILING AGAINST — identity AND epoch, captured together, with no
@@ -1085,14 +1080,11 @@ async function runReconcile(reason: string): Promise<ReconcileResult> {
 		// describe. Every durable write below asserts this snapshot immediately before mutating.
 		const pass: PassSnapshot = {
 			epoch: captureDictionaryEpoch(),
-			noteId: cfg.dictionaryNoteId,
 			dictPath: isMobile() ? '' : cfg.dictionaryPath,
 			reason,
 		};
-		const noteId = pass.noteId;
 		const dictPath = pass.dictPath;
 
-		const note = await readDictionaryNote(noteId); // null when there is no readable note side
 		const file = readExternalFile(dictPath); // null on mobile / no path / unreadable
 
 		// BOTH PENDING BUFFERS ARE SNAPSHOTTED HERE, TOGETHER, and the pair is made disjoint before
@@ -1100,11 +1092,11 @@ async function runReconcile(reason: string): Promise<ReconcileResult> {
 		//
 		// `addPendingWord`/`addPendingRemoval` keep the two buffers disjoint at WRITE time — but that is
 		// a write-time invariant only. A pass that reads them at two different instants (this one used
-		// to take `removals` two awaits earlier, with the note `data.get` in between) can observe a pair
-		// that was never simultaneously true, and mergeDictionary then applies removals-beat-additions
-		// to it: a word re-added by "Add to dictionary" mid-pass was cancelled by the very removal it
-		// had just superseded, left out of the note, and then retired from BOTH buffers — permanent loss
-		// of a word whose underline the user had just watched clear.
+		// to take `removals` two awaits apart, with a note read in between) can observe a pair that was
+		// never simultaneously true, and mergeDictionary then applies removals-beat-additions to it: a
+		// word re-added by "Add to dictionary" mid-pass was cancelled by the very removal it had just
+		// superseded, left out of the file, and then retired from BOTH buffers — permanent loss of a
+		// word whose underline the user had just watched clear.
 		//
 		// An overlap is resolved in favour of the ADDITION, and the removal stays in its buffer: this
 		// pass does not consume it, so `retirePendingEntries` cannot drop it and the next pass — reading
@@ -1115,7 +1107,7 @@ async function runReconcile(reason: string): Promise<ReconcileResult> {
 		const pendingSet = new Set(pending);
 		const removals = removalsRaw.filter((w) => !pendingSet.has(w));
 
-		if (note === null && file === null) {
+		if (file === null) {
 			// Nothing durable to reconcile against: keep buffering (exactly as v1.2.0 did) and feed the
 			// engine the local fallback plus whatever is in the pending buffer.
 			// A STALE PASS PUBLISHES NOTHING — engine state included. The durable-write gates alone do
@@ -1126,12 +1118,12 @@ async function runReconcile(reason: string): Promise<ReconcileResult> {
 			}
 			const removed = new Set(removals);
 			lastEngineWords = [...new Set([...pending, ...local])].filter((w) => !removed.has(w));
-			// A removal is only DONE once the sides that could resurrect the word have absorbed it.
-			// With no durable side CONFIGURED there is nothing left to absorb it — persistRemovedWord
-			// already pruned the desktop-local fallback — so the buffer can be retired here. But when a
-			// side IS configured and merely unreadable this pass (unsynced note, offline drive), the
-			// buffer must survive: clearing it would let that side put the word back when it returns.
-			const anyDurableSideConfigured = !!noteId || (!isMobile() && !!dictPath);
+			// A removal is only DONE once the side that could resurrect the word has absorbed it. With no
+			// file CONFIGURED there is nothing left to absorb it — persistRemovedWord already pruned the
+			// desktop-local fallback — so the buffer can be retired here. But when a file IS configured
+			// and merely unreadable this pass (an offline network drive), the buffer must survive:
+			// clearing it would let the file put the word back when it returns.
+			const anyDurableSideConfigured = !isMobile() && !!dictPath;
 			if (!anyDurableSideConfigured && !passIsStale(pass, 'retiring the removals buffer')) {
 				// Only the removals THIS pass consumed are retired: a removal queued since the snapshot,
 				// or one this pass set aside as superseded by a pending add, has not been applied to
@@ -1144,93 +1136,63 @@ async function runReconcile(reason: string): Promise<ReconcileResult> {
 		const base = await readSyncBase();
 		const merged = mergeDictionary({
 			base,
-			note,
-			file: file ? file.words : null,
+			file: file.words,
 			pending,
 			removals,
 		});
 
-		// PRESENCE GATE (v1.3.0 fix) — the other half of the commit condition, see the COMMIT block.
-		// A side is "present" when it is not configured at all (nothing to be absent) or it read back
-		// non-null this pass. On mobile there is no file side by construction, so it is never missing.
-		const noteSidePresent = !noteId || note !== null;
-		const fileSidePresent = isMobile() || !dictPath || file !== null;
-		const allSidesPresent = noteSidePresent && fileSidePresent;
-
 		// --- DURABLE WRITES: each one asserts the pass snapshot IMMEDIATELY before mutating -----
 		//
-		// Not once for the whole block. Everything above describes the note, the file and the base this
-		// pass started against, and each write below would do real damage with a configuration that has
-		// since moved: the note put writes the OLD note's body over the NEWLY-POINTED note; the file
-		// rewrite reshapes a file that is no longer configured; the base commit overwrites the `''` that
-		// `resetSyncBase()` wrote, which is the entire reason a repoint is safe. Between these writes
-		// lie four suspension points (the put, its updated_time get, the file rewrite, and the base
-		// read), so a single check up front is a check-then-act with a window in every one of them.
+		// Not once for the whole block. Everything above describes the file and the base this pass
+		// started against, and each write below would do real damage with a configuration that has
+		// since moved: the file rewrite reshapes a file that is no longer configured; the base commit
+		// overwrites the `''` that `resetSyncBase()` wrote, which is the entire reason a repoint is
+		// safe. Suspension points lie between them (the file rewrite and the base read), so a single
+		// check up front is a check-then-act with a window in every one of them.
 		//
 		// An abandoned pass has written nothing. It is idempotent and the repoint schedules its own
 		// reconcile, so the next pass redoes this correctly against the new configuration.
 
-		// --- NOTE side (L3-guarded; the plugin's only data.put) ---------------------------------
-		let noteWritten = true;
-		if (merged.noteChanged) {
-			if (editorOpen) {
-				noteWritten = false; // deferred: an editor is open, so a note write is forbidden
-			} else {
-				if (passIsStale(pass, 'the dictionary-note write')) return { words: lastEngineWords, published: false };
-				await joplin.data.put(['notes', noteId], null, {
-					body: canonicalDictionaryBody(merged.result),
-				});
-				try {
-					const after = await joplin.data.get(['notes', noteId], {
-						fields: ['updated_time'],
-					});
-					lastNoteUpdatedTime = (after && after.updated_time) || lastNoteUpdatedTime;
-				} catch {
-					/* best-effort updated_time refresh */
-				}
-			}
-		}
-
 		// --- FILE side (desktop; order-preserving atomic rewrite) -------------------------------
 		let fileWritten = true;
-		if (merged.fileChanged && file) {
+		if (merged.fileChanged) {
 			if (passIsStale(pass, 'the external-file rewrite')) return { words: lastEngineWords, published: false };
 			fileWritten = rewriteExternalFile(file, merged.result);
 		}
 
 		// --- COMMIT: advance the base ONLY on a pass that saw the whole picture -----------------
 		//
-		// Two independent conditions, and BOTH are required:
+		// The file needed writing and actually got written — otherwise the base would move past a
+		// change that never landed, and the retry would read it as a deletion.
 		//
-		//   (a) every side that needed writing actually got written — otherwise the base would move
-		//       past a change that never landed, and the retry would read it as a deletion;
-		//   (b) every CONFIGURED side was PRESENT this pass — this is the data-loss gate. An absent
-		//       side infers no deletions, but it also contributes nothing to the base, so committing
-		//       would fold the *present* side's additions into a base the absent side has never seen.
-		//       When it comes back with its older content, those additions read as deletions on that
-		//       side and are destroyed: word loss nobody asked for, synced to every device. It is not
-		//       an exotic race — "Joplin launched before the rclone/network drive was reachable" is
-		//       enough, and on a first run it would wipe every note-only word on mount.
+		// THE PRESENCE GATE (v1.3.0) IS STILL HERE; it has simply moved to where the sides now are.
+		// It said: never advance the base on a pass where a CONFIGURED side was absent, because an
+		// absent side infers no deletions but contributes nothing to the base either — so committing
+		// would fold the other side's additions into a base the absent side has never seen, and when
+		// it came back with its older content those additions read as deletions and were destroyed.
+		// "Joplin launched before the rclone/network drive was reachable" is enough to trigger it.
+		// With the dictionary note gone the file is the ONLY side, so "the configured side is absent"
+		// is exactly `file === null` — which returns early, far above, without ever reaching this
+		// commit. The gate is therefore structural now rather than a conjunct here, and the branch it
+		// lives in says so.
 		//
-		// An uncommitted pass is still useful and still safe: the merge result is fed to the engine
-		// (additively, since no deletion can be inferred from a side that was not there), the pending
-		// buffer is kept rather than flushed, and the whole thing is recomputed next tick. It is a
-		// stable fixed point, not a write loop — with the base frozen, the same inputs keep producing
-		// the same result, so nothing is rewritten twice.
-		const committed = noteWritten && fileWritten && allSidesPresent;
+		// An uncommitted pass is still useful and still safe: the merge result is fed to the engine,
+		// the pending buffer is kept rather than flushed, and the whole thing is recomputed next tick.
+		// It is a stable fixed point, not a write loop — with the base frozen, the same inputs keep
+		// producing the same result, so nothing is rewritten twice.
+		const committed = fileWritten;
 		if (committed) {
 			// writeSyncBase asserts the snapshot inside itself, right before its setValue — its own
 			// unchanged-value read is a suspension point, so a check out here would not be "at the write".
 			await writeSyncBase(merged.result, pass);
 			// Retire only what THIS pass merged and wrote — see retirePendingEntries. Anything enqueued
-			// while the pass was in flight (the note read, the note write, the file rewrite are all
-			// awaits the user's "Add to dictionary" can land inside) is kept for the next pass, which
-			// is idempotent and will merge it exactly as if it had arrived a tick later.
+			// while the pass was in flight (the buffer reads, the file rewrite and the base read are all
+			// awaits the user's "Add to dictionary" can land inside) is kept for the next pass, which is
+			// idempotent and will merge it exactly as if it had arrived a tick later.
 			if (passIsStale(pass, 'retiring the pending buffers')) return { words: lastEngineWords, published: false };
 			await retirePendingEntries('pendingWords', pending, readPendingWords);
-			// Removals retire on exactly the same condition as pending additions: every side that
-			// needed writing was written, and every configured side was present. Until then the buffer
-			// is what stops a not-yet-rewritten side from resurrecting the word on the next pass.
+			// Removals retire on exactly the same condition as pending additions. Until then the buffer
+			// is what stops a not-yet-rewritten file from resurrecting the word on the next pass.
 			await retirePendingEntries(PENDING_REMOVALS_KEY, removals, readPendingRemovals);
 		}
 
@@ -1246,9 +1208,9 @@ async function runReconcile(reason: string): Promise<ReconcileResult> {
 		// persistRemovedWord already prunes userWords.txt, and this keeps the engine correct even if
 		// that prune could not be written (read-only dir, missing file).
 		// A STALE PASS PUBLISHES NOTHING — engine state included, which the durable-write gates above
-		// do not reach. With the note write L3-deferred (an editor is open: the normal state) and no
-		// file side changing, none of those gates is evaluated, and the pass fell through to here and
-		// clear-then-imported a merge computed against a configuration that no longer exists — so a
+		// do not reach. With the file side unchanged, none of those gates is evaluated, and the pass
+		// fell through to here and clear-then-imported a merge computed against a configuration that
+		// no longer exists — so a
 		// lint landing in that window flagged words nothing had deleted, and `getEffectiveWords`
 		// handed the same phantom list to the settings dialog. Keeping the previous good list costs
 		// nothing: the repoint runs its own fresh reconcile immediately afterwards.
@@ -1472,8 +1434,8 @@ async function lintText(text: string): Promise<PlainLint[]> {
  * reimplementing it. Deliberately does NOT touch the engine or poke: the caller batches those.
  */
 async function persistAddedWord(word: string): Promise<void> {
-	// 2) Settings buffer (both platforms): the deferred flush folds this into the dictionary note when
-	//    no editor is open (L4-safe settings write; never a note write here).
+	// 2) Settings buffer (both platforms): the next reconcile folds this into the external file, and
+	//    the sync note carries it to the other devices (L4-safe settings write; never a note write here).
 	await addPendingWord(word);
 
 	// 3) Desktop keeps its existing external-file / plugin-local append (unchanged, always safe).
@@ -1509,9 +1471,11 @@ async function persistAddedWord(word: string): Promise<void> {
 				// eslint-disable-next-line no-console
 				console.warn(`[harper] could not append to external dictionary: ${external}`);
 			}
-		} else if (!cfg.dictionaryNoteId) {
-			// No external file AND no dictionary note: fall back to the plugin-local list so the word
-			// still persists across desktop sessions.
+		} else {
+			// No external file: fall back to the plugin-local list so the word still persists across
+			// desktop sessions. This is used with a sync note configured too, and that is right — the
+			// sync note is the TRANSPORT, not the local store, and userWords.txt is what keeps the word
+			// on this machine across a restart.
 			try {
 				fs.appendFileSync(await localWordsPath(), `${word}\n`);
 			} catch {
@@ -1721,6 +1685,521 @@ async function applyWordEdits(adds: string[], removes: string[]): Promise<string
 	return words;
 }
 
+// =============================================================================
+// THE SYNC NOTE (v1.5.0) — a mailbox, read whole and written whole.
+// =============================================================================
+//
+// The whole mechanism is four pieces of state and two operations, and it is deliberately not more
+// than that. The note carries rules + dismissed findings + words as JSON (see src/syncNote.ts);
+// this half decides WHEN to write it and WHEN to apply it.
+//
+//   WRITE  — any local change to synced state schedules a debounced write. The write is skipped when
+//            the resulting content matches what this device last wrote or applied.
+//   APPLY  — the poll and every note-selection change read the note. A body whose content differs
+//            from that same remembered value is applied WHOLESALE: rules, ignore state and words are
+//            replaced, not merged.
+//
+// LOOP PREVENTION is that one remembered value, `lastSyncContentKey` (see syncContentKey). It is the
+// canonical form of the SYNCED CONTENT — not of the body — so the `updatedAt` stamp cannot make a
+// device rewrite what it just applied, which is the shape every ping-pong in a scheme like this
+// takes. It lives in memory only: a fresh session reads the note and applies it, which is correct
+// (that is how a change made while this device was closed arrives) and idempotent.
+//
+// CONCURRENT EDITS ARE NOT MERGED. Whole-note last-writer-wins. Two devices changing settings at the
+// same moment produce a Joplin conflict copy, which the plugin ignores entirely: it always uses the
+// note at the configured id, and the user resolves the conflict themselves.
+//
+// A MANGLED NOTE NEVER STOPS ANYTHING. An unreadable body is logged once, the remembered key is
+// cleared, and the plugin keeps running on local state; the next write rewrites the note wholesale.
+
+/** A few seconds: long enough to coalesce a burst of rule toggles, short enough to feel immediate. */
+const SYNC_NOTE_WRITE_DELAY_MS = 3_000;
+
+/**
+ * The canonical content this device last WROTE to, or APPLIED from, the sync note.
+ *
+ * `null` means "nothing is known" — the next write always writes, and the next read always applies.
+ * That is the correct state after a failed apply and after an unparseable body.
+ */
+let lastSyncContentKey: string | null = null;
+/** Set once the sync note has actually been READ this session. Nothing is written before that. */
+let syncNoteInitialized = false;
+/** A write is wanted. Survives an L3 deferral, so the next drain point performs it. */
+let syncNoteWritePending = false;
+let syncNoteWriteTimer: ReturnType<typeof setTimeout> | null = null;
+let lastSyncNoteUpdatedTime: number | null = null;
+let warnedSyncNoteUnparseable = false;
+
+/**
+ * ONE SYNC-NOTE OPERATION AT A TIME.
+ *
+ * Reading and writing the mailbox are both read-modify-write over `lastSyncContentKey`, and they
+ * straddle real suspension points (a `data.get`, a `data.put`, a whole reconcile pass). Nothing
+ * upstream serializes them, and the overlap is the ordinary case rather than an exotic one: the
+ * startup refresh awaits the engine build, and a user who clicks a note during those two seconds
+ * fires the selection-change refresh straight into it. Both read a null key, both decide the note
+ * says something new, and the payload is applied twice — two reconciles and two engine imports for
+ * one piece of news.
+ *
+ * The apply is idempotent, so this was never corruption; the gate is here because "twice on every
+ * cold start" is exactly the kind of accident that stops being idempotent the first time someone
+ * adds a non-idempotent step to it.
+ *
+ * `.then(fn, fn)`, not `.then(fn)`: a rejected predecessor must not SKIP the next operation, which
+ * would silently wedge the sync for the rest of the session. The stored chain is kept un-rejected
+ * for the same reason. Nothing inside a flush or a refresh re-enters this gate, so it cannot
+ * deadlock on itself.
+ */
+let syncNoteChain: Promise<unknown> = Promise.resolve();
+
+function withSyncNote<T>(fn: () => Promise<T>): Promise<T> {
+	const next = syncNoteChain.then(fn, fn);
+	syncNoteChain = next.catch(() => undefined);
+	return next;
+}
+
+/** The dismissed side table in the note's field names. */
+function toSyncEntries(entries: readonly DismissedEntry[]): SyncContent['dismissed']['entries'] {
+	return entries.map((entry) => ({
+		hashes: entry.hashes,
+		rule: entry.ruleName,
+		text: entry.problemText,
+		date: entry.dismissedAt,
+	}));
+}
+
+/** ...and back. The note's own names are shorter; the side table's are the ones the UI reads. */
+function toDismissedEntries(entries: SyncContent['dismissed']['entries']): DismissedEntry[] {
+	return entries.map((entry) => ({
+		id: entry.hashes[0],
+		hashes: entry.hashes,
+		ruleName: entry.rule,
+		problemText: entry.text,
+		dismissedAt: entry.date,
+	}));
+}
+
+/** Everything that syncs, as this device currently holds it, for a given reconciled word set. */
+async function syncContentFor(words: string[]): Promise<SyncContent> {
+	return {
+		ruleOverrides: parseRuleOverrides(),
+		dismissed: {
+			// VERBATIM — harper's own payload, u64s and all. Never parsed here, never rebuilt.
+			ignoredLintsRaw: await loadIgnoredLintsJson(),
+			entries: toSyncEntries(await loadDismissed(dismissedStore)),
+		},
+		words,
+	};
+}
+
+/**
+ * The content to write, or NULL when this device cannot honestly state its word list right now.
+ *
+ * The word list comes from a reconcile pass, and a pass that did not publish (stale configuration, a
+ * failed read) computed nothing. Writing its fallback list into the note would broadcast a word set
+ * this device does not actually believe in to every other device. Returning null defers instead —
+ * the write stays pending and the next drain point tries again.
+ */
+async function collectSyncContent(): Promise<SyncContent | null> {
+	const result = await reconcileDictionaryResult('sync-note');
+	if (!result.published) return null;
+	return syncContentFor(result.words);
+}
+
+/**
+ * Schedule a debounced write. Called from `pokeForceLint`, which every mutation in this plugin ends
+ * in — one hook rather than one per path, so no rule toggle, dismissal, restore or dictionary edit
+ * can be forgotten. Over-triggering is free: the content-key comparison in the flush turns a write
+ * with nothing to say into a no-op before any note is touched.
+ */
+function scheduleSyncNoteWrite(): void {
+	if (!cfg.syncNoteId) return;
+	syncNoteWritePending = true;
+	if (syncNoteWriteTimer) return;
+	syncNoteWriteTimer = setTimeout(() => {
+		syncNoteWriteTimer = null;
+		void flushSyncNote('debounce');
+	}, SYNC_NOTE_WRITE_DELAY_MS);
+}
+
+/**
+ * Write the note, if there is anything to say and it is safe to say it now.
+ *
+ * THREE GATES, and each defers rather than cancels — `syncNoteWritePending` stays set, so the next
+ * drain point (a note-selection change, the 60 s poll) retries:
+ *
+ *   1. THE MAILBOX MUST HAVE BEEN READ FIRST. A device that has never successfully read the note
+ *      does not know what is in it, and writing its own state over an unread note is how a machine
+ *      that just installed the plugin wipes everyone else's settings.
+ *   2. L3 — NO `data.put` WHILE AN EDITOR IS OPEN. The rule the dictionary note obeyed for three
+ *      releases (a plugin note write evicts the mobile editor), inherited here for the same reason:
+ *      this is now the only note write the plugin performs at all.
+ *   3. THE WORD LIST MUST BE PUBLISHABLE. See collectSyncContent.
+ */
+function flushSyncNote(reason: string): Promise<void> {
+	return withSyncNote(() => flushSyncNoteLocked(reason));
+}
+
+async function flushSyncNoteLocked(reason: string): Promise<void> {
+	if (!syncNoteWritePending) return;
+	const noteId = cfg.syncNoteId;
+	if (!noteId) {
+		syncNoteWritePending = false;
+		return;
+	}
+	if (!syncNoteInitialized) return;
+	if (editorOpen) return;
+
+	let content: SyncContent | null = null;
+	try {
+		content = await collectSyncContent();
+	} catch (error) {
+		// eslint-disable-next-line no-console
+		console.warn(`[harper] sync note (${reason}): could not read local state:`, error);
+		return;
+	}
+	if (!content) return;
+
+	const key = syncContentKey(content);
+	if (key === lastSyncContentKey) {
+		// Nothing to say: this is exactly what we last wrote or last applied.
+		syncNoteWritePending = false;
+		return;
+	}
+	// The note id is re-read immediately before the write rather than trusted from the top of this
+	// function: everything above is awaited, and a repoint landing in any of it would send this
+	// device's state to whatever note the user has just pointed at instead.
+	if (cfg.syncNoteId !== noteId) return;
+	try {
+		await joplin.data.put(['notes', noteId], null, {
+			body: buildSyncNoteBody(content, new Date().toISOString()),
+		});
+	} catch (error) {
+		// Not synced yet, deleted, or a bad id. Keep the write pending and try again next time.
+		// eslint-disable-next-line no-console
+		console.warn(`[harper] sync note (${reason}): could not write note ${noteId}:`, error);
+		return;
+	}
+	lastSyncContentKey = key;
+	syncNoteWritePending = false;
+	try {
+		const after = await joplin.data.get(['notes', noteId], { fields: ['updated_time'] });
+		lastSyncNoteUpdatedTime = (after && after.updated_time) || lastSyncNoteUpdatedTime;
+	} catch {
+		/* best-effort updated_time refresh */
+	}
+	// eslint-disable-next-line no-console
+	console.info(`[harper] sync note (${reason}): wrote ${content.words.length} words`);
+}
+
+/**
+ * Read the note and, if it says something new, apply it wholesale.
+ *
+ * The remembered content key is set BEFORE the apply, deliberately: applying writes settings, which
+ * schedules a write, and that write must already see itself as redundant. If the apply then throws,
+ * the key is cleared again so the next read retries rather than silently believing it succeeded.
+ */
+function refreshFromSyncNote(reason: string): Promise<void> {
+	return withSyncNote(() => refreshFromSyncNoteLocked(reason));
+}
+
+async function refreshFromSyncNoteLocked(reason: string): Promise<void> {
+	const noteId = cfg.syncNoteId;
+	if (!noteId) {
+		syncNoteInitialized = true; // nothing to read; writes are irrelevant while the feature is off
+		return;
+	}
+	let body = '';
+	try {
+		const note = await joplin.data.get(['notes', noteId], { fields: ['body', 'updated_time'] });
+		body = (note && note.body) || '';
+		lastSyncNoteUpdatedTime = (note && note.updated_time) || null;
+	} catch {
+		// The note is not readable yet (not synced, or a bad id). Nothing to apply, and — because
+		// `syncNoteInitialized` stays false — nothing may be written over it either.
+		return;
+	}
+	syncNoteInitialized = true;
+
+	const payload = parseSyncNoteBody(body);
+	if (!payload) {
+		if (!warnedSyncNoteUnparseable) {
+			warnedSyncNoteUnparseable = true;
+			// eslint-disable-next-line no-console
+			console.warn(
+				`[harper] sync note ${noteId} could not be read as Harper sync state; ` +
+					'working from local settings until it is rewritten.',
+			);
+		}
+		// Forget what we thought was in it, so the next local change rewrites the note wholesale.
+		lastSyncContentKey = null;
+		return;
+	}
+	warnedSyncNoteUnparseable = false;
+
+	const key = syncContentKey(payload);
+	if (key === lastSyncContentKey) return; // our own write, or something already applied
+	lastSyncContentKey = key;
+	try {
+		await applySyncPayload(payload, reason);
+	} catch (error) {
+		lastSyncContentKey = null; // the apply is incomplete; do not pretend we are in sync
+		// eslint-disable-next-line no-console
+		console.warn(`[harper] sync note (${reason}): could not apply the note's state:`, error);
+	}
+}
+
+/**
+ * Replace this device's synced state with the note's. Three replacements, no merging.
+ *
+ * RULES go to the setting and to the live engine, exactly as every other rule-writing path does.
+ * DISMISSED FINDINGS are rebuilt from harper's own exported payload, carried verbatim: the engine's
+ * ignore set is cleared and re-imported from it, the persisted mirror becomes those same bytes, and
+ * the readable side table is replaced from the entries. All three under ONE dismissal transaction,
+ * because they are the three halves of one piece of state (see src/dismissedLog.ts).
+ * WORDS go through `applyWordEdits` — the existing local machinery — so the engine import, the
+ * desktop external-file mirror and the pending buffers all behave exactly as they do for a hand
+ * edit. Nothing about the word path is re-implemented here.
+ */
+async function applySyncPayload(payload: SyncContent, reason: string): Promise<void> {
+	// Resolved BEFORE the dismissal transaction below: getLinter() runs applyConfiguration, which
+	// takes that same lock to re-hydrate the ignore state (see withDismissalTransaction).
+	const linter = await getLinter();
+
+	// --- RULES ------------------------------------------------------------------------------
+	const overrides = payload.ruleOverrides;
+	const overrideKeys = Object.keys(overrides);
+	// '' rather than '{}' for an empty map: the setting's pristine default, and what every other
+	// writer of this key stores.
+	await joplin.settings.setValue('ruleOverrides', overrideKeys.length ? JSON.stringify(overrides) : '');
+	await linter.setLintConfig(overrides);
+
+	// --- DISMISSED FINDINGS -----------------------------------------------------------------
+	await withDismissalTransaction(dismissedStore, async () => {
+		await linter.clearIgnoredLints();
+		const raw = payload.dismissed.ignoredLintsRaw;
+		if (raw && raw.trim()) {
+			try {
+				// UNTOUCHED. This string came out of another device's exportIgnoredLints() and crossed
+				// the note as a JSON string, so its u64s are still the exact digits harper wrote.
+				await linter.importIgnoredLints(raw);
+			} catch {
+				// A payload this engine will not take is not a reason to abandon the rest of the apply;
+				// the side table below still names what the other device dismissed.
+				// eslint-disable-next-line no-console
+				console.warn('[harper] sync note: the ignored-lints payload was rejected by the engine');
+			}
+		}
+		await saveIgnoredLintsJson(raw);
+		await saveDismissed(dismissedStore, toDismissedEntries(payload.dismissed.entries));
+	});
+
+	// --- WORDS ------------------------------------------------------------------------------
+	const current = await reconcileDictionary('sync-note-apply');
+	const before = new Set(current);
+	const after = new Set(payload.words);
+	const adds = payload.words.filter((word) => !before.has(word));
+	const removes = current.filter((word) => !after.has(word));
+	if (adds.length || removes.length) await applyWordEdits(adds, removes);
+
+	await pokeForceLint();
+	// eslint-disable-next-line no-console
+	console.info(
+		`[harper] sync note (${reason}): applied ${overrideKeys.length} rule overrides, ` +
+			`${payload.dismissed.entries.length} dismissals, +${adds.length} -${removes.length} words`,
+	);
+}
+
+/**
+ * THE ONE-TIME LEGACY FOLD — the words from a ≤ v1.4.x dictionary note, read ONCE, here and nowhere
+ * else.
+ *
+ * A device that lived off the dictionary note alone (no external file: every mobile install, and any
+ * desktop one that never set a path) has its entire custom vocabulary in that note and nowhere the
+ * new code looks. Removing the note's reconcile side without this would make those words silently
+ * stop being recognised — underlines reappearing under names the user added months ago, with nothing
+ * on screen to explain it.
+ *
+ * READ-ONLY, ALWAYS. The old note is never written and never deleted, so a user who was mid-upgrade
+ * across several devices, or who simply wants to keep the list, still has it exactly as it was. The
+ * notice in the Harper window offers deleting it as their choice.
+ *
+ * A note that will not read (deleted, not yet synced, a stale id) yields no words rather than an
+ * error: the command's real job is creating the sync note, and it must not fail over a courtesy.
+ */
+async function legacyDictionaryNoteWords(): Promise<string[]> {
+	const noteId = cfg.dictionaryNoteId;
+	if (!noteId) return [];
+	try {
+		const note = await joplin.data.get(['notes', noteId], { fields: ['body'] });
+		// The OLD format: one word per line, '# ' comment lines dropped — exactly what parseWords does,
+		// which is the same function that read this note for the whole of v1.2.0-v1.4.1.
+		return parseWords((note && note.body) || '');
+	} catch {
+		// eslint-disable-next-line no-console
+		console.warn(`[harper] the old dictionary note ${noteId} could not be read; its words are not folded in.`);
+		return [];
+	}
+}
+
+/**
+ * The command's note: created seeded from this device's current state, so turning sync on never
+ * starts from empty. Idempotent — an existing, readable sync note is kept.
+ */
+async function createSyncNote(): Promise<void> {
+	if (cfg.syncNoteId) {
+		try {
+			await joplin.data.get(['notes', cfg.syncNoteId], { fields: ['id'] });
+			return; // already have a live sync note
+		} catch {
+			/* stale id — fall through and create a fresh one */
+		}
+	}
+	const folderId = await pickFolderForPluginNote();
+	// FRESH: whatever the user just did (a rule toggle, an add-to-dictionary) must be in the seed.
+	let words = (await reconcileFreshResult('create-sync-note')).words;
+
+	// THE LEGACY WORDS GO INTO LOCAL STATE, not merely into the seed.
+	//
+	// Writing them straight into the note body would put them in the mailbox and nowhere else: this
+	// device records the seed's own content key, so it never applies its own handwriting back, and the
+	// words would sit in the note unrecognised by the very engine that is supposed to accept them.
+	// Routing them through `applyWordEdits` instead puts them where every other word lives — the
+	// engine, the pending buffer, the external file if one is configured — and the seed below then
+	// picks them up as a matter of course, from the reconciled truth rather than from a special case.
+	const legacy = await legacyDictionaryNoteWords();
+	if (legacy.length) {
+		const known = new Set(words);
+		const adds = legacy.filter((word) => !known.has(word));
+		if (adds.length) {
+			words = await applyWordEdits(adds, []);
+			// eslint-disable-next-line no-console
+			console.info(`[harper] folded ${adds.length} words from the old dictionary note into the sync note`);
+		}
+	}
+
+	const content = await syncContentFor(words);
+	const note = await joplin.data.post(['notes'], null, {
+		title: SYNC_NOTE_TITLE,
+		body: buildSyncNoteBody(content, new Date().toISOString()),
+		parent_id: folderId,
+	});
+	await joplin.settings.setValue(SYNC_NOTE_ID_KEY, note.id);
+	// THE KEY IS RECORDED AFTER THE SETTING WRITE, AND ON THE SYNC CHAIN. Both halves matter.
+	//
+	// AFTER, because pointing the setting at a new note is a repoint like any other: the onChange
+	// handler answers a repoint by forgetting everything it believed about the old mailbox, so an
+	// assignment made before the write is simply erased.
+	//
+	// ON THE CHAIN, because that same handler starts a refresh of the new note. Queueing behind it
+	// makes this the last word, and makes the command settle its own mailbox before it returns.
+	//
+	// Without this the device applies its OWN freshly-written seed as though a second device had
+	// sent it — and an apply is WHOLESALE, so any word added between the create and that read is
+	// read as absent from the incoming state and deleted. Not a concurrent-edit race (those are
+	// accepted): just this device failing to recognise its own handwriting.
+	await withSyncNote(async () => {
+		lastSyncContentKey = syncContentKey(content);
+		syncNoteInitialized = true;
+		warnedSyncNoteUnparseable = false;
+	});
+}
+
+// =============================================================================
+// THE SETTINGS EXPORT (v1.5.0) — this device's dialect and rule overrides, as a JSON file.
+// =============================================================================
+// Entirely SEPARATE from the sync note: a one-way projection of THIS device's state onto a file
+// other tools can read, not a sync channel. Nothing is ever read back out of it. See
+// src/settingsExport.ts for the shape, the sparse-linters rule, and the two worse designs this
+// replaced (a copy-to-clipboard button, and splicing a block into Zed's own settings.json).
+//
+// THE PLUGIN OWNS THE FILE OUTRIGHT, which is what makes the write discipline simple: it is
+// overwritten wholesale whenever the state it projects changes, exactly like a generated artifact.
+// There is nothing in it to preserve, so — unlike the external DICTIONARY file, where rclone and
+// harper-ls write real words the plugin must merge with rather than clobber — there is no mtime
+// re-check, no merge and no backup. Pointing this at a file that matters is the one thing the
+// setting's description tells the user not to do.
+
+/** `<path>\n<content>` of the last export written, so an unchanged regeneration costs no fs calls. */
+let lastSettingsExportKey = '';
+
+/**
+ * DESKTOP: write the settings export to the configured path.
+ *
+ * Atomic (temp sibling, fsync, rename) like the dictionary rewrite, so a crash mid-write can never
+ * leave a half-written or zero-length file behind for another tool to read.
+ */
+function writeSettingsExport(targetPath: string, overrides: LintConfig, defaults: LintConfig): void {
+	if (isMobile()) return;
+	// Expanded like every other path setting, so `~/.config/harper/settings.json` means what it says
+	// rather than creating a literal `~` directory next to the Joplin profile.
+	const target = expandTilde(targetPath);
+	if (!target) return;
+	const content = buildSettingsExportFile({
+		overrides: overrides as Record<string, boolean>,
+		defaults: defaults as Record<string, boolean>,
+		dialect: cfg.dialect,
+	});
+	const key = `${target}\n${content}`;
+	if (key === lastSettingsExportKey) return;
+
+	const fs = getFs();
+	try {
+		if (fs.existsSync(target) && fs.readFileSync(target, 'utf8') === content) {
+			lastSettingsExportKey = key;
+			return;
+		}
+	} catch {
+		/* unreadable is not a reason to skip the write — fall through and rewrite it */
+	}
+
+	const tmp = tempSiblingPath(target);
+	try {
+		fs.writeFileSync(tmp, content, 'utf8');
+		try {
+			// Flush before the rename, exactly as the dictionary rewrite does: rename() is atomic against
+			// other readers but not against a crash, and a truncated export is worse than a stale one.
+			const fd = fs.openSync(tmp, 'r+');
+			try {
+				fs.fsyncSync(fd);
+			} finally {
+				fs.closeSync(fd);
+			}
+		} catch {
+			/* best effort: an un-fsynced write is still correct, just less crash-durable */
+		}
+		fs.renameSync(tmp, target);
+		lastSettingsExportKey = key;
+	} catch (error) {
+		try {
+			fs.removeSync(tmp);
+		} catch {
+			/* ignore */
+		}
+		// eslint-disable-next-line no-console
+		console.warn(`[harper] could not write the settings export: ${target}`, error);
+	}
+}
+
+/** harper's concrete default for every rule — the reference `sparseLinters` trims against. */
+async function lintDefaults(): Promise<LintConfig> {
+	try {
+		return await (await getLinter()).getDefaultLintConfig();
+	} catch {
+		return {};
+	}
+}
+
+/** Regenerate the export. Called whenever the rule overrides, the dialect or the target path move. */
+async function refreshSettingsExport(): Promise<void> {
+	if (isMobile() || !cfg.settingsPath) return;
+	try {
+		writeSettingsExport(cfg.settingsPath, parseRuleOverrides(), await lintDefaults());
+	} catch (error) {
+		// eslint-disable-next-line no-console
+		console.warn('[harper] could not refresh the settings export:', error);
+	}
+}
 const settingsService: SettingsService = createSettingsService({
 	getLinter,
 	pokeForceLint,
@@ -1879,59 +2358,38 @@ async function registerSettingsDialogCommand(): Promise<void> {
 }
 
 // -----------------------------------------------------------------------------
-// Create-dictionary-note command (both platforms).
+// The create-note command (both platforms).
 // -----------------------------------------------------------------------------
-async function createDictionaryNote(): Promise<void> {
-	// Reuse an existing configured note if it is still readable, so the command is idempotent.
-	if (cfg.dictionaryNoteId) {
-		try {
-			await joplin.data.get(['notes', cfg.dictionaryNoteId], { fields: ['id'] });
-			return; // already have a live dictionary note
-		} catch {
-			/* stale id — fall through and create a fresh one */
-		}
-	}
-	// Place it in the currently selected folder if we can, else the first folder, else create one.
-	let folderId = '';
+/**
+ * Where a note this plugin creates should go: the selected notebook, else the first one, else a new
+ * "Harper" notebook.
+ */
+async function pickFolderForPluginNote(): Promise<string> {
 	try {
 		const selected = await joplin.workspace.selectedFolder();
-		if (selected && selected.id) folderId = selected.id;
+		if (selected && selected.id) return selected.id;
 	} catch {
 		/* no selected folder */
 	}
-	if (!folderId) {
-		try {
-			const folders = await joplin.data.get(['folders']);
-			const items: Array<{ id: string }> = (folders && folders.items) || [];
-			if (items.length) folderId = items[0].id;
-		} catch {
-			/* ignore */
-		}
+	try {
+		const folders = await joplin.data.get(['folders']);
+		const items: Array<{ id: string }> = (folders && folders.items) || [];
+		if (items.length) return items[0].id;
+	} catch {
+		/* ignore */
 	}
-	if (!folderId) {
-		const folder = await joplin.data.post(['folders'], null, { title: 'Harper' });
-		folderId = folder.id;
-	}
-	// Seed with any words already known to the linter session (pending buffer) so nothing is lost.
-	const seed = await readPendingWords();
-	const body = canonicalDictionaryBody(seed);
-	const note = await joplin.data.post(['notes'], null, {
-		title: DICTIONARY_NOTE_TITLE,
-		body,
-		parent_id: folderId,
-	});
-	// Persist the id (settings write — safe). onChange reacts: resets the merge base and reconciles.
-	await joplin.settings.setValue('dictionaryNoteId', note.id);
+	const folder = await joplin.data.post(['folders'], null, { title: 'Harper' });
+	return folder.id;
 }
 
 // -----------------------------------------------------------------------------
-// Dictionary polling (60s): desktop file mtime + dictionary-note updated_time.
+// Dictionary polling (60s): the desktop file's mtime, and the sync note.
 // -----------------------------------------------------------------------------
 function pollDictionaryTick(): void {
-	// CHEAP CHANGE DETECTION FIRST: a `statSync` for the file (no read) and an `updated_time`-only
-	// GET for the note. When neither moved, the tick costs ZERO file reads and does no work at all.
-	// When either moved, ONE reconcile handles both sides (additions AND deletions) and refreshes the
-	// engine — that is how a word deleted on another device stops being accepted here.
+	// CHEAP CHANGE DETECTION FIRST: a `statSync` for the file (no read). When it has not moved, the
+	// tick costs ZERO file reads and does no dictionary work at all. When it has, ONE reconcile handles
+	// additions AND deletions and refreshes the engine — that is how a word deleted by harper-ls or by
+	// another machine's rclone copy stops being accepted here.
 	let fileMoved = false;
 	if (!isMobile()) {
 		const p = expandTilde(cfg.dictionaryPath);
@@ -1949,20 +2407,16 @@ function pollDictionaryTick(): void {
 	}
 
 	void (async () => {
-		let noteMoved = false;
-		if (cfg.dictionaryNoteId) {
-			try {
-				const note = await joplin.data.get(['notes', cfg.dictionaryNoteId], {
-					fields: ['updated_time'],
-				});
-				const ut = (note && note.updated_time) || null;
-				noteMoved = lastNoteUpdatedTime === null || ut !== lastNoteUpdatedTime;
-			} catch {
-				noteMoved = false; // note unreadable this tick
-			}
-		}
-		if (!fileMoved && !noteMoved) return; // ZERO extra work when nothing changed
-		await reconcileAndApply(fileMoved && noteMoved ? 'poll' : fileMoved ? 'file-poll' : 'note-poll');
+		// THE SYNC NOTE FIRST, and in this order: drain any write this device still owes (a local
+		// change deferred by the L3 editor gate), then read, so we never apply a remote body over
+		// local changes that have not been published yet. Both are no-ops when the feature is off.
+		await flushSyncNote('poll');
+		await refreshFromSyncNote('poll');
+
+		// The sync note's own apply already reconciles when it has words to deliver, so the only thing
+		// left for this tick is the external file.
+		if (!fileMoved) return; // ZERO extra work when nothing changed
+		await reconcileAndApply('file-poll');
 	})();
 }
 
@@ -2198,16 +2652,38 @@ async function registerSettings(): Promise<void> {
 				'Off by default.',
 			storage: SettingStorage.File,
 		},
+		// THE LEGACY DICTIONARY NOTE — registered, PRIVATE, and read-only from here on.
+		//
+		// It has to stay REGISTERED: real Joplin throws "Unknown key" the moment a plugin reads a
+		// setting it never registered, and two things still read this one — the upgrade notice, and the
+		// one-time word fold in "Harper: Create sync note". Un-registering it would not skip the read,
+		// it would break it, and on mobile that meant taking the whole plugin down with onStart.
+		//
+		// It is PRIVATE (`public: false`) in BOTH surface modes, unlike every other key here: there is
+		// no longer any mechanism behind it, so a field a user could type into would be a control that
+		// does nothing. Existing values keep working exactly as before — `public: false` is a pure
+		// visibility change and never touches what is stored.
 		dictionaryNoteId: {
+			value: '',
+			type: SettingItemType.String,
+			public: false,
+			section: SECTION,
+			label: 'Dictionary note id (legacy, no longer used)',
+			storage: SettingStorage.File,
+		},
+		// v1.5.0: the sync note. Registered alongside the others, and PUBLIC on the same terms, so a
+		// user can paste an id from another device without going through the command.
+		[SYNC_NOTE_ID_KEY]: {
 			value: '',
 			type: SettingItemType.String,
 			public: basicPublic,
 			section: SECTION,
-			label: 'Dictionary note id',
+			label: 'Sync note id',
 			description:
-				'The id of a Joplin note used as your Harper dictionary (one word per line). It syncs ' +
-				'across all your devices. Use the "Harper: Create dictionary note" command to make one, ' +
-				'or paste an existing note id here. Leave empty to disable the dictionary note.',
+				'The id of a Joplin note that Harper uses to sync your rules, your dictionary and your ' +
+				'dismissed findings between devices. The note holds machine-readable data, so do not ' +
+				'edit it by hand. Use the "Harper: Create sync note" command to make one, or paste an ' +
+				'existing note id here. Leave empty to turn the sync off.',
 			storage: SettingStorage.File,
 		},
 		ruleOverrides: {
@@ -2285,10 +2761,36 @@ async function registerSettings(): Promise<void> {
 			label: 'External dictionary file (desktop)',
 			description:
 				'Absolute path to a plain-text dictionary (one word per line), e.g. ' +
-				'~/.local/share/harper-dictionary/dictionary.txt. Leave empty to use the plugin-local list ' +
-				'or the dictionary note. Words added via "Add to dictionary" are appended here when set. ' +
-				'Re-read every 60s. When a dictionary note is ALSO set, the file and note mirror each other, ' +
-				'deletions included: removing a word from either one removes it from the other.',
+				'~/.local/share/harper-dictionary/dictionary.txt. Leave empty to use the plugin-local list. ' +
+				'Words added via "Add to dictionary" are appended here when set. Re-read every 60s. ' +
+				'Deletions travel both ways: removing a word from this file removes it from Harper, and ' +
+				'removing it in Harper removes it from the file.',
+			storage: SettingStorage.File,
+		};
+		// v1.5.0: the settings export. Registered immediately after the dictionary file so it appears
+		// directly under it on the native page — the two are the plugin's whole "and the rest of your
+		// toolchain" story, and reading them together is what makes either make sense.
+		//
+		// THE COPY NAMES NO EDITOR. The file is Harper's own state in Harper's own vocabulary, so
+		// "Other tools can read it from there" is the honest description of what it is for: whoever
+		// consumes it decides what to do with it. It also says plainly that Harper REWRITES the file,
+		// because the plugin owns it wholesale and a user must not point this at something they edit.
+		defs[SETTINGS_PATH_KEY] = {
+			value: '',
+			type: SettingItemType.String,
+			public: basicPublic,
+			section: SECTION,
+			label: 'External settings file',
+			// THE WHOLE PATH IS THE USER'S, FILE NAME INCLUDED. The plugin has no default name and no
+			// fallback: `writeSettingsExport` writes to exactly this string (tilde-expanded) or, when it
+			// is empty, to nothing at all. The example is written as an example — ", e.g. …" — in the same
+			// shape the dictionary-file description above uses, so it reads as a suggestion rather than
+			// as a name Harper is going to pick for you.
+			description:
+				'Absolute path to a JSON file where Harper keeps your current settings: the dialect and ' +
+				'your rule overrides, e.g. ~/.local/share/harper-dictionary/harper-settings.json. ' +
+				'Harper rewrites it when they change. Other tools can read it from there. ' +
+				'Leave empty to skip it.',
 			storage: SettingStorage.File,
 		};
 	}
@@ -2324,6 +2826,14 @@ async function warmUpEngine(): Promise<void> {
 		console.warn('[harper] background engine warm-up failed:', error);
 		return;
 	}
+	// THE MAILBOX IS READ BEFORE ANYTHING IS WRITTEN TO IT. A change another device made while this
+	// one was closed arrives here, and — just as important — `flushSyncNote` refuses to write until
+	// this has succeeded, so a freshly-installed device cannot broadcast its empty state over
+	// everyone else's settings.
+	await refreshFromSyncNote('plugin-start');
+	// The harper-ls block is correct from the first run rather than only after the next rule change,
+	// so a user who has just set the path finds their rules already there in Zed.
+	await refreshSettingsExport();
 	// Reconcile: if the dictionary words finished importing only now, poke any open editor to re-lint so
 	// late-arriving words clear their underlines. A no-op when no editor is open.
 	await pokeForceLint();
@@ -2362,12 +2872,13 @@ joplin.plugins.register({
 		);
 		await joplin.contentScripts.onMessage(CONTENT_SCRIPT_ID, handleMessage);
 
-		// Command to create the dictionary note (both platforms; appears in the command palette).
+		// v1.5.0: the sync note (both platforms; appears in the command palette). This REPLACED
+		// "Harper: Create dictionary note", which is gone along with the note it made.
 		await joplin.commands.register({
-			name: 'harper.createDictionaryNote',
-			label: 'Harper: Create dictionary note',
+			name: 'harper.createSyncNote',
+			label: 'Harper: Create sync note',
 			execute: async () => {
-				await createDictionaryNote();
+				await createSyncNote();
 			},
 		});
 
@@ -2406,48 +2917,52 @@ joplin.plugins.register({
 			if (!external.length) return;
 
 			const before = cfg.dialect;
-			const noteIdBefore = cfg.dictionaryNoteId;
 			const pathBefore = cfg.dictionaryPath;
 			// INV-A: the identity flip and the base reset are ONE transition, bracketed together.
 			//
 			// Bracketing them separately is not enough. Between the two, `cfg` already names the new
-			// note while `syncBase` still describes the old one, and a reconcile that starts there reads
+			// file while `syncBase` still describes the old one, and a reconcile that starts there reads
 			// that inconsistent pair without anything changing for its duration — so no epoch
 			// comparison can catch it. Held as a single transition, any pass beginning anywhere inside
 			// is born stale and writes nothing.
 			//
 			// ONLY FOR KEYS THAT ACTUALLY MOVE IDENTITY OR BASE, though. The epoch exists to protect one
-			// thing: a pass's answer is computed from {note, file, base}, and it must not write once any
-			// of those has moved. Bracketing every settings write instead abandoned in-flight passes on
-			// changes that touch none of them — a dictionary save racing an `underlineStyle` toggle came
-			// back reporting success with the new word missing from its own reply, and the dialog then
+			// thing: a pass's answer is computed from {file, base}, and it must not write once either of
+			// those has moved. Bracketing every settings write instead abandoned in-flight passes on
+			// changes that touch neither — a dictionary save racing an `underlineStyle` toggle came back
+			// reporting success with the new word missing from its own reply, and the dialog then
 			// re-seeded the editor from that. `dialect` is deliberately NOT here: it resets ENGINE state
 			// (the WASM instance, its words and its ignore set) but moves no side and no base, so a pass
 			// in flight across it is still computing the right answer from the right sources. Its own
 			// hazards have their own guards — `importedWordsKey = null` forces the word re-import, and
 			// INV-B keeps the ignore-set rebuild inside the dismissal transaction.
-			const movesDictionaryIdentity =
-				external.includes('dictionaryNoteId') ||
-				(!isMobile() && external.includes('dictionaryPath'));
+			//
+			// `syncNoteId` USED to belong here, because it made the dictionary NOTE side appear or
+			// disappear. With that side gone it moves neither the file nor the base: a repointed mailbox
+			// delivers its words through `applyWordEdits`, as explicit adds and removals that beat
+			// inference on their own terms and need no first-run base. So it is out, and a sync repoint
+			// no longer abandons a dictionary pass that has nothing to do with it.
+			const syncNoteIdBefore = cfg.syncNoteId;
+			const movesDictionaryIdentity = !isMobile() && external.includes('dictionaryPath');
 			const applySettingsChange = async () => {
 				await loadSettings();
+				if (external.includes(SYNC_NOTE_ID_KEY) && cfg.syncNoteId !== syncNoteIdBefore) {
+					// A different mailbox knows nothing about the old one: forget what we believed was in
+					// it, forget that we had read it, and let the next refresh establish the truth.
+					lastSyncNoteUpdatedTime = null;
+					lastSyncContentKey = null;
+					syncNoteInitialized = false;
+					warnedSyncNoteUnparseable = false;
+				}
 				if (!isMobile() && (cfg.dictionaryPath === '' || external.includes('dictionaryPath'))) {
 					// A changed path invalidates the cached mtime / missing-file warning.
 					lastExternalMtimeMs = null;
 					warnedMissingDict = false;
 				}
-				if (external.includes('dictionaryNoteId') && cfg.dictionaryNoteId !== noteIdBefore) {
-					// New/changed dictionary note: force a fresh read next time.
-					lastNoteUpdatedTime = null;
-				}
-				// REPOINTING A SIDE RESETS THE MERGE BASE. A base describes the two sides it was computed
-				// from; against a different note or a different file its "missing" words are not
-				// deletions at all. Dropping it makes the next reconcile a first run: adopt the union,
-				// delete nothing.
-				if (
-					(external.includes('dictionaryNoteId') && cfg.dictionaryNoteId !== noteIdBefore) ||
-					(!isMobile() && external.includes('dictionaryPath') && cfg.dictionaryPath !== pathBefore)
-				) {
+				// REPOINTING THE FILE RESETS THE MERGE BASE. A base describes the side it was computed
+				// from; against a different file its "missing" words are not deletions at all. Dropping
+				// it makes the next reconcile a first run: adopt the union, delete nothing.
+				if (!isMobile() && external.includes('dictionaryPath') && cfg.dictionaryPath !== pathBefore) {
 					await resetSyncBase();
 				}
 			};
@@ -2483,9 +2998,28 @@ joplin.plugins.register({
 				// answer the change with a view of the world that predates it.
 				await applyConfiguration(linter, 'settings-change', true);
 			} else {
-				// No engine yet (warm-up still running): still reconcile, so a repointed note/file is
-				// merged and persisted rather than waiting for the first lint.
+				// No engine yet (warm-up still running): still reconcile, so a repointed file is merged
+				// and persisted rather than waiting for the first lint.
 				await reconcileFresh('settings-change'); // same freshness contract as the branch above
+			}
+			// THE ZED BRIDGE regenerates on exactly the keys it is a projection of, PLUS its own target
+			// path — pointing it at a file is itself a request to put the block there, and waiting for
+			// the user's next rule toggle to honour that would look like the feature simply did nothing.
+			// (`dictionaryPath` is no longer among them: the block carries rules and a dialect, never a
+			// path, so where the word list lives has stopped being any of its business.) Fire-and-forget:
+			// writing another program's config is a convenience, and failing at it must never hold up —
+			// or fail — the settings change the user actually made.
+			if (
+				external.includes('ruleOverrides') ||
+				external.includes('dialect') ||
+				external.includes(SETTINGS_PATH_KEY)
+			) {
+				void refreshSettingsExport();
+			}
+			// A repointed sync note is read (and applied) right away rather than at the next poll: the
+			// user has just told us where their settings live, and waiting 60 s to look would be odd.
+			if (external.includes(SYNC_NOTE_ID_KEY) && cfg.syncNoteId !== syncNoteIdBefore) {
+				void refreshFromSyncNote('settings-change');
 			}
 			await pokeForceLint();
 		});
@@ -2498,6 +3032,11 @@ joplin.plugins.register({
 			await joplin.workspace.onNoteSelectionChange(async () => {
 				editorOpen = false;
 				await reconcileAndApply('note-selection-change');
+				// The sync note's own drain point: `editorOpen` is now false, so a write the L3 gate
+				// deferred can finally land, and a body another device wrote can be applied. Same order
+				// as the poll: publish what we owe, then read.
+				await flushSyncNote('note-selection-change');
+				await refreshFromSyncNote('note-selection-change');
 			});
 		} catch {
 			// Older API without onNoteSelectionChange — the start reconcile + poll still persist words.

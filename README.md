@@ -41,6 +41,9 @@ suggestion:
 - **Disable a rule.** The toggle in the card header turns off the rule that produced the finding,
   everywhere, from then on.
 - **Dialects.** Check against American, British, Australian, Canadian, or Indian English.
+- **Sync your settings between devices.** One note carries your rules, your dictionary and your
+  dismissed findings to every device through your normal Joplin sync (see
+  [Sync your settings](#sync-your-settings) below).
 - **A settings screen for everything else.** **Harper: Settings…** opens a searchable browser for all
   823 rules — each with its description shown inline — a dictionary editor, and the list of findings
   you dismissed, with a Restore button on each. Desktop and mobile (see
@@ -49,14 +52,10 @@ suggestion:
 ## Your dictionary
 
 By default, words you add via *Add to dictionary* are stored in the plugin's own private word list
-on that device. Two settings turn it into one dictionary shared everywhere:
+on that device. To share one dictionary everywhere, set up the [sync note](#sync-your-settings) — it
+carries your words along with your rules and your dismissed findings.
 
-**Dictionary note (desktop and mobile).** Run the command **Harper: Create dictionary note** and the
-plugin creates a regular Joplin note called "Harper Dictionary" — one word per line — and remembers
-it in the **Dictionary note** setting. From then on, added words go into that note, and because it
-is an ordinary note it syncs to every device through your normal Joplin sync. This is also the only
-dictionary mechanism on mobile. You can edit the note by hand; deleting a line removes the word
-everywhere.
+On desktop you can also keep the same words in a plain file of your own:
 
 **External dictionary file (desktop only).** Point **External dictionary file** at a
 **plain-text dictionary file of your own** — one word per line. When that path is set:
@@ -65,8 +64,8 @@ everywhere.
 - *Add to dictionary* **appends** the new word to that same file (one word per line).
 - The file is re-read automatically about every 60 seconds, so changes made outside Joplin are
   picked up without a restart.
-- **Removals are picked up too.** Delete a word from the file (or from the dictionary note, if you
-  use one) and the plugin removes it everywhere else as well, so it starts being flagged again.
+- **Removals are picked up too.** Delete a word from the file and the plugin drops it as well, so it
+  starts being flagged again — and the removal travels to your other devices through the sync note.
 
 Deleting a word is the one case where the plugin writes more than a new line, so it does as little
 as it can: it drops only the lines for words you removed, appends genuinely new words at the end,
@@ -82,10 +81,65 @@ version-controlled dotfile, `rsync`/`rclone`, and so on) — or to share the sam
 another tool that reads a plain word-per-line dictionary, such as `harper-ls` in Zed, Neovim, or
 VS Code.
 
-**Using both together** is the full setup: with the note and the file both configured on desktop,
-the plugin keeps them in sync with each other. A word added on your phone reaches the note through
-Joplin sync, then the file — and from there any external tool that reads it. Deletions travel the
-same way, in every direction.
+**Using both together** is the full setup: with the sync note and the file both configured on
+desktop, a word added on your phone reaches this machine through Joplin sync and lands in the file —
+and from there in any external tool that reads it. Deletions travel the same way, in every
+direction.
+
+## Sync your settings
+
+The **sync note** carries everything: your rule choices, your dictionary, and the findings you
+dismissed.
+
+Run the command **Harper: Create sync note** once, on any device. The plugin creates a note called
+"Harper Sync", seeds it with what that device already has, and remembers it in the **Sync note**
+setting. On your other devices, open the same note, copy its id, and paste it into their **Sync
+note** setting. From then on the plugin writes the note whenever you change something and reads it
+back on the other devices, through your normal Joplin sync.
+
+The note holds machine-readable data, so do not edit it by hand. It says so at the top.
+
+A few things are worth knowing:
+
+- **The dialect and "Ignore non-English text" do not sync.** They are per-device on purpose: you may
+  well want British on one machine and American on another.
+- **The whole note is replaced on each write, and the last write wins.** Change settings on two
+  devices at the same moment and Joplin will make a conflict copy, which you resolve yourself like
+  any other note conflict. The plugin always uses the note at the configured id and never touches
+  conflict copies.
+- **Upgrading from a dictionary note?** Earlier versions kept your words in a separate "Harper
+  Dictionary" note. That mechanism is gone — the sync note carries the words now, along with
+  everything else. If you still have an old dictionary note configured, the Harper window shows a
+  one-line notice, and running **Harper: Create sync note** reads that note once and folds its words
+  into the new one, so nothing is lost. The old note itself is never written to and never deleted;
+  delete it yourself once you are happy, or keep it.
+- **Nothing is written while you are typing.** The sync note is only written once you leave the note
+  you are editing.
+
+## Share your rules with other tools
+
+`harper-ls` powers Harper in Zed, Neovim, Helix, and VS Code, and it reads its rules from that
+editor's own settings file. Point **External settings file** at a path of your choosing — the full
+path including the file name — and the plugin writes your current dialect and rule overrides there
+as plain JSON, rewriting it whenever either changes:
+
+```json
+{
+	"dialect": "American",
+	"linters": {
+		"SentenceCapitalization": false
+	}
+}
+```
+
+Those are `harper-ls`'s own key names, so whatever you feed the file to needs no translation. The
+file is Harper's, written wholesale: point it somewhere of its own rather than at a config you edit
+by hand. Leave the setting empty and nothing is written at all.
+
+The `linters` map lists only the rules you actually changed, so it stays short and Harper's own
+defaults keep applying to everything else; with nothing overridden the key is left out entirely.
+Dismissed findings are not included: `harper-ls` computes its ignore hashes differently, so
+exporting them would produce a file that silently ignores nothing.
 
 ## The settings dialog
 
@@ -127,7 +181,8 @@ reflects it.
 | Setting | Default | What it does |
 | --- | --- | --- |
 | **Enable Harper grammar checking** | On | Master switch. When off, no underlines are shown. |
-| **Dictionary note** | *(empty)* | The Joplin note that holds your shared word list. Set automatically by the **Harper: Create dictionary note** command. See [Your dictionary](#your-dictionary). |
+| **External settings file** *(desktop)* | *(empty)* | Absolute path — file name included — to a JSON file where Harper keeps your dialect and rule overrides for other tools to read. Harper rewrites it when they change. See [Share your rules with other tools](#share-your-rules-with-other-tools). |
+| **Sync note** | *(empty)* | The Joplin note that syncs your rules, your dictionary and your dismissed findings between devices. Set automatically by the **Harper: Create sync note** command. See [Sync your settings](#sync-your-settings). |
 | **English dialect** | American | Which English variety Harper checks against: American, British, Australian, Canadian, or Indian. |
 | **Lint debounce (ms)** | `500` | How long the editor waits after you stop typing before re-checking, in milliseconds (0–10000). Changes apply immediately. |
 | **Underline style** | Squiggly | How findings are underlined: *Squiggly (default)* for Harper's wavy underline, or *Solid line* for a straight 2 px line with a light tint. Either way the colour is the issue type's. Changes apply immediately. |
@@ -162,7 +217,7 @@ Plugins**, enable plugin support first, then search for **Harper** and install �
 - **Joplin 3.1 or newer on desktop, 3.3 or newer on mobile.** The plugin uses Joplin's CodeMirror 6 editor integration, which is what sets both minimums.
 - **Markdown editor only.** Harper checks the Markdown (CodeMirror) editor. It does **not** work in
   the Rich Text (WYSIWYG) editor, which offers no hook for this kind of decoration.
-- **Desktop and Android.** The same plugin runs on Joplin desktop and on Joplin for Android. Plugin support on Joplin mobile is still Beta, so the phone side is newer and less proven than the desktop side. Only Android has been tested. There is no external dictionary *file* on mobile (the plugin has no filesystem access there) — the dictionary note covers mobile instead.
+- **Desktop and Android.** The same plugin runs on Joplin desktop and on Joplin for Android. Plugin support on Joplin mobile is still Beta, so the phone side is newer and less proven than the desktop side. Only Android has been tested. There is no external dictionary *file* on mobile (the plugin has no filesystem access there) — the sync note covers mobile instead.
 - **About 21 MB.** The plugin bundles Harper's WebAssembly engine so it can run offline, which makes the `.jpl` roughly 21 MB. That is large for a plugin, but it is the whole checker, downloaded once.
 - **Startup warm-up.** The engine warms up in the background when Joplin starts, so the first check
   is usually instant; if you start typing right away it can take a second or two. After that,
@@ -172,7 +227,7 @@ Plugins**, enable plugin support first, then search for **Harper** and install �
 
 Harper runs locally and makes **no network calls**. Your note text is passed to the bundled
 WebAssembly engine inside Joplin and nowhere else — nothing is uploaded, and there is no telemetry.
-The external dictionary, if you use one, is a file on your own disk; the dictionary note is an
+The external dictionary, if you use one, is a file on your own disk; the sync note is an
 ordinary Joplin note that travels only through your own Joplin sync, like every other note.
 
 ## Development

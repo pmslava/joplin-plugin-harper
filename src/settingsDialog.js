@@ -132,6 +132,9 @@
 		dictionaryBaseline: [],
 		dictionaryText: '',
 		dismissed: { entries: [], legacyCount: 0 },
+		// v1.5.0: the one-line sync notice, or ''. Rendered above the tabs (see render), because a
+		// stale sync setup is a property of the window and not of any one tab.
+		syncNotice: '',
 		search: '',
 		tab: 'general',
 		expandedGroups: Object.create(null), // group id -> true
@@ -667,16 +670,24 @@
 		ignoreWrap.appendChild(el('span', null, 'Skip text that is not English'));
 		section.appendChild(field('Ignore non-English text', ignoreWrap, 'Useful for multilingual notes.'));
 
-		// Dictionary note id
+		// Sync note id — THE ONE NOTE FIELD.
+		//
+		// v1.5.0 briefly had two (this and "Dictionary note id"), which asked the user to understand a
+		// distinction that only existed while the old mechanism was being retired. The dictionary note
+		// is gone, so there is one note and one field. A device that still carries a legacy
+		// `dictionaryNoteId` value shows this box EMPTY — because it is empty; the legacy id is not a
+		// sync note and pre-filling it here would invite the user to "confirm" a setting that would
+		// then point the sync at a plain word list. The banner above the tabs is what tells them about
+		// the old note instead (see SYNC_UPGRADE_NOTICE).
 		var noteId = el('input', 'hs-input hs-input-wide');
 		noteId.type = 'text';
-		noteId.id = 'hs-dictionary-note-id';
-		noteId.value = s.dictionaryNoteId || '';
+		noteId.id = 'hs-sync-note-id';
+		noteId.value = s.syncNoteId || '';
 		stopEnterFromClosingTheDialog(noteId);
 		var noteIdBefore = noteId.value;
 		noteId.addEventListener('change', function () {
 			var value = noteId.value.trim();
-			updateSetting('dictionaryNoteId', value, function () {
+			updateSetting('syncNoteId', value, function () {
 				noteId.value = noteIdBefore;
 			}).then(function () {
 				noteIdBefore = noteId.value;
@@ -684,10 +695,16 @@
 		});
 		section.appendChild(
 			field(
-				'Dictionary note id',
+				'Sync note id',
 				noteId,
-				'A Joplin note used as your dictionary, one word per line. It syncs across devices. ' +
-					'Run "Harper: Create dictionary note" to make one. Leave empty to turn it off.',
+				// APPROVED COPY, verbatim — the same words the native settings page carries for this key.
+				// Other rows here shorten their native description, but this one is load-bearing: it is
+				// the only place that says "do not edit it by hand", and the Harper window is where most
+				// users will meet the field at all (the native page hides it in the default mode).
+				'The id of a Joplin note that Harper uses to sync your rules, your dictionary and your ' +
+					'dismissed findings between devices. The note holds machine-readable data, so do not ' +
+					'edit it by hand. Use the "Harper: Create sync note" command to make one, or paste an ' +
+					'existing note id here. Leave empty to turn the sync off.',
 			),
 		);
 
@@ -713,6 +730,34 @@
 					'External dictionary file',
 					dictPath,
 					'Absolute path to a plain-text dictionary, one word per line. Leave empty to skip it.',
+				),
+			);
+		}
+
+		// External settings file — DESKTOP ONLY, on the same terms as the dictionary path above, and
+		// placed directly under it because the two together are the "and your other tools see this"
+		// story. Harper OWNS this file and rewrites it wholesale, which the help text says outright.
+		if (Object.prototype.hasOwnProperty.call(s, 'settingsPath')) {
+			var settingsPath = el('input', 'hs-input hs-input-wide');
+			settingsPath.type = 'text';
+			settingsPath.id = 'hs-settings-path';
+			settingsPath.value = s.settingsPath || '';
+			stopEnterFromClosingTheDialog(settingsPath);
+			var settingsPathBefore = settingsPath.value;
+			settingsPath.addEventListener('change', function () {
+				var value = settingsPath.value;
+				updateSetting('settingsPath', value, function () {
+					settingsPath.value = settingsPathBefore;
+				}).then(function () {
+					settingsPathBefore = settingsPath.value;
+				});
+			});
+			section.appendChild(
+				field(
+					'External settings file',
+					settingsPath,
+					'Absolute path to a JSON file where Harper keeps your dialect and rule overrides for ' +
+						'other tools to read. Harper rewrites it when they change. Leave empty to skip it.',
 				),
 			);
 		}
@@ -1049,6 +1094,7 @@
 			);
 		});
 		toolbar.appendChild(disableAll);
+
 		section.appendChild(toolbar);
 
 		var summary = el('div', 'hs-summary');
@@ -1432,6 +1478,14 @@
 		head.appendChild(el('h1', 'hs-title', 'Harper settings'));
 		scroll.appendChild(head);
 
+		// THE SYNC NOTICE. Plain text, above the tabs, no buttons and no dismissal: it states a fact
+		// and names the command that resolves it. NEVER a popup — see SYNC_UPGRADE_NOTICE.
+		if (state.syncNotice) {
+			var notice = el('div', 'hs-notice', state.syncNotice);
+			notice.id = 'hs-sync-notice';
+			scroll.appendChild(notice);
+		}
+
 		var tabs = el('div', 'hs-tabs');
 		tabs.id = 'hs-tabs';
 		for (var i = 0; i < TABS.length; i++) {
@@ -1523,6 +1577,7 @@
 				// draft and baseline are all seeded from it together.
 				seedDictionary(snapshot.dictionaryWords || []);
 				state.dismissed = snapshot.dismissed || { entries: [], legacyCount: 0 };
+				state.syncNotice = snapshot.syncNotice || '';
 				state.loaded = true;
 				render();
 				ensureDescriptions();

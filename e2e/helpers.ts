@@ -384,8 +384,8 @@ async function submitGotoAnything(win: Page, text: string): Promise<void> {
 
 /**
  * Run a Joplin command by fuzzy-matching its label in the command palette (Goto Anything, `:` mode).
- * Used to invoke the plugin command `harper.createDictionaryNote` (label "Harper: Create dictionary
- * note") the way a user would.
+ * Used to invoke a plugin command such as `harper.createSyncNote` (label "Harper: Create sync note")
+ * the way a user would.
  */
 export async function runCommand(win: Page, labelQuery: string): Promise<void> {
   await submitGotoAnything(win, `:${labelQuery}`);
@@ -408,7 +408,9 @@ export async function openNoteInNewWindow(win: Page): Promise<void> {
 /**
  * Jump to (open) a note by title via Goto Anything. Opening a different note fires
  * `workspace.onNoteSelectionChange`, the plugin's deferred-flush trigger, so this doubles as "leave the
- * current note so its buffered dictionary words flush".
+ * current note so the pending sync-note write lands". (It used to say "so its buffered dictionary
+ * words flush to the dictionary note"; that note is gone, and the sync note is the only note the
+ * plugin writes now — the deferral itself is unchanged.)
  */
 export async function gotoNote(win: Page, titleQuery: string): Promise<void> {
   await submitGotoAnything(win, titleQuery);
@@ -430,15 +432,153 @@ export async function openNoteFromList(win: Page, title: string): Promise<void> 
   await win.waitForTimeout(1200);
 }
 
+// `readNoteBodyFresh` lived here: it read a note's saved body off the RENDERED editor after bouncing
+// away and back. Its only two callers were the dictionary-note and note<->file mirror specs, both of
+// which went with the dictionary note. Everything left reads note bytes through `readNoteBodyViaApi`
+// below, which is strictly better anyway — `innerText` drops a fenced block's own backticks, and the
+// sync note is a fenced block.
+
+// =============================================================================
+// v1.5.0 — driving the plugin through its OWN background page.
+// =============================================================================
+//
+// Everything above drives Joplin's UI. These four go one level down, to the page where the plugin
+// itself runs, and they exist for the two things the UI cannot express honestly:
+//
+//   * READING AND WRITING A NOTE'S STORED BYTES. `getEditorBody` reads the RENDERED editor, whose
+//     innerText drops a fenced block's own backticks — useless for "is this note valid JSON".
+//   * SIMULATING A REMOTE DEVICE. A second device's edit arrives as a changed note body and nothing
+//     else, which is exactly what `writeNoteBodyViaApi` produces.
+//
+// Ported from the abandoned v1.5 branch's e2e/helpers.ts, trimmed to what these specs use.
+
 /**
- * Read a note's CURRENT saved body by opening it fresh: click away to `viaTitle`, then back to
- * `title`, so the editor reloads the note from the database rather than showing a stale in-editor copy
- * (a plugin `data.put` to an already-open note does not necessarily live-refresh the desktop editor).
+ * Poll `read` until `ok` accepts its value; throw a loud, diagnosable error on timeout.
+ *
+ * `expect.poll` would do this, but helpers.ts deliberately imports no assertion library: these are
+ * app-driving helpers, and a helper that fails must fail with a message naming what it was waiting
+ * for and what it last saw, not with an assertion diff.
  */
-export async function readNoteBodyFresh(win: Page, title: string, viaTitle: string): Promise<string> {
-  await openNoteFromList(win, viaTitle);
-  await openNoteFromList(win, title);
-  return getEditorBody(win);
+async function pollFor<T>(
+  what: string,
+  read: () => Promise<T> | T,
+  ok: (value: T) => boolean,
+  timeoutMs: number,
+  intervalMs = 1000,
+): Promise<T> {
+  const start = Date.now();
+  let last: T | undefined;
+  let lastError: unknown;
+  while (Date.now() - start < timeoutMs) {
+    try {
+      last = await read();
+      lastError = undefined;
+      if (ok(last)) return last;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  const seen = lastError
+    ? `last read threw: ${(lastError as Error)?.message ?? String(lastError)}`
+    : `last value: ${JSON.stringify(last)}`;
+  throw new Error(`Timed out after ${timeoutMs} ms waiting for ${what} — ${seen}`);
+}
+
+/**
+ * The plugin's own background page — the ONE surface in this harness where the `joplin` global
+ * exists (a plugin webview gets `webviewApi`, not `joplin`).
+ *
+ * Several pages carry `?pluginId=<id>` (the settings dialog's webview among them), so the page is
+ * identified by actually HAVING `joplin.data`, not by its URL alone.
+ */
+export async function pluginBackgroundPage(win: Page, timeoutMs = 90_000): Promise<Page> {
+  return pollFor(
+    'the plugin background page (the one with a `joplin` global)',
+    async () => {
+      for (const ctx of win.context().browser()!.contexts()) {
+        for (const p of ctx.pages()) {
+          if (p.isClosed() || !p.url().includes(`pluginId=${PLUGIN_ID}`)) continue;
+          const hasApi = await p
+            .evaluate(() => {
+              const j = (window as unknown as Record<string, any>).joplin;
+              return !!j && !!j.data && typeof j.data.get === 'function';
+            })
+            .catch(() => false);
+          if (hasApi) return p;
+        }
+      }
+      return null;
+    },
+    (page): page is Page => page !== null,
+    timeoutMs,
+    500,
+  ) as Promise<Page>;
+}
+
+/**
+ * Run a Joplin command BY EXACT NAME, dispatched through the plugin's own background page.
+ *
+ * `runCommand` above is the user-gesture route and stays the default. This is the route for a
+ * command that MUST be the one that runs, because Goto Anything's `:` mode is a FUZZY match over a
+ * shared namespace: with several commands whose labels all begin "Harper: …", the query that used to
+ * select one of them can silently select another. `joplin.commands.execute` is the same
+ * CommandService the palette drives, addressed by id.
+ */
+export async function executeCommand(win: Page, name: string, ...args: unknown[]): Promise<void> {
+  const bg = await pluginBackgroundPage(win);
+  const result = await bg.evaluate(
+    async ([commandName, commandArgs]: [string, unknown[]]) => {
+      try {
+        await (window as unknown as Record<string, any>).joplin.commands.execute(
+          commandName,
+          ...commandArgs,
+        );
+        return 'ok';
+      } catch (error: any) {
+        return `ERROR ${String(error?.message ?? error)}`;
+      }
+    },
+    [name, args] as [string, unknown[]],
+  );
+  if (result !== 'ok') throw new Error(`joplin.commands.execute("${name}") failed: ${result}`);
+  await win.waitForTimeout(1000);
+}
+
+/** A note's body AS STORED — the real bytes, read through `joplin.data.get`. */
+export async function readNoteBodyViaApi(win: Page, noteId: string): Promise<string> {
+  const bg = await pluginBackgroundPage(win);
+  return bg.evaluate(async (id: string) => {
+    const note = await (window as unknown as Record<string, any>).joplin.data.get(['notes', id], {
+      fields: ['body'],
+    });
+    return String(note.body ?? '');
+  }, noteId);
+}
+
+/**
+ * Replace a note's body through the data API — the whole of what a second device's edit looks like
+ * to this one once Joplin has synced it.
+ */
+export async function writeNoteBodyViaApi(win: Page, noteId: string, body: string): Promise<void> {
+  const bg = await pluginBackgroundPage(win);
+  await bg.evaluate(
+    async ([id, text]: [string, string]) => {
+      await (window as unknown as Record<string, any>).joplin.data.put(['notes', id], null, {
+        body: text,
+      });
+    },
+    [noteId, body] as [string, string],
+  );
+}
+
+/** One of THIS plugin's settings, read from the plugin's own (namespaced) settings surface. */
+export async function readPluginSetting(win: Page, key: string): Promise<unknown> {
+  const bg = await pluginBackgroundPage(win);
+  return bg.evaluate(
+    (k: string) => (window as unknown as Record<string, any>).joplin.settings.value(k),
+    key,
+  );
 }
 
 /** True if the plugin's hidden background page is running (its URL carries ?pluginId=<id>). */

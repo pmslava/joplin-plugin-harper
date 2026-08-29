@@ -456,6 +456,22 @@ body,
 	font-size: 0.88em;
 }
 
+/* ---- v1.5.0: the sync notice --------------------------------------------- */
+
+/*
+ * The notice reads as information, not as an alarm: the plugin still works exactly as it did, and
+ * the only thing on offer is a command the user may run whenever they like. So it borrows the
+ * editor's own faded border rather than an error colour.
+ */
+.hs-notice {
+	border: 1px solid var(--joplin-divider-color, #dddddd);
+	border-left: 3px solid var(--joplin-color-faded, #777777);
+	border-radius: 4px;
+	padding: 8px 12px;
+	margin: 0 0 14px 0;
+	font-size: 0.95em;
+}
+
 /* ---- narrow screens ------------------------------------------------------ */
 
 @media (max-width: 620px) {
