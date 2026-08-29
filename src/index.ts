@@ -2109,13 +2109,25 @@ async function createSyncNote(): Promise<void> {
 		body: buildSyncNoteBody(content, new Date().toISOString()),
 		parent_id: folderId,
 	});
-	// The remembered key is deliberately NOT set here. Pointing the setting at a new note is a
-	// repoint like any other, and the onChange handler answers a repoint by forgetting everything it
-	// believed about the old mailbox and reading the new one — which would undo an assignment made
-	// here anyway. So the read path establishes the truth, exactly as it does on every other device.
-	// It costs one redundant apply of the state we have just written, and that apply is a no-op in
-	// every one of its three halves.
 	await joplin.settings.setValue(SYNC_NOTE_ID_KEY, note.id);
+	// THE KEY IS RECORDED AFTER THE SETTING WRITE, AND ON THE SYNC CHAIN. Both halves matter.
+	//
+	// AFTER, because pointing the setting at a new note is a repoint like any other: the onChange
+	// handler answers a repoint by forgetting everything it believed about the old mailbox, so an
+	// assignment made before the write is simply erased.
+	//
+	// ON THE CHAIN, because that same handler starts a refresh of the new note. Queueing behind it
+	// makes this the last word, and makes the command settle its own mailbox before it returns.
+	//
+	// Without this the device applies its OWN freshly-written seed as though a second device had
+	// sent it — and an apply is WHOLESALE, so any word added between the create and that read is
+	// read as absent from the incoming state and deleted. Not a concurrent-edit race (those are
+	// accepted): just this device failing to recognise its own handwriting.
+	await withSyncNote(async () => {
+		lastSyncContentKey = syncContentKey(content);
+		syncNoteInitialized = true;
+		warnedSyncNoteUnparseable = false;
+	});
 }
 
 // =============================================================================
