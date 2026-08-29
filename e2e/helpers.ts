@@ -384,8 +384,8 @@ async function submitGotoAnything(win: Page, text: string): Promise<void> {
 
 /**
  * Run a Joplin command by fuzzy-matching its label in the command palette (Goto Anything, `:` mode).
- * Used to invoke the plugin command `harper.createDictionaryNote` (label "Harper: Create dictionary
- * note") the way a user would.
+ * Used to invoke a plugin command such as `harper.createSyncNote` (label "Harper: Create sync note")
+ * the way a user would.
  */
 export async function runCommand(win: Page, labelQuery: string): Promise<void> {
   await submitGotoAnything(win, `:${labelQuery}`);
@@ -408,7 +408,9 @@ export async function openNoteInNewWindow(win: Page): Promise<void> {
 /**
  * Jump to (open) a note by title via Goto Anything. Opening a different note fires
  * `workspace.onNoteSelectionChange`, the plugin's deferred-flush trigger, so this doubles as "leave the
- * current note so its buffered dictionary words flush".
+ * current note so the pending sync-note write lands". (It used to say "so its buffered dictionary
+ * words flush to the dictionary note"; that note is gone, and the sync note is the only note the
+ * plugin writes now — the deferral itself is unchanged.)
  */
 export async function gotoNote(win: Page, titleQuery: string): Promise<void> {
   await submitGotoAnything(win, titleQuery);
@@ -430,16 +432,11 @@ export async function openNoteFromList(win: Page, title: string): Promise<void> 
   await win.waitForTimeout(1200);
 }
 
-/**
- * Read a note's CURRENT saved body by opening it fresh: click away to `viaTitle`, then back to
- * `title`, so the editor reloads the note from the database rather than showing a stale in-editor copy
- * (a plugin `data.put` to an already-open note does not necessarily live-refresh the desktop editor).
- */
-export async function readNoteBodyFresh(win: Page, title: string, viaTitle: string): Promise<string> {
-  await openNoteFromList(win, viaTitle);
-  await openNoteFromList(win, title);
-  return getEditorBody(win);
-}
+// `readNoteBodyFresh` lived here: it read a note's saved body off the RENDERED editor after bouncing
+// away and back. Its only two callers were the dictionary-note and note<->file mirror specs, both of
+// which went with the dictionary note. Everything left reads note bytes through `readNoteBodyViaApi`
+// below, which is strictly better anyway — `innerText` drops a fenced block's own backticks, and the
+// sync note is a fenced block.
 
 // =============================================================================
 // v1.5.0 — driving the plugin through its OWN background page.

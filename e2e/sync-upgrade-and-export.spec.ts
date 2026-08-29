@@ -17,7 +17,7 @@ import {
 } from './helpers';
 
 /**
- * E2E — THE UPGRADE NOTICE and THE ZED BRIDGE (v1.5.0).
+ * E2E — THE UPGRADE NOTICE and THE SETTINGS EXPORT (v1.5.0).
  *
  * Two v1.5.0 surfaces that have nothing to do with each other except that they can share one Joplin
  * launch, which in this suite is the expensive part:
@@ -27,16 +27,31 @@ import {
  *     is no honest migration — the Harper window says so, in one line, and names the command. It is
  *     a BANNER and never a popup, which is what "appears in the window, unprompted nowhere else"
  *     means and what the second half of this spec checks by watching it disappear.
- *   * THE ZED EXPORT. A file beside the configured dictionary holding the harper-ls settings block,
- *     regenerated whenever the rules change. Asserted on disk, in the real filesystem the real
- *     plugin wrote to.
+ *   * THE SETTINGS EXPORT. The file named by the `settingsPath` setting, which Harper owns outright
+ *     and rewrites wholesale whenever the dialect or a rule override changes. Asserted on disk, in
+ *     the real filesystem the real plugin wrote to.
+ *
+ * This used to be "the Zed bridge": a `zed-harper-ls.json` sidecar written beside the dictionary
+ * file, carrying Zed's own nested `lsp.harper-ls.settings.harper-ls` block. That shipped one editor's
+ * config format from a plugin that has no business knowing it, so it was replaced by one flat file at
+ * a path the user names. Both the sidecar and the "Copy Zed settings block" button are gone, and so
+ * is every assertion about them.
  */
 
 const RULE = 'ModalOf';
 const PHRASE = 'should of';
 const NOTICE =
-  'Your dictionary note cannot be used for the new settings sync, so make a new one with the ' +
-  'command Harper: Create sync note.';
+  'Your dictionary note is no longer used. Create a sync note with the command Harper: Create ' +
+  'sync note, and delete the old dictionary note if you like.';
+
+/**
+ * A legacy `dictionaryNoteId`, seeded straight into settings.json (see beforeAll).
+ *
+ * It does NOT have to resolve to a real note: the notice fires on "a dictionaryNoteId is set and a
+ * syncNoteId is not", and the only thing that ever reads the note behind it is the one-time word fold
+ * inside "Harper: Create sync note", which treats an unreadable id as "no words" by design.
+ */
+const LEGACY_NOTE_ID = '0123456789abcdef0123456789abcdef';
 
 // -----------------------------------------------------------------------------
 // Dialog plumbing. Deliberately local rather than shared with settings-dialog.spec.ts: that file is
@@ -86,23 +101,40 @@ async function closeSettings(win: Page): Promise<void> {
 
 test.describe.configure({ mode: 'serial' });
 
-test.describe('Harper sync upgrade notice and Zed export', () => {
+test.describe('Harper sync upgrade notice and settings export', () => {
   let joplin: JoplinInstance;
-  let dictDir = '';
+  let workDir = '';
   let dictPath = '';
+  let settingsPath = '';
 
   test.beforeAll(async () => {
-    // A real external dictionary, so the Zed export has a real "beside" to be written to.
-    dictDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-e2e-zed-'));
-    dictPath = path.join(dictDir, 'dictionary.txt');
+    workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-e2e-export-'));
+    // A real external dictionary, so the plugin has a configured file side as a v1.4.x user would.
+    dictPath = path.join(workDir, 'dictionary.txt');
     fs.writeFileSync(dictPath, 'Alreadythere\n', 'utf8');
-    joplin = await launchJoplin({ harperSettings: { dictionaryPath: dictPath } });
+    // Deliberately NOT pre-created: "the file appears" is half of what the export test proves.
+    settingsPath = path.join(workDir, 'harper-settings.json');
+    // The legacy state is SEEDED, not driven.
+    //
+    // It used to be produced by running `harper.createDictionaryNote`. That command is gone, and
+    // `executeCommand` throws hard on a command Joplin does not know — so the only honest way to be
+    // a v1.4.x install is to boot with the v1.4.x value already in settings.json, which is exactly
+    // what `harperSettings` writes (launch.ts pluginSettingKey; the same route dialect.spec.ts and
+    // the dictionaryPath specs take). The key is private now, but private is a visibility flag: the
+    // value still lives in settings.json and the plugin still reads it on startup.
+    joplin = await launchJoplin({
+      harperSettings: {
+        dictionaryPath: dictPath,
+        settingsPath,
+        dictionaryNoteId: LEGACY_NOTE_ID,
+      },
+    });
   });
 
   test.afterAll(async () => {
     if (joplin) await closeJoplin(joplin);
     try {
-      fs.rmSync(dictDir, { recursive: true, force: true });
+      fs.rmSync(workDir, { recursive: true, force: true });
     } catch {
       /* ignore */
     }
@@ -115,10 +147,8 @@ test.describe('Harper sync upgrade notice and Zed export', () => {
     await createNote(win, 'Scratch');
     await expect.poll(() => editorIsPresent(win), { timeout: 20_000 }).toBe(true);
 
-    // Exactly the state a v1.4.1 user upgrades from: the OLD note, and nothing else.
-    await executeCommand(win, 'harper.createDictionaryNote');
-    await openNoteFromList(win, 'Scratch');
-
+    // Exactly the state a v1.4.1 user upgrades from — a dictionaryNoteId and no syncNoteId — is
+    // already in place from beforeAll's seed, so there is nothing to drive here.
     const frame = await openSettings(win);
     const notice = frame.locator('#hs-sync-notice');
     await notice.waitFor({ state: 'visible', timeout: 30_000 });
@@ -141,9 +171,28 @@ test.describe('Harper sync upgrade notice and Zed export', () => {
     await closeSettings(win);
   });
 
-  test('disabling a rule regenerates the Zed settings block beside the dictionary file', async () => {
+  /**
+   * The Zed test this replaces asserted a sidecar file, at a path the plugin chose, in Zed's nested
+   * block format. All three of those are gone. What is left to prove is the whole of the new
+   * promise: the file at the user's `settingsPath` APPEARS, and it UPDATES when a rule is toggled.
+   */
+  test('disabling a rule writes that rule into the external settings file', async () => {
     const { win } = joplin;
-    const zedPath = path.join(dictDir, 'zed-harper-ls.json');
+
+    const readExport = () => {
+      try {
+        return JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+      } catch {
+        return null;
+      }
+    };
+
+    // THE FILE APPEARS. beforeAll pointed `settingsPath` at a path with nothing on it; warm-up alone
+    // is enough to create it. Nothing has been overridden yet, so `linters` is absent rather than
+    // empty — an absent key and `{}` say the same thing, and the absent one does not invite anyone to
+    // read it as "Harper disabled every linter".
+    await expect.poll(() => readExport()?.dialect, { timeout: 60_000 }).toBe('American');
+    expect(readExport().linters, 'no overrides yet, so no linters key').toBeUndefined();
 
     await openNoteFromList(win, 'Scratch');
     await expect.poll(() => editorIsPresent(win), { timeout: 20_000 }).toBe(true);
@@ -156,31 +205,26 @@ test.describe('Harper sync upgrade notice and Zed export', () => {
     await clickDisableRule(win, card);
     await expect.poll(() => lintRangeCountForWord(win, PHRASE), { timeout: 20_000 }).toBe(0);
 
-    const readZed = () => {
-      try {
-        return JSON.parse(fs.readFileSync(zedPath, 'utf8'));
-      } catch {
-        return null;
-      }
-    };
+    // ...AND IT UPDATES. The toggle went through the suggestion card, not the settings file.
     await expect
-      .poll(() => readZed()?.lsp?.['harper-ls']?.settings?.['harper-ls']?.linters?.[RULE], {
-        timeout: 60_000,
-      })
+      .poll(() => readExport()?.linters?.[RULE], { timeout: 60_000 })
       .toBe(false);
 
-    const raw = fs.readFileSync(zedPath, 'utf8');
+    const raw = fs.readFileSync(settingsPath, 'utf8');
     // eslint-disable-next-line no-console
-    console.log(`[harper-e2e] ${zedPath} =\n${raw}`);
-    const inner = readZed().lsp['harper-ls'].settings['harper-ls'];
-    // Zed nests harper-ls's own config root INSIDE its LSP block, so the key appears twice. A block
-    // with only one layer pastes cleanly and does nothing at all.
-    expect(inner.dialect).toBe('American');
-    expect(inner.linters[RULE]).toBe(false);
+    console.log(`[harper-e2e] ${settingsPath} =\n${raw}`);
+    const exported = readExport();
+    // FLAT, in harper's own vocabulary: `{dialect, linters}` at the top level and no editor's
+    // wrapper around it. American is the default dialect this profile booted with.
+    expect(exported.dialect).toBe('American');
+    expect(exported.linters[RULE]).toBe(false);
+    expect(exported.lsp, 'no editor-specific nesting').toBeUndefined();
     // SPARSE: the file must not be a dump of all ~823 rules.
-    expect(Object.keys(inner.linters).length).toBeLessThan(10);
-    // statsPath silently relocates harper-ls's file-local dictionary directory. Never emitted.
-    expect(raw).not.toContain('statsPath');
+    expect(Object.keys(exported.linters).length).toBeLessThan(10);
+    // The exact bytes matter to whoever diffs or version-controls this file: tab indent, one
+    // trailing newline, and nothing else after it.
+    expect(raw).toContain('\n\t"linters"');
+    expect(raw.endsWith('}\n')).toBe(true);
   });
 
   test('creating the sync note silences the notice', async () => {

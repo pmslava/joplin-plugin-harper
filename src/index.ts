@@ -2781,10 +2781,16 @@ async function registerSettings(): Promise<void> {
 			public: basicPublic,
 			section: SECTION,
 			label: 'External settings file',
+			// THE WHOLE PATH IS THE USER'S, FILE NAME INCLUDED. The plugin has no default name and no
+			// fallback: `writeSettingsExport` writes to exactly this string (tilde-expanded) or, when it
+			// is empty, to nothing at all. The example is written as an example — ", e.g. …" — in the same
+			// shape the dictionary-file description above uses, so it reads as a suggestion rather than
+			// as a name Harper is going to pick for you.
 			description:
 				'Absolute path to a JSON file where Harper keeps your current settings: the dialect and ' +
-				'your rule overrides. Harper rewrites it when they change. Other tools can read it from ' +
-				'there. Leave empty to skip it.',
+				'your rule overrides, e.g. ~/.local/share/harper-dictionary/harper-settings.json. ' +
+				'Harper rewrites it when they change. Other tools can read it from there. ' +
+				'Leave empty to skip it.',
 			storage: SettingStorage.File,
 		};
 	}
