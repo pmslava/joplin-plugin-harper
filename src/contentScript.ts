@@ -66,6 +66,36 @@ interface CodeMirrorControl {
 const DEFAULT_DELAY_MS = 500;
 
 // -----------------------------------------------------------------------------
+// ATTACH BREADCRUMBS.
+//
+// When this content script fails to attach, it fails SILENTLY — the editor simply never grows
+// underlines, and there is nothing in any log saying why, which is what made the dead-editor bug so
+// expensive to chase. So the attach path leaves a short trail: plugin() entry and each early bail,
+// the handshake round trips, and the moment the linter extension actually lands.
+//
+// It goes to a bounded window-level array rather than the console, for two reasons: the console in a
+// Joplin renderer is shared with the whole app and a per-lint log line there would be noise, and a
+// diagnostic that only exists in console output is unreadable after the fact — anything attaching to
+// the renderer (the e2e attach soak, or a developer opening devtools mid-session) arrives long after
+// startup and can still read the array. Kept on `window` for the same reason the L5 registry is:
+// every window's content script runs in the main renderer's realm, and a re-mount re-evaluates this
+// module. Capped so a long session cannot grow it without bound.
+// -----------------------------------------------------------------------------
+const TRACE_T0 = Date.now();
+const TRACE_MAX_LINES = 200;
+function trace(...args: unknown[]): void {
+	try {
+		const w = window as unknown as { __harperTrace?: string[] };
+		if (!w.__harperTrace) w.__harperTrace = [];
+		if (w.__harperTrace.length >= TRACE_MAX_LINES) return;
+		const detail = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+		w.__harperTrace.push(`${Date.now()} [cs] +${Date.now() - TRACE_T0}ms ${detail}`);
+	} catch {
+		/* no window (non-browser harness) — the trail is a diagnostic, never a dependency */
+	}
+}
+
+// -----------------------------------------------------------------------------
 // L5 IDEMPOTENCY GUARD. Joplin mobile double-mounts content scripts (joplin#12891): the same editor's
 // `plugin()` gets called twice, which without a guard doubles the linter extension + click handler
 // (the v0.0.4 device symptom: two squiggles, two cards). We record activated editors in a registry
@@ -730,12 +760,19 @@ function buildClickTooltip(from: number, to: number, diagnostic: Diagnostic): To
 export default (context: ContentScriptContext) => {
 	return {
 		plugin: (editorControl: CodeMirrorControl) => {
+			trace('plugin() enter', { cm6: !!editorControl.cm6, hasEditor: !!editorControl.editor });
 			// Only wire up on CodeMirror 6; the legacy CM5 emulation lacks `cm6`/addExtension.
-			if (!editorControl.cm6) return;
+			if (!editorControl.cm6) {
+				trace('plugin() BAIL: no cm6');
+				return;
+			}
 
 			// L5: make a second activation on the SAME editor a no-op (mobile double-mounts content
 			// scripts — joplin#12891). Without this the linter extension + click handler double up.
-			if (alreadyActivated(editorControl.editor)) return;
+			if (alreadyActivated(editorControl.editor)) {
+				trace('plugin() BAIL: already activated');
+				return;
+			}
 
 			// Query the plugin main process for lints of the current document and map them to
 			// @codemirror/lint diagnostics. Used both as the `linter()` source (debounced, on
@@ -1015,27 +1052,39 @@ export default (context: ContentScriptContext) => {
 				})();
 			};
 
-			// Ask the plugin main process for the configured debounce before building the linter, then
-			// keep it live via the `harper.forceLint` poke.
-			void (async () => {
-				try {
-					const config = (await context.postMessage({ type: 'getConfig' })) as RefreshConfig | null;
-					if (config && typeof config.debounceMs === 'number') currentDelay = config.debounceMs;
-					if (config) applyUnderlineStyle(config.underlineStyle);
-					if (config && typeof config.generation === 'number') lastSeenGeneration = config.generation;
-					if (config && config.platform === 'desktop') platformIsDesktop = true;
-					if (config && config.platform === 'mobile') {
-						isMobilePlatform = true;
-						ensureMobileStyles(documentOf(editorControl.editor));
-					}
-				} catch {
-					/* keep the default */
-				}
+			// -----------------------------------------------------------------------------------------
+			// ATTACH FIRST, HANDSHAKE SECOND (the dead-editor fix).
+			//
+			// Everything below this line up to `subscribeToRefreshPokes` used to run INSIDE the
+			// getConfig continuation, which made the single most important thing this content script
+			// does — putting the linter extension on the editor — conditional on one IPC round trip
+			// resolving. A round trip that RESOLVES late is fine and a round trip that REJECTS is fine;
+			// the fatal case is one that does neither, because `await` on a promise nobody ever settles
+			// waits forever, and the editor is then silently linter-less for the rest of the session:
+			// no underlines, no cards, no error, and no second attempt — the L5 registry has already
+			// recorded this editor as activated, so a re-entry into plugin() would bail out too.
+			//
+			// That is not a hypothetical shape. Joplin's own transport has several places where a
+			// content-script message is dropped rather than answered (verified in the 3.6.14 bundle):
+			// PostMessageService.sendResponse logs "Cannot respond to message because no responder was
+			// found" and returns; the plugin webview's ipcRenderer handler logs "Got an event ID but no
+			// matching event handler" and returns; ElectronAppWrapper's ipcMain 'pluginMessage' route
+			// logs "Trying to send IPC message to non-existing plugin window" and returns. Every one of
+			// those leaves the sender's promise pending forever — there is no timeout anywhere on the
+			// path. Gating attach on that promise turns any of them into a dead session.
+			//
+			// So the linter, the styles and the forceLint command are wired UNCONDITIONALLY and
+			// SYNCHRONOUSLY here, with the compiled-in defaults, and the handshake becomes a pure
+			// refinement that arrives whenever it arrives (see the bounded retry below). The worst case
+			// degrades from "Harper is dead" to "Harper lints at the default 500 ms debounce in the
+			// default squiggly style until the config lands".
+			// -----------------------------------------------------------------------------------------
 
-				// Inject styles eagerly so the first underline paints with the per-kind color — into THIS
-				// editor's own document, which is the secondary window's when the note was opened there.
-				ensureStyles(documentOf(editorControl.editor));
+			// Inject styles eagerly so the first underline paints with the per-kind color — into THIS
+			// editor's own document, which is the secondary window's when the note was opened there.
+			ensureStyles(documentOf(editorControl.editor));
 
+			{
 				// linter delay 0: our `debouncedLint` owns the idle-delay against the mutable value.
 				// tooltipFilter: () => null FULLY SUPPRESSES the stock hover tooltip (v1.0.2). The
 				// bundled @codemirror/lint hover source (lintTooltip) applies this filter to the
@@ -1053,32 +1102,121 @@ export default (context: ContentScriptContext) => {
 				editorControl.addExtension(
 					linter(debouncedLint, { delay: 0, tooltipFilter: suppressHoverTooltip }),
 				);
+				trace('LINTER ATTACHED');
+			}
 
-				// Register the command the plugin main process pokes after settings/dictionary changes.
-				// We read `editorControl.editor` freshly on each invocation so a note switch (new view)
-				// is handled, and re-lint via `relint` (setDiagnostics) rather than the no-op
-				// `forceLinting`. `harper.forceLint` therefore genuinely refreshes the underlines AND
-				// re-reads debounceMs + underlineStyle (via getConfig), so both apply live — no reopen.
-				//
-				// ORDERING (v1.2.0): the relint runs INSIDE the getConfig continuation (see
-				// refreshFromConfig). debounceMs only affects the NEXT typing burst, so the old code
-				// could fire it in parallel; the underline style is baked into each Diagnostic's
-				// markClass by `toDiagnostic`, so a relint that races ahead of the config reply would
-				// repaint in the OLD style and the user would see no change until they typed again.
-				// Awaiting the config first makes the poke itself the repaint. The rejection path still
-				// relints (with the current values), so a failed handshake can never leave the
-				// underlines stale.
-				//
-				// NOTE (multi-window): this command reaches the FOCUSED window's editor only, so it is the
-				// instant path for that window (and the only path on mobile); every other window is
-				// refreshed by the subscription below. The skip flag drops the reply when the
-				// subscription already refreshed this editor for the same generation.
-				try {
-					editorControl.registerCommand('harper.forceLint', () => {
-						void refreshFromConfig(true);
-					});
-				} catch {
-					/* registerCommand unavailable — main's poke will simply no-op */
+			// Register the command the plugin main process pokes after settings/dictionary changes.
+			// We read `editorControl.editor` freshly on each invocation so a note switch (new view)
+			// is handled, and re-lint via `relint` (setDiagnostics) rather than the no-op
+			// `forceLinting`. `harper.forceLint` therefore genuinely refreshes the underlines AND
+			// re-reads debounceMs + underlineStyle (via getConfig), so both apply live — no reopen.
+			//
+			// ORDERING (v1.2.0): the relint runs INSIDE the getConfig continuation (see
+			// refreshFromConfig). debounceMs only affects the NEXT typing burst, so the old code
+			// could fire it in parallel; the underline style is baked into each Diagnostic's
+			// markClass by `toDiagnostic`, so a relint that races ahead of the config reply would
+			// repaint in the OLD style and the user would see no change until they typed again.
+			// Awaiting the config first makes the poke itself the repaint. The rejection path still
+			// relints (with the current values), so a failed handshake can never leave the
+			// underlines stale.
+			//
+			// NOTE (multi-window): this command reaches the FOCUSED window's editor only, so it is the
+			// instant path for that window (and the only path on mobile); every other window is
+			// refreshed by the subscription below. The skip flag drops the reply when the
+			// subscription already refreshed this editor for the same generation.
+			try {
+				editorControl.registerCommand('harper.forceLint', () => {
+					void refreshFromConfig(true);
+				});
+			} catch {
+				/* registerCommand unavailable — main's poke will simply no-op */
+			}
+
+			// -----------------------------------------------------------------------------------------
+			// THE HANDSHAKE, BOUNDED AND RETRIED.
+			//
+			// The editor is already linting by the time this runs, so nothing here is load-bearing for
+			// the underlines existing — it decides what they look like (style), how long the debounce
+			// idles (delay), which platform's tap targets the cards get, and whether this editor joins
+			// the multi-window refresh subscription.
+			//
+			// Each attempt is raced against a timeout, because the failure this whole restructure is
+			// about is a reply that never comes: without the race, one dropped message would leave the
+			// editor on the defaults forever, and (on desktop) out of the refresh subscription forever,
+			// which is the stale-underlines bug the subscription was added to fix. A timed-out or
+			// rejected attempt is retried a few times with a short backoff, so a handshake that loses
+			// its reply to a startup race recovers within seconds rather than at the next app start.
+			//
+			// The attempts are bounded rather than endless: if the transport is still dropping replies
+			// after this many tries the plugin main process is not answering at all, and a content
+			// script that keeps posting into that would only spin. `harper.forceLint` (registered
+			// above) remains a live re-handshake path for the whole session either way — every poke
+			// re-reads the config — so a later recovery still lands.
+			// -----------------------------------------------------------------------------------------
+			const HANDSHAKE_ATTEMPTS = 4;
+			const HANDSHAKE_TIMEOUT_MS = 5000;
+			const HANDSHAKE_BACKOFF_MS = 2000;
+			const HANDSHAKE_TIMED_OUT = 'harper-handshake-timeout';
+
+			void (async () => {
+				for (let attempt = 1; attempt <= HANDSHAKE_ATTEMPTS; attempt++) {
+					let config: RefreshConfig | null = null;
+					try {
+						trace('getConfig ->', attempt);
+						const timeout: { handle: ReturnType<typeof setTimeout> | null } = { handle: null };
+						let reply: unknown;
+						try {
+							reply = await Promise.race([
+								context.postMessage({ type: 'getConfig' }),
+								new Promise<typeof HANDSHAKE_TIMED_OUT>((resolve) => {
+									timeout.handle = setTimeout(() => resolve(HANDSHAKE_TIMED_OUT), HANDSHAKE_TIMEOUT_MS);
+								}),
+							]);
+						} finally {
+							if (timeout.handle) clearTimeout(timeout.handle);
+						}
+						if (reply === HANDSHAKE_TIMED_OUT) {
+							trace('getConfig TIMED OUT', attempt);
+							await sleep(HANDSHAKE_BACKOFF_MS);
+							continue;
+						}
+						config = reply as RefreshConfig | null;
+						trace('getConfig <-', JSON.stringify(config ?? null));
+					} catch (error) {
+						trace('getConfig REJECTED', String((error as Error)?.message ?? error));
+						await sleep(HANDSHAKE_BACKOFF_MS);
+						continue;
+					}
+
+					// AN EMPTY REPLY IS AN UNANSWERED ONE, NOT AN ANSWER. `getConfig` always replies with
+					// a full object, so `undefined` back means nothing handled the message — which is
+					// exactly what Joplin returns while the plugin main process has registered the content
+					// script but not yet wired `contentScripts.onMessage` to it (Plugin.
+					// emitContentScriptMessage returns undefined when no listener is registered for the
+					// id). Measured on this build, that window is ~25 ms wide and lands squarely in the
+					// path of an editor that mounts during startup. Retrying costs one more round trip and
+					// closes it; accepting the empty reply would strand this editor on the defaults and,
+					// on desktop, out of the refresh subscription for the whole session.
+					if (!config) {
+						trace('getConfig UNANSWERED', attempt);
+						await sleep(HANDSHAKE_BACKOFF_MS);
+						continue;
+					}
+
+					if (typeof config.debounceMs === 'number') currentDelay = config.debounceMs;
+					applyUnderlineStyle(config.underlineStyle);
+					if (typeof config.generation === 'number') lastSeenGeneration = config.generation;
+					if (config.platform === 'desktop') platformIsDesktop = true;
+					if (config.platform === 'mobile') {
+						isMobilePlatform = true;
+						ensureMobileStyles(documentOf(editorControl.editor));
+					}
+					// The style is baked into each Diagnostic's markClass at build time, so a config that
+					// arrives after the first paint only reaches the screen via a relint. Skipped when the
+					// editor has gone (a note switch or a closed window during the handshake).
+					const current = editorControl.editor;
+					if (current) relint(current);
+					break;
 				}
 
 				// DESKTOP ONLY, FAIL-CLOSED: subscribe to main-process refresh pokes so THIS editor

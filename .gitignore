@@ -6,6 +6,7 @@ publish/
 .e2e-cache/
 e2e/.profiles/
 e2e/.artifacts/
+e2e/.soak/
 test-results/
 playwright-report/
 .vscode/
