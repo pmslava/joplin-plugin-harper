@@ -65,6 +65,25 @@ interface CodeMirrorControl {
 // Fallback debounce if the config handshake fails (ms).
 const DEFAULT_DELAY_MS = 500;
 
+// TEMPORARY attach-tracing (investigation only).
+const TRACE_T0 = Date.now();
+function trace(...args: unknown[]): void {
+	const line = `+${Date.now() - TRACE_T0}ms ${args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')}`;
+	try {
+		// eslint-disable-next-line no-console
+		console.log('[harper-trace][cs]', line);
+	} catch {
+		/* no console */
+	}
+	try {
+		const w = window as unknown as { __harperTrace?: string[] };
+		if (!w.__harperTrace) w.__harperTrace = [];
+		if (w.__harperTrace.length < 500) w.__harperTrace.push(`${Date.now()} [cs] ${line}`);
+	} catch {
+		/* no window */
+	}
+}
+
 // -----------------------------------------------------------------------------
 // L5 IDEMPOTENCY GUARD. Joplin mobile double-mounts content scripts (joplin#12891): the same editor's
 // `plugin()` gets called twice, which without a guard doubles the linter extension + click handler
@@ -730,21 +749,30 @@ function buildClickTooltip(from: number, to: number, diagnostic: Diagnostic): To
 export default (context: ContentScriptContext) => {
 	return {
 		plugin: (editorControl: CodeMirrorControl) => {
+			trace('plugin() enter', { cm6: !!editorControl.cm6, hasEditor: !!editorControl.editor });
 			// Only wire up on CodeMirror 6; the legacy CM5 emulation lacks `cm6`/addExtension.
-			if (!editorControl.cm6) return;
+			if (!editorControl.cm6) {
+				trace('plugin() BAIL: no cm6');
+				return;
+			}
 
 			// L5: make a second activation on the SAME editor a no-op (mobile double-mounts content
 			// scripts — joplin#12891). Without this the linter extension + click handler double up.
-			if (alreadyActivated(editorControl.editor)) return;
+			if (alreadyActivated(editorControl.editor)) {
+				trace('plugin() BAIL: already activated');
+				return;
+			}
 
 			// Query the plugin main process for lints of the current document and map them to
 			// @codemirror/lint diagnostics. Used both as the `linter()` source (debounced, on
 			// docChanged) and by `relint` (immediate, after a card action / main-process poke).
 			const runLint = async (view: EditorView): Promise<Diagnostic[]> => {
 				const text = view.state.doc.toString();
+				trace('lint ->', text.length);
 				const response = (await context.postMessage({ type: 'lint', text })) as
 					| PlainLint[]
 					| null;
+				trace('lint <-', Array.isArray(response) ? response.length : String(response));
 				if (!Array.isArray(response)) return [];
 				return response.map((lint) => toDiagnostic(context, text, lint, relint));
 			};
@@ -1019,7 +1047,9 @@ export default (context: ContentScriptContext) => {
 			// keep it live via the `harper.forceLint` poke.
 			void (async () => {
 				try {
+					trace('getConfig ->');
 					const config = (await context.postMessage({ type: 'getConfig' })) as RefreshConfig | null;
+					trace('getConfig <-', JSON.stringify(config ?? null));
 					if (config && typeof config.debounceMs === 'number') currentDelay = config.debounceMs;
 					if (config) applyUnderlineStyle(config.underlineStyle);
 					if (config && typeof config.generation === 'number') lastSeenGeneration = config.generation;
@@ -1028,8 +1058,9 @@ export default (context: ContentScriptContext) => {
 						isMobilePlatform = true;
 						ensureMobileStyles(documentOf(editorControl.editor));
 					}
-				} catch {
+				} catch (error) {
 					/* keep the default */
+					trace('getConfig REJECTED', String((error as Error)?.message ?? error));
 				}
 
 				// Inject styles eagerly so the first underline paints with the per-kind color — into THIS
@@ -1053,6 +1084,7 @@ export default (context: ContentScriptContext) => {
 				editorControl.addExtension(
 					linter(debouncedLint, { delay: 0, tooltipFilter: suppressHoverTooltip }),
 				);
+				trace('LINTER ATTACHED');
 
 				// Register the command the plugin main process pokes after settings/dictionary changes.
 				// We read `editorControl.editor` freshly on each invocation so a note switch (new view)
