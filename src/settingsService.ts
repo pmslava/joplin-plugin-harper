@@ -48,8 +48,29 @@ export interface PrimarySettings {
 	underlineStyle: string;
 	ignoreNonEnglish: boolean;
 	dictionaryNoteId: string;
+	/** v1.5.0: the sync note. Empty means the settings sync is off on this device. */
+	syncNoteId: string;
 	/** Present on desktop only — the setting is not registered on mobile. */
 	dictionaryPath?: string;
+}
+
+/**
+ * THE UPGRADE NOTICE (v1.5.0) — shown in the Harper window when a v1.4.x user has a dictionary note
+ * but no sync note.
+ *
+ * The old note is a plain word list; the new one is machine-readable JSON carrying rules, dismissed
+ * findings and words together. There is no honest way to read one as the other, so the plugin says
+ * so rather than migrating something it would have to guess at. Deliberately a BANNER and not a
+ * popup: nothing about this is urgent, the old note keeps working exactly as it did, and an
+ * unprompted dialog for a feature the user has not asked for yet is the wrong trade.
+ */
+export const SYNC_UPGRADE_NOTICE =
+	'Your dictionary note cannot be used for the new settings sync, so make a new one with the ' +
+	'command Harper: Create sync note.';
+
+/** The notice to show above the tabs, or null when there is nothing to say. */
+export function syncNoticeFor(settings: PrimarySettings): string | null {
+	return settings.dictionaryNoteId && !settings.syncNoteId ? SYNC_UPGRADE_NOTICE : null;
 }
 
 export interface DismissedSnapshot {
@@ -77,6 +98,8 @@ export interface SettingsSnapshot {
 	settings: PrimarySettings;
 	dictionaryWords: string[];
 	dismissed: DismissedSnapshot;
+	/** v1.5.0: the one-line banner above the tabs, or null. See SYNC_UPGRADE_NOTICE. */
+	syncNotice: string | null;
 }
 
 /** What a dictionary-editor save reports back: what it changed, and the resulting truth. */
@@ -125,6 +148,17 @@ export interface SettingsServiceDeps {
 	applyWordEdits(adds: string[], removes: string[]): Promise<string[]>;
 	/** Accepted `dialect` values, so validation cannot drift from DIALECT_BY_NAME. */
 	dialectNames: string[];
+	/**
+	 * v1.5.0: the harper-ls block for the "Copy Zed settings block" button, plus where (if anywhere)
+	 * the plugin keeps the same bytes as a file. `copied` reports whether the clipboard actually took
+	 * it — a webview cannot reach the clipboard, so the copy happens in the plugin and mobile has no
+	 * clipboard API at all. Optional so a host without it degrades to no button rather than an error.
+	 */
+	getZedSettingsBlock?(opts: { copy: boolean }): Promise<{
+		text: string;
+		filePath: string;
+		copied: boolean;
+	}>;
 }
 
 // =============================================================================
@@ -280,6 +314,7 @@ const SETTING_VALIDATORS: Record<string, (value: unknown, deps: SettingsServiceD
 		return v;
 	},
 	dictionaryNoteId: (v) => (typeof v === 'string' ? v.trim() : ''),
+	syncNoteId: (v) => (typeof v === 'string' ? v.trim() : ''),
 	dictionaryPath: (v, deps) => {
 		// Not registered on mobile — writing it there throws "Unknown key" in real Joplin.
 		if (deps.isMobile()) throw new Error('dictionaryPath is desktop-only');
@@ -349,6 +384,7 @@ export function createSettingsService(deps: SettingsServiceDeps): SettingsServic
 			underlineStyle: (await deps.getSetting('underlineStyle')) === 'solid' ? 'solid' : 'squiggly',
 			ignoreNonEnglish: (await deps.getSetting('ignoreNonEnglish')) === true,
 			dictionaryNoteId: (await deps.getSetting('dictionaryNoteId')) || '',
+			syncNoteId: (await deps.getSetting('syncNoteId')) || '',
 		};
 		// Reading an unregistered key throws in real Joplin, so mobile must not even ask.
 		if (!deps.isMobile()) settings.dictionaryPath = (await deps.getSetting('dictionaryPath')) || '';
@@ -406,15 +442,17 @@ export function createSettingsService(deps: SettingsServiceDeps): SettingsServic
 
 			const raw = await deps.loadIgnoredLintsRaw();
 			const entries = await loadDismissed(deps.dismissedStore);
+			const settings = await readPrimarySettings();
 
 			return {
 				structured,
 				flatConfig,
 				defaults,
 				descriptionsHtml,
-				settings: await readPrimarySettings(),
+				settings,
 				dictionaryWords: normalizeWords(await deps.getEffectiveWords()),
 				dismissed: { entries, legacyCount: legacyCount(raw, entries) },
+				syncNotice: syncNoticeFor(settings),
 			};
 		},
 
@@ -539,6 +577,12 @@ export function createSettingsService(deps: SettingsServiceDeps): SettingsServic
 					return service.getRuleDescriptions();
 				case 'settings:applyRuleOverrides':
 					return { ok: true, overrides: await service.applyRuleOverrides(msg.overrides || {}) };
+				case 'settings:zedBlock':
+					// Null (not an error) when the host does not provide it: the dialog reads that as
+					// "not available on this device" and says so, rather than showing a stack trace.
+					return deps.getZedSettingsBlock
+						? await deps.getZedSettingsBlock({ copy: msg.copy === true })
+						: null;
 				case 'settings:resetRules':
 					return { ok: true, overrides: await service.resetRules() };
 				case 'settings:disableAllRules':

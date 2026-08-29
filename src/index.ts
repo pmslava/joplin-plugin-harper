@@ -24,14 +24,25 @@ import { slimBinaryInlined } from 'harper.js/slimBinaryInlined';
 import { resolvePlatform, isMobile } from './platform';
 import { mergeDictionary } from './dictionaryMerge';
 import {
+	DismissedEntry,
 	DismissedStore,
 	appendDismissedInTransaction,
 	buildIgnoredLintsPayload,
 	extractHashes,
+	loadDismissed,
 	makeEntryId,
+	saveDismissed,
 	withDismissalTransaction,
 } from './dismissedLog';
 import { SettingsService, createSettingsService, parseRuleOverridesJson } from './settingsService';
+import {
+	SYNC_NOTE_TITLE,
+	SyncContent,
+	buildSyncNoteBody,
+	parseSyncNoteBody,
+	syncContentKey,
+} from './syncNote';
+import { buildZedSettingsBlock, buildZedSettingsFile, zedExportPath } from './zedExport';
 
 const CONTENT_SCRIPT_ID = 'harperCm';
 const SECTION = 'harper';
@@ -133,6 +144,8 @@ interface HarperConfig {
 	ignoreNonEnglish: boolean;
 	dictionaryPath: string;
 	dictionaryNoteId: string;
+	/** v1.5.0: the sync note. When set it owns rules, words and dismissed findings on every device. */
+	syncNoteId: string;
 	ruleOverrides: string;
 }
 const cfg: HarperConfig = {
@@ -143,8 +156,26 @@ const cfg: HarperConfig = {
 	ignoreNonEnglish: false,
 	dictionaryPath: '',
 	dictionaryNoteId: '',
+	syncNoteId: '',
 	ruleOverrides: '',
 };
+
+const SYNC_NOTE_ID_KEY = 'syncNoteId';
+
+/**
+ * THE STAND-DOWN (v1.5.0). Which note the DICTIONARY reconcile treats as its note side.
+ *
+ * With a sync note configured, that note owns the word list, and the old dictionary note is left
+ * exactly as the user last saw it: not read, not written, not deleted. Returning `''` here is the
+ * whole mechanism — `readDictionaryNote('')` yields a null note side, `mergeDictionary` reports
+ * `noteChanged: false` for a null side, and the reconcile's only `data.put` is therefore never
+ * reached. Nothing else in the reconcile has to know the feature exists.
+ *
+ * With no sync note configured this is `cfg.dictionaryNoteId` and v1.4.1 behaviour is bit-identical.
+ */
+function activeDictionaryNoteId(): string {
+	return cfg.syncNoteId ? '' : cfg.dictionaryNoteId;
+}
 
 export const DIALECT_BY_NAME: Record<string, Dialect> = {
 	American: Dialect.American,
@@ -176,6 +207,7 @@ async function loadSettings(): Promise<void> {
 	// unconditional read escaped onStart on mobile and killed the whole plugin.)
 	cfg.dictionaryPath = isMobile() ? '' : await read('dictionaryPath', '');
 	cfg.dictionaryNoteId = await read('dictionaryNoteId', '');
+	cfg.syncNoteId = await read(SYNC_NOTE_ID_KEY, '');
 	cfg.ruleOverrides = await read('ruleOverrides', '');
 }
 
@@ -353,7 +385,7 @@ let lastNoteUpdatedTime: number | null = null;
  * Same null-vs-empty rule as the file (see readExternalFile): an unreadable note infers no
  * deletions, an empty-but-readable note deletes what the base remembered.
  */
-async function readDictionaryNote(noteId: string = cfg.dictionaryNoteId): Promise<string[] | null> {
+async function readDictionaryNote(noteId: string = activeDictionaryNoteId()): Promise<string[] | null> {
 	if (!noteId) return null;
 	try {
 		const note = await joplin.data.get(['notes', noteId], {
@@ -615,7 +647,7 @@ let warnedStalePass: string | null = null;
 function passIsStale(pass: PassSnapshot, what: string): boolean {
 	if (
 		dictionaryEpoch === pass.epoch &&
-		cfg.dictionaryNoteId === pass.noteId &&
+		activeDictionaryNoteId() === pass.noteId &&
 		(isMobile() || cfg.dictionaryPath === pass.dictPath)
 	) {
 		return false;
@@ -624,7 +656,7 @@ function passIsStale(pass: PassSnapshot, what: string): boolean {
 	// where the identity never moved at all, which sent anyone reading the log after the wrong cause.
 	let why: string;
 	if (pass.epoch < 0) why = 'it started while the dictionary was being repointed';
-	else if (cfg.dictionaryNoteId !== pass.noteId) why = 'the dictionary note was repointed mid-pass';
+	else if (activeDictionaryNoteId() !== pass.noteId) why = 'the dictionary note was repointed mid-pass';
 	else if (!isMobile() && cfg.dictionaryPath !== pass.dictPath) {
 		why = 'the external dictionary file was repointed mid-pass';
 	} else why = 'the dictionary configuration changed mid-pass';
@@ -948,6 +980,13 @@ function waitForRefresh(clientGeneration: number): Promise<{ generation: number 
 async function pokeForceLint(): Promise<void> {
 	// Resolve every parked subscription FIRST (all windows), then poke the focused editor.
 	bumpConfigGeneration();
+	// THE SYNC-NOTE WRITE HOOK (v1.5.0). Every mutation of synced state in this plugin — a rule
+	// toggle from any of its three paths, a dismiss, a restore, a clear, a dictionary add or remove,
+	// a reconcile that moved the word set — ends here. Hooking the one function rather than the seven
+	// call sites is what makes "when local synced state changes, write the note" true by construction
+	// instead of by inventory. The write is debounced and skipped when the content is unchanged, so
+	// the calls that change nothing synced (an underline-style toggle, a dialect switch) cost nothing.
+	scheduleSyncNoteWrite();
 	try {
 		await joplin.commands.execute('editor.execCommand', { name: 'harper.forceLint' });
 	} catch {
@@ -1085,7 +1124,9 @@ async function runReconcile(reason: string): Promise<ReconcileResult> {
 		// describe. Every durable write below asserts this snapshot immediately before mutating.
 		const pass: PassSnapshot = {
 			epoch: captureDictionaryEpoch(),
-			noteId: cfg.dictionaryNoteId,
+			// The ACTIVE note id: `''` while a sync note owns the dictionary, which is how the old
+			// dictionary note stands down without a single branch inside the merge below.
+			noteId: activeDictionaryNoteId(),
 			dictPath: isMobile() ? '' : cfg.dictionaryPath,
 			reason,
 		};
@@ -1509,9 +1550,11 @@ async function persistAddedWord(word: string): Promise<void> {
 				// eslint-disable-next-line no-console
 				console.warn(`[harper] could not append to external dictionary: ${external}`);
 			}
-		} else if (!cfg.dictionaryNoteId) {
+		} else if (!activeDictionaryNoteId()) {
 			// No external file AND no dictionary note: fall back to the plugin-local list so the word
-			// still persists across desktop sessions.
+			// still persists across desktop sessions. With a SYNC note configured the dictionary note has
+			// stood down, so this fallback is used there too — which is right: the sync note is the
+			// transport, not the local store, and userWords.txt is what keeps the word across a restart.
 			try {
 				fs.appendFileSync(await localWordsPath(), `${word}\n`);
 			} catch {
@@ -1721,6 +1764,429 @@ async function applyWordEdits(adds: string[], removes: string[]): Promise<string
 	return words;
 }
 
+// =============================================================================
+// THE SYNC NOTE (v1.5.0) — a mailbox, read whole and written whole.
+// =============================================================================
+//
+// The whole mechanism is four pieces of state and two operations, and it is deliberately not more
+// than that. The note carries rules + dismissed findings + words as JSON (see src/syncNote.ts);
+// this half decides WHEN to write it and WHEN to apply it.
+//
+//   WRITE  — any local change to synced state schedules a debounced write. The write is skipped when
+//            the resulting content matches what this device last wrote or applied.
+//   APPLY  — the poll and every note-selection change read the note. A body whose content differs
+//            from that same remembered value is applied WHOLESALE: rules, ignore state and words are
+//            replaced, not merged.
+//
+// LOOP PREVENTION is that one remembered value, `lastSyncContentKey` (see syncContentKey). It is the
+// canonical form of the SYNCED CONTENT — not of the body — so the `updatedAt` stamp cannot make a
+// device rewrite what it just applied, which is the shape every ping-pong in a scheme like this
+// takes. It lives in memory only: a fresh session reads the note and applies it, which is correct
+// (that is how a change made while this device was closed arrives) and idempotent.
+//
+// CONCURRENT EDITS ARE NOT MERGED. Whole-note last-writer-wins. Two devices changing settings at the
+// same moment produce a Joplin conflict copy, which the plugin ignores entirely: it always uses the
+// note at the configured id, and the user resolves the conflict themselves.
+//
+// A MANGLED NOTE NEVER STOPS ANYTHING. An unreadable body is logged once, the remembered key is
+// cleared, and the plugin keeps running on local state; the next write rewrites the note wholesale.
+
+/** A few seconds: long enough to coalesce a burst of rule toggles, short enough to feel immediate. */
+const SYNC_NOTE_WRITE_DELAY_MS = 3_000;
+
+/**
+ * The canonical content this device last WROTE to, or APPLIED from, the sync note.
+ *
+ * `null` means "nothing is known" — the next write always writes, and the next read always applies.
+ * That is the correct state after a failed apply and after an unparseable body.
+ */
+let lastSyncContentKey: string | null = null;
+/** Set once the sync note has actually been READ this session. Nothing is written before that. */
+let syncNoteInitialized = false;
+/** A write is wanted. Survives an L3 deferral, so the next drain point performs it. */
+let syncNoteWritePending = false;
+let syncNoteWriteTimer: ReturnType<typeof setTimeout> | null = null;
+let lastSyncNoteUpdatedTime: number | null = null;
+let warnedSyncNoteUnparseable = false;
+
+/** The dismissed side table in the note's field names. */
+function toSyncEntries(entries: readonly DismissedEntry[]): SyncContent['dismissed']['entries'] {
+	return entries.map((entry) => ({
+		hashes: entry.hashes,
+		rule: entry.ruleName,
+		text: entry.problemText,
+		date: entry.dismissedAt,
+	}));
+}
+
+/** ...and back. The note's own names are shorter; the side table's are the ones the UI reads. */
+function toDismissedEntries(entries: SyncContent['dismissed']['entries']): DismissedEntry[] {
+	return entries.map((entry) => ({
+		id: entry.hashes[0],
+		hashes: entry.hashes,
+		ruleName: entry.rule,
+		problemText: entry.text,
+		dismissedAt: entry.date,
+	}));
+}
+
+/** Everything that syncs, as this device currently holds it, for a given reconciled word set. */
+async function syncContentFor(words: string[]): Promise<SyncContent> {
+	return {
+		ruleOverrides: parseRuleOverrides(),
+		dismissed: {
+			// VERBATIM — harper's own payload, u64s and all. Never parsed here, never rebuilt.
+			ignoredLintsRaw: await loadIgnoredLintsJson(),
+			entries: toSyncEntries(await loadDismissed(dismissedStore)),
+		},
+		words,
+	};
+}
+
+/**
+ * The content to write, or NULL when this device cannot honestly state its word list right now.
+ *
+ * The word list comes from a reconcile pass, and a pass that did not publish (stale configuration, a
+ * failed read) computed nothing. Writing its fallback list into the note would broadcast a word set
+ * this device does not actually believe in to every other device. Returning null defers instead —
+ * the write stays pending and the next drain point tries again.
+ */
+async function collectSyncContent(): Promise<SyncContent | null> {
+	const result = await reconcileDictionaryResult('sync-note');
+	if (!result.published) return null;
+	return syncContentFor(result.words);
+}
+
+/**
+ * Schedule a debounced write. Called from `pokeForceLint`, which every mutation in this plugin ends
+ * in — one hook rather than one per path, so no rule toggle, dismissal, restore or dictionary edit
+ * can be forgotten. Over-triggering is free: the content-key comparison in the flush turns a write
+ * with nothing to say into a no-op before any note is touched.
+ */
+function scheduleSyncNoteWrite(): void {
+	if (!cfg.syncNoteId) return;
+	syncNoteWritePending = true;
+	if (syncNoteWriteTimer) return;
+	syncNoteWriteTimer = setTimeout(() => {
+		syncNoteWriteTimer = null;
+		void flushSyncNote('debounce');
+	}, SYNC_NOTE_WRITE_DELAY_MS);
+}
+
+/**
+ * Write the note, if there is anything to say and it is safe to say it now.
+ *
+ * THREE GATES, and each defers rather than cancels — `syncNoteWritePending` stays set, so the next
+ * drain point (a note-selection change, the 60 s poll) retries:
+ *
+ *   1. THE MAILBOX MUST HAVE BEEN READ FIRST. A device that has never successfully read the note
+ *      does not know what is in it, and writing its own state over an unread note is how a machine
+ *      that just installed the plugin wipes everyone else's settings.
+ *   2. L3 — NO `data.put` WHILE AN EDITOR IS OPEN. Exactly the rule the dictionary note has always
+ *      obeyed (a plugin note write evicts the mobile editor), and for exactly the same reason.
+ *   3. THE WORD LIST MUST BE PUBLISHABLE. See collectSyncContent.
+ */
+async function flushSyncNote(reason: string): Promise<void> {
+	if (!syncNoteWritePending) return;
+	const noteId = cfg.syncNoteId;
+	if (!noteId) {
+		syncNoteWritePending = false;
+		return;
+	}
+	if (!syncNoteInitialized) return;
+	if (editorOpen) return;
+
+	let content: SyncContent | null = null;
+	try {
+		content = await collectSyncContent();
+	} catch (error) {
+		// eslint-disable-next-line no-console
+		console.warn(`[harper] sync note (${reason}): could not read local state:`, error);
+		return;
+	}
+	if (!content) return;
+
+	const key = syncContentKey(content);
+	if (key === lastSyncContentKey) {
+		// Nothing to say: this is exactly what we last wrote or last applied.
+		syncNoteWritePending = false;
+		return;
+	}
+	// The note id is re-read immediately before the write rather than trusted from the top of this
+	// function: everything above is awaited, and a repoint landing in any of it would send this
+	// device's state to whatever note the user has just pointed at instead.
+	if (cfg.syncNoteId !== noteId) return;
+	try {
+		await joplin.data.put(['notes', noteId], null, {
+			body: buildSyncNoteBody(content, new Date().toISOString()),
+		});
+	} catch (error) {
+		// Not synced yet, deleted, or a bad id. Keep the write pending and try again next time.
+		// eslint-disable-next-line no-console
+		console.warn(`[harper] sync note (${reason}): could not write note ${noteId}:`, error);
+		return;
+	}
+	lastSyncContentKey = key;
+	syncNoteWritePending = false;
+	try {
+		const after = await joplin.data.get(['notes', noteId], { fields: ['updated_time'] });
+		lastSyncNoteUpdatedTime = (after && after.updated_time) || lastSyncNoteUpdatedTime;
+	} catch {
+		/* best-effort updated_time refresh */
+	}
+	// eslint-disable-next-line no-console
+	console.info(`[harper] sync note (${reason}): wrote ${content.words.length} words`);
+}
+
+/**
+ * Read the note and, if it says something new, apply it wholesale.
+ *
+ * The remembered content key is set BEFORE the apply, deliberately: applying writes settings, which
+ * schedules a write, and that write must already see itself as redundant. If the apply then throws,
+ * the key is cleared again so the next read retries rather than silently believing it succeeded.
+ */
+async function refreshFromSyncNote(reason: string): Promise<void> {
+	const noteId = cfg.syncNoteId;
+	if (!noteId) {
+		syncNoteInitialized = true; // nothing to read; writes are irrelevant while the feature is off
+		return;
+	}
+	let body = '';
+	try {
+		const note = await joplin.data.get(['notes', noteId], { fields: ['body', 'updated_time'] });
+		body = (note && note.body) || '';
+		lastSyncNoteUpdatedTime = (note && note.updated_time) || null;
+	} catch {
+		// The note is not readable yet (not synced, or a bad id). Nothing to apply, and — because
+		// `syncNoteInitialized` stays false — nothing may be written over it either.
+		return;
+	}
+	syncNoteInitialized = true;
+
+	const payload = parseSyncNoteBody(body);
+	if (!payload) {
+		if (!warnedSyncNoteUnparseable) {
+			warnedSyncNoteUnparseable = true;
+			// eslint-disable-next-line no-console
+			console.warn(
+				`[harper] sync note ${noteId} could not be read as Harper sync state; ` +
+					'working from local settings until it is rewritten.',
+			);
+		}
+		// Forget what we thought was in it, so the next local change rewrites the note wholesale.
+		lastSyncContentKey = null;
+		return;
+	}
+	warnedSyncNoteUnparseable = false;
+
+	const key = syncContentKey(payload);
+	if (key === lastSyncContentKey) return; // our own write, or something already applied
+	lastSyncContentKey = key;
+	try {
+		await applySyncPayload(payload, reason);
+	} catch (error) {
+		lastSyncContentKey = null; // the apply is incomplete; do not pretend we are in sync
+		// eslint-disable-next-line no-console
+		console.warn(`[harper] sync note (${reason}): could not apply the note's state:`, error);
+	}
+}
+
+/**
+ * Replace this device's synced state with the note's. Three replacements, no merging.
+ *
+ * RULES go to the setting and to the live engine, exactly as every other rule-writing path does.
+ * DISMISSED FINDINGS are rebuilt from harper's own exported payload, carried verbatim: the engine's
+ * ignore set is cleared and re-imported from it, the persisted mirror becomes those same bytes, and
+ * the readable side table is replaced from the entries. All three under ONE dismissal transaction,
+ * because they are the three halves of one piece of state (see src/dismissedLog.ts).
+ * WORDS go through `applyWordEdits` — the existing local machinery — so the engine import, the
+ * desktop external-file mirror and the pending buffers all behave exactly as they do for a hand
+ * edit. Nothing about the word path is re-implemented here.
+ */
+async function applySyncPayload(payload: SyncContent, reason: string): Promise<void> {
+	// Resolved BEFORE the dismissal transaction below: getLinter() runs applyConfiguration, which
+	// takes that same lock to re-hydrate the ignore state (see withDismissalTransaction).
+	const linter = await getLinter();
+
+	// --- RULES ------------------------------------------------------------------------------
+	const overrides = payload.ruleOverrides;
+	const overrideKeys = Object.keys(overrides);
+	// '' rather than '{}' for an empty map: the setting's pristine default, and what every other
+	// writer of this key stores.
+	await joplin.settings.setValue('ruleOverrides', overrideKeys.length ? JSON.stringify(overrides) : '');
+	await linter.setLintConfig(overrides);
+
+	// --- DISMISSED FINDINGS -----------------------------------------------------------------
+	await withDismissalTransaction(dismissedStore, async () => {
+		await linter.clearIgnoredLints();
+		const raw = payload.dismissed.ignoredLintsRaw;
+		if (raw && raw.trim()) {
+			try {
+				// UNTOUCHED. This string came out of another device's exportIgnoredLints() and crossed
+				// the note as a JSON string, so its u64s are still the exact digits harper wrote.
+				await linter.importIgnoredLints(raw);
+			} catch {
+				// A payload this engine will not take is not a reason to abandon the rest of the apply;
+				// the side table below still names what the other device dismissed.
+				// eslint-disable-next-line no-console
+				console.warn('[harper] sync note: the ignored-lints payload was rejected by the engine');
+			}
+		}
+		await saveIgnoredLintsJson(raw);
+		await saveDismissed(dismissedStore, toDismissedEntries(payload.dismissed.entries));
+	});
+
+	// --- WORDS ------------------------------------------------------------------------------
+	const current = await reconcileDictionary('sync-note-apply');
+	const before = new Set(current);
+	const after = new Set(payload.words);
+	const adds = payload.words.filter((word) => !before.has(word));
+	const removes = current.filter((word) => !after.has(word));
+	if (adds.length || removes.length) await applyWordEdits(adds, removes);
+
+	await pokeForceLint();
+	// eslint-disable-next-line no-console
+	console.info(
+		`[harper] sync note (${reason}): applied ${overrideKeys.length} rule overrides, ` +
+			`${payload.dismissed.entries.length} dismissals, +${adds.length} -${removes.length} words`,
+	);
+}
+
+/**
+ * The command's note: created seeded from this device's current state, so turning sync on never
+ * starts from empty. Idempotent — an existing, readable sync note is kept.
+ */
+async function createSyncNote(): Promise<void> {
+	if (cfg.syncNoteId) {
+		try {
+			await joplin.data.get(['notes', cfg.syncNoteId], { fields: ['id'] });
+			return; // already have a live sync note
+		} catch {
+			/* stale id — fall through and create a fresh one */
+		}
+	}
+	const folderId = await pickFolderForPluginNote();
+	// FRESH: whatever the user just did (a rule toggle, an add-to-dictionary) must be in the seed.
+	const content = await syncContentFor((await reconcileFreshResult('create-sync-note')).words);
+	const note = await joplin.data.post(['notes'], null, {
+		title: SYNC_NOTE_TITLE,
+		body: buildSyncNoteBody(content, new Date().toISOString()),
+		parent_id: folderId,
+	});
+	// The note holds exactly this device's state, so there is nothing to apply and nothing to write.
+	// Recorded BEFORE the setting write, whose onChange runs the reconfigure that would otherwise
+	// schedule an immediate, pointless rewrite of the note we have just built.
+	lastSyncContentKey = syncContentKey(content);
+	syncNoteInitialized = true;
+	warnedSyncNoteUnparseable = false;
+	await joplin.settings.setValue(SYNC_NOTE_ID_KEY, note.id);
+}
+
+// =============================================================================
+// THE ZED BRIDGE (v1.5.0) — a harper-ls settings block beside the dictionary file.
+// =============================================================================
+// Entirely SEPARATE from the sync note: it is a one-way projection of this device's rules and
+// dialect onto a file another editor reads, not a sync channel. See src/zedExport.ts for the shape
+// and for why `statsPath` is never emitted.
+
+/** `<path>\n<content>` of the last export written, so an unchanged regeneration costs no fs calls. */
+let lastZedExportKey = '';
+
+/**
+ * DESKTOP: write `zed-harper-ls.json` next to the configured dictionary file.
+ *
+ * Atomic (temp sibling, fsync, rename) like the dictionary rewrite, but with NO mtime check: this
+ * file is a pure projection of the plugin's own settings, so the worst a concurrent writer can cost
+ * is a regenerated copy of state the plugin still holds — unlike the dictionary, where rclone and
+ * harper-ls write real words we must not clobber.
+ */
+function writeZedExport(dictPath: string, overrides: LintConfig, defaults: LintConfig): void {
+	if (isMobile()) return;
+	// Expanded like every other consumer of the setting: `~/dict.txt` must put the export beside the
+	// real file, not create a literal `~` directory next to the profile.
+	const target = zedExportPath(expandTilde(dictPath));
+	if (!target) return;
+	const content = buildZedSettingsFile({
+		overrides: overrides as Record<string, boolean>,
+		defaults: defaults as Record<string, boolean>,
+		dialect: cfg.dialect,
+	});
+	const key = `${target}\n${content}`;
+	if (key === lastZedExportKey) return;
+
+	const fs = getFs();
+	try {
+		if (fs.existsSync(target) && fs.readFileSync(target, 'utf8') === content) {
+			lastZedExportKey = key;
+			return;
+		}
+	} catch {
+		/* unreadable is not a reason to skip the write — fall through and rewrite it */
+	}
+
+	const tmp = tempSiblingPath(target);
+	try {
+		fs.writeFileSync(tmp, content, 'utf8');
+		try {
+			const fd = fs.openSync(tmp, 'r+');
+			try {
+				fs.fsyncSync(fd);
+			} finally {
+				fs.closeSync(fd);
+			}
+		} catch {
+			/* best effort, exactly as the dictionary rewrite treats it */
+		}
+		fs.renameSync(tmp, target);
+		lastZedExportKey = key;
+	} catch (error) {
+		try {
+			fs.removeSync(tmp);
+		} catch {
+			/* ignore */
+		}
+		// eslint-disable-next-line no-console
+		console.warn(`[harper] could not write the Zed settings export: ${target}`, error);
+	}
+}
+
+/** harper's concrete default for every rule — the reference `sparseLinters` trims against. */
+async function lintDefaults(): Promise<LintConfig> {
+	try {
+		return await (await getLinter()).getDefaultLintConfig();
+	} catch {
+		return {};
+	}
+}
+
+/** Regenerate the export. Called whenever rule overrides, the dialect or the dictionary path move. */
+async function refreshZedExport(): Promise<void> {
+	if (isMobile() || !cfg.dictionaryPath) return;
+	try {
+		writeZedExport(cfg.dictionaryPath, parseRuleOverrides(), await lintDefaults());
+	} catch (error) {
+		// eslint-disable-next-line no-console
+		console.warn('[harper] could not refresh the Zed settings export:', error);
+	}
+}
+
+/**
+ * The same block, as text for the dialog's "Copy Zed settings block" button.
+ *
+ * Offered on BOTH platforms and regardless of whether a dictionary path is set: this is text on a
+ * screen, not a second sync channel, and a user reading their rules on a phone may perfectly well
+ * want to paste them into a laptop later. Only the FILE is gated.
+ */
+async function zedSettingsBlock(): Promise<{ text: string; filePath: string }> {
+	const text = buildZedSettingsBlock({
+		overrides: parseRuleOverrides() as Record<string, boolean>,
+		defaults: (await lintDefaults()) as Record<string, boolean>,
+		dialect: cfg.dialect,
+	});
+	const filePath = isMobile() || !cfg.dictionaryPath ? '' : zedExportPath(expandTilde(cfg.dictionaryPath));
+	return { text, filePath };
+}
+
 const settingsService: SettingsService = createSettingsService({
 	getLinter,
 	pokeForceLint,
@@ -1733,6 +2199,20 @@ const settingsService: SettingsService = createSettingsService({
 	getEffectiveWords: () => reconcileDictionary('settings-snapshot'),
 	applyWordEdits,
 	dialectNames: Object.keys(DIALECT_BY_NAME),
+	getZedSettingsBlock: async ({ copy }) => {
+		const block = await zedSettingsBlock();
+		let copied = false;
+		if (copy) {
+			try {
+				await joplin.clipboard.writeText(block.text);
+				copied = true;
+			} catch {
+				// Mobile has no clipboard in the plugin surface. The dialog falls back to showing the
+				// block in a selectable box, which is why `text` is returned either way.
+			}
+		}
+		return { ...block, copied };
+	},
 });
 
 async function disableRule(ruleName: string): Promise<void> {
@@ -1879,8 +2359,30 @@ async function registerSettingsDialogCommand(): Promise<void> {
 }
 
 // -----------------------------------------------------------------------------
-// Create-dictionary-note command (both platforms).
+// Create-note commands (both platforms).
 // -----------------------------------------------------------------------------
+/**
+ * Where a note this plugin creates should go: the selected notebook, else the first one, else a new
+ * "Harper" notebook. Shared by both create-note commands so they cannot drift.
+ */
+async function pickFolderForPluginNote(): Promise<string> {
+	try {
+		const selected = await joplin.workspace.selectedFolder();
+		if (selected && selected.id) return selected.id;
+	} catch {
+		/* no selected folder */
+	}
+	try {
+		const folders = await joplin.data.get(['folders']);
+		const items: Array<{ id: string }> = (folders && folders.items) || [];
+		if (items.length) return items[0].id;
+	} catch {
+		/* ignore */
+	}
+	const folder = await joplin.data.post(['folders'], null, { title: 'Harper' });
+	return folder.id;
+}
+
 async function createDictionaryNote(): Promise<void> {
 	// Reuse an existing configured note if it is still readable, so the command is idempotent.
 	if (cfg.dictionaryNoteId) {
@@ -1891,27 +2393,7 @@ async function createDictionaryNote(): Promise<void> {
 			/* stale id — fall through and create a fresh one */
 		}
 	}
-	// Place it in the currently selected folder if we can, else the first folder, else create one.
-	let folderId = '';
-	try {
-		const selected = await joplin.workspace.selectedFolder();
-		if (selected && selected.id) folderId = selected.id;
-	} catch {
-		/* no selected folder */
-	}
-	if (!folderId) {
-		try {
-			const folders = await joplin.data.get(['folders']);
-			const items: Array<{ id: string }> = (folders && folders.items) || [];
-			if (items.length) folderId = items[0].id;
-		} catch {
-			/* ignore */
-		}
-	}
-	if (!folderId) {
-		const folder = await joplin.data.post(['folders'], null, { title: 'Harper' });
-		folderId = folder.id;
-	}
+	const folderId = await pickFolderForPluginNote();
 	// Seed with any words already known to the linter session (pending buffer) so nothing is lost.
 	const seed = await readPendingWords();
 	const body = canonicalDictionaryBody(seed);
@@ -1949,10 +2431,17 @@ function pollDictionaryTick(): void {
 	}
 
 	void (async () => {
+		// THE SYNC NOTE FIRST, and in this order: drain any write this device still owes (a local
+		// change deferred by the L3 editor gate), then read, so we never apply a remote body over
+		// local changes that have not been published yet. Both are no-ops when the feature is off.
+		await flushSyncNote('poll');
+		await refreshFromSyncNote('poll');
+
+		const dictNoteId = activeDictionaryNoteId();
 		let noteMoved = false;
-		if (cfg.dictionaryNoteId) {
+		if (dictNoteId) {
 			try {
-				const note = await joplin.data.get(['notes', cfg.dictionaryNoteId], {
+				const note = await joplin.data.get(['notes', dictNoteId], {
 					fields: ['updated_time'],
 				});
 				const ut = (note && note.updated_time) || null;
@@ -2207,7 +2696,23 @@ async function registerSettings(): Promise<void> {
 			description:
 				'The id of a Joplin note used as your Harper dictionary (one word per line). It syncs ' +
 				'across all your devices. Use the "Harper: Create dictionary note" command to make one, ' +
-				'or paste an existing note id here. Leave empty to disable the dictionary note.',
+				'or paste an existing note id here. Leave empty to disable the dictionary note. ' +
+				'The sync note supersedes this note, so when a sync note is set this note is left alone.',
+			storage: SettingStorage.File,
+		},
+		// v1.5.0: the sync note. Registered alongside the others, and PUBLIC on the same terms, so a
+		// user can paste an id from another device without going through the command.
+		[SYNC_NOTE_ID_KEY]: {
+			value: '',
+			type: SettingItemType.String,
+			public: basicPublic,
+			section: SECTION,
+			label: 'Sync note id',
+			description:
+				'The id of a Joplin note that Harper uses to sync your rules, your dictionary and your ' +
+				'dismissed findings between devices. The note holds machine-readable data, so do not ' +
+				'edit it by hand. Use the "Harper: Create sync note" command to make one, or paste an ' +
+				'existing note id here. Leave empty to turn the sync off.',
 			storage: SettingStorage.File,
 		},
 		ruleOverrides: {
@@ -2324,6 +2829,14 @@ async function warmUpEngine(): Promise<void> {
 		console.warn('[harper] background engine warm-up failed:', error);
 		return;
 	}
+	// THE MAILBOX IS READ BEFORE ANYTHING IS WRITTEN TO IT. A change another device made while this
+	// one was closed arrives here, and — just as important — `flushSyncNote` refuses to write until
+	// this has succeeded, so a freshly-installed device cannot broadcast its empty state over
+	// everyone else's settings.
+	await refreshFromSyncNote('plugin-start');
+	// The Zed export exists from the first run rather than only after the next rule change, so a user
+	// who configures a dictionary path and points their editor at the sibling file finds it there.
+	await refreshZedExport();
 	// Reconcile: if the dictionary words finished importing only now, poke any open editor to re-lint so
 	// late-arriving words clear their underlines. A no-op when no editor is open.
 	await pokeForceLint();
@@ -2368,6 +2881,15 @@ joplin.plugins.register({
 			label: 'Harper: Create dictionary note',
 			execute: async () => {
 				await createDictionaryNote();
+			},
+		});
+
+		// v1.5.0: the sync note (both platforms; appears in the command palette).
+		await joplin.commands.register({
+			name: 'harper.createSyncNote',
+			label: 'Harper: Create sync note',
+			execute: async () => {
+				await createSyncNote();
 			},
 		});
 
@@ -2426,11 +2948,25 @@ joplin.plugins.register({
 			// in flight across it is still computing the right answer from the right sources. Its own
 			// hazards have their own guards — `importedWordsKey = null` forces the word re-import, and
 			// INV-B keeps the ignore-set rebuild inside the dismissal transaction.
+			//
+			// `syncNoteId` belongs here too, and for the same reason: turning the sync on or off makes
+			// the DICTIONARY NOTE SIDE appear or disappear (see activeDictionaryNoteId), which is a
+			// repoint of that side in every sense the epoch cares about.
+			const syncNoteIdBefore = cfg.syncNoteId;
 			const movesDictionaryIdentity =
 				external.includes('dictionaryNoteId') ||
+				external.includes(SYNC_NOTE_ID_KEY) ||
 				(!isMobile() && external.includes('dictionaryPath'));
 			const applySettingsChange = async () => {
 				await loadSettings();
+				if (external.includes(SYNC_NOTE_ID_KEY) && cfg.syncNoteId !== syncNoteIdBefore) {
+					// A different mailbox knows nothing about the old one: forget what we believed was in
+					// it, forget that we had read it, and let the next refresh establish the truth.
+					lastSyncNoteUpdatedTime = null;
+					lastSyncContentKey = null;
+					syncNoteInitialized = false;
+					warnedSyncNoteUnparseable = false;
+				}
 				if (!isMobile() && (cfg.dictionaryPath === '' || external.includes('dictionaryPath'))) {
 					// A changed path invalidates the cached mtime / missing-file warning.
 					lastExternalMtimeMs = null;
@@ -2446,6 +2982,7 @@ joplin.plugins.register({
 				// delete nothing.
 				if (
 					(external.includes('dictionaryNoteId') && cfg.dictionaryNoteId !== noteIdBefore) ||
+					(external.includes(SYNC_NOTE_ID_KEY) && cfg.syncNoteId !== syncNoteIdBefore) ||
 					(!isMobile() && external.includes('dictionaryPath') && cfg.dictionaryPath !== pathBefore)
 				) {
 					await resetSyncBase();
@@ -2487,6 +3024,21 @@ joplin.plugins.register({
 				// merged and persisted rather than waiting for the first lint.
 				await reconcileFresh('settings-change'); // same freshness contract as the branch above
 			}
+			// THE ZED BRIDGE regenerates on exactly the three keys it is a projection of. Fire-and-
+			// forget: a file another editor reads is a convenience, and failing to write it must never
+			// hold up (or fail) the settings change the user actually made.
+			if (
+				external.includes('ruleOverrides') ||
+				external.includes('dialect') ||
+				external.includes('dictionaryPath')
+			) {
+				void refreshZedExport();
+			}
+			// A repointed sync note is read (and applied) right away rather than at the next poll: the
+			// user has just told us where their settings live, and waiting 60 s to look would be odd.
+			if (external.includes(SYNC_NOTE_ID_KEY) && cfg.syncNoteId !== syncNoteIdBefore) {
+				void refreshFromSyncNote('settings-change');
+			}
 			await pokeForceLint();
 		});
 
@@ -2498,6 +3050,11 @@ joplin.plugins.register({
 			await joplin.workspace.onNoteSelectionChange(async () => {
 				editorOpen = false;
 				await reconcileAndApply('note-selection-change');
+				// The sync note's own drain point: `editorOpen` is now false, so a write the L3 gate
+				// deferred can finally land, and a body another device wrote can be applied. Same order
+				// as the poll: publish what we owe, then read.
+				await flushSyncNote('note-selection-change');
+				await refreshFromSyncNote('note-selection-change');
 			});
 		} catch {
 			// Older API without onNoteSelectionChange — the start reconcile + poll still persist words.

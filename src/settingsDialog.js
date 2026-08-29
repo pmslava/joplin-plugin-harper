@@ -132,6 +132,9 @@
 		dictionaryBaseline: [],
 		dictionaryText: '',
 		dismissed: { entries: [], legacyCount: 0 },
+		// v1.5.0: the one-line sync notice, or ''. Rendered above the tabs (see render), because a
+		// stale sync setup is a property of the window and not of any one tab.
+		syncNotice: '',
 		search: '',
 		tab: 'general',
 		expandedGroups: Object.create(null), // group id -> true
@@ -992,6 +995,43 @@
 
 	var searchTimer = null;
 
+	/**
+	 * Show the block, always, whether or not the clipboard worked.
+	 *
+	 * A "Copied!" toast the user has to trust is worse than the text itself: a webview cannot reach
+	 * the clipboard on either platform, so the copy happens in the plugin and may quietly not be
+	 * available. Rendering the block means the button is useful even then, and it doubles as the
+	 * answer to "what exactly did it copy?".
+	 */
+	function showZedBlock(reply) {
+		var box = document.getElementById('hs-zed');
+		if (!box) return;
+		clear(box);
+		if (reply.filePath) {
+			box.appendChild(
+				el(
+					'p',
+					'hs-help',
+					'Harper also keeps this block in a file next to your dictionary, at ' + reply.filePath + '.',
+				),
+			);
+		}
+		var area = el('textarea', 'hs-textarea hs-zed-text');
+		area.id = 'hs-zed-text';
+		area.readOnly = true;
+		area.rows = 12;
+		// value, never innerHTML — the content is the plugin's own JSON, but the rule is about the
+		// channel, not about who happens to be on the other end today.
+		area.value = reply.text || '';
+		box.appendChild(area);
+		try {
+			area.focus();
+			area.select();
+		} catch (error) {
+			/* selecting is a convenience; a host that refuses it still shows the text */
+		}
+	}
+
 	function renderRulesSection(root) {
 		var section = el('div', 'hs-section');
 		section.appendChild(
@@ -1049,7 +1089,38 @@
 			);
 		});
 		toolbar.appendChild(disableAll);
+
+		// THE ZED BRIDGE (v1.5.0). The same rules, as a block a user pastes into another editor's
+		// settings. Always offered: it is text, not a second sync channel, and a user reading their
+		// rules on a phone may perfectly well want to paste them into a laptop later.
+		var zed = el('button', 'hs-button', 'Copy Zed settings block');
+		zed.type = 'button';
+		zed.id = 'hs-copy-zed';
+		zed.addEventListener('click', function () {
+			setRulesStatus('Building the block…');
+			send({ type: 'settings:zedBlock', copy: true })
+				.then(function (reply) {
+					if (!reply) {
+						setRulesStatus('The Zed settings block is not available on this device.', true);
+						return;
+					}
+					showZedBlock(reply);
+					setRulesStatus(
+						reply.copied
+							? 'Copied. Paste it into Zed\'s settings.json.'
+							: 'Select the block below and copy it into Zed\'s settings.json.',
+					);
+				})
+				.catch(function (error) {
+					setRulesStatus('Could not build the block: ' + errorText(error), true);
+				});
+		});
+		toolbar.appendChild(zed);
 		section.appendChild(toolbar);
+
+		var zedBox = el('div', 'hs-zed');
+		zedBox.id = 'hs-zed';
+		section.appendChild(zedBox);
 
 		var summary = el('div', 'hs-summary');
 		summary.id = 'hs-rules-summary';
@@ -1432,6 +1503,14 @@
 		head.appendChild(el('h1', 'hs-title', 'Harper settings'));
 		scroll.appendChild(head);
 
+		// THE SYNC NOTICE. Plain text, above the tabs, no buttons and no dismissal: it states a fact
+		// and names the command that resolves it. NEVER a popup — see SYNC_UPGRADE_NOTICE.
+		if (state.syncNotice) {
+			var notice = el('div', 'hs-notice', state.syncNotice);
+			notice.id = 'hs-sync-notice';
+			scroll.appendChild(notice);
+		}
+
 		var tabs = el('div', 'hs-tabs');
 		tabs.id = 'hs-tabs';
 		for (var i = 0; i < TABS.length; i++) {
@@ -1523,6 +1602,7 @@
 				// draft and baseline are all seeded from it together.
 				seedDictionary(snapshot.dictionaryWords || []);
 				state.dismissed = snapshot.dismissed || { entries: [], legacyCount: 0 };
+				state.syncNotice = snapshot.syncNotice || '';
 				state.loaded = true;
 				render();
 				ensureDescriptions();
