@@ -22,20 +22,6 @@ import {
 // .jpl grows to ~21 MB. Device-proven in mobile-spike/ (init ~1.5 s, lint ~37 ms). See L1/L2 + verdict.
 import { slimBinaryInlined } from 'harper.js/slimBinaryInlined';
 import { resolvePlatform, isMobile } from './platform';
-
-// TEMPORARY attach-tracing (investigation only): console AND a durable window buffer, because the
-// harness can only attach a console listener after Joplin is already up.
-function mainTrace(line: string): void {
-	// eslint-disable-next-line no-console
-	console.log('[harper-trace][main]', line);
-	try {
-		const w = window as unknown as { __harperTraceMain?: string[] };
-		if (!w.__harperTraceMain) w.__harperTraceMain = [];
-		if (w.__harperTraceMain.length < 500) w.__harperTraceMain.push(`${Date.now()} [main] ${line}`);
-	} catch {
-		/* no window */
-	}
-}
 import { mergeDictionary } from './dictionaryMerge';
 import {
 	DismissedEntry,
@@ -2438,7 +2424,6 @@ function pollDictionaryTick(): void {
 // Message handler.
 // -----------------------------------------------------------------------------
 async function handleMessage(message: IncomingMessage | unknown): Promise<unknown> {
-	mainTrace(`handleMessage ${JSON.stringify((message as { type?: unknown })?.type ?? null)}`);
 	if (!message || typeof message !== 'object') return null;
 	// SETTINGS-SERVICE CHANNEL (Phase 1). The 'settings:*' namespace is the whole surface the Phase-2
 	// settings dialog drives. It is answered here as well as (eventually) on the dialog's own
@@ -2453,7 +2438,6 @@ async function handleMessage(message: IncomingMessage | unknown): Promise<unknow
 		case 'getConfig': {
 			// A content-script handshake means an editor is open (L3 tracking).
 			editorOpen = true;
-			mainTrace('getConfig: reading settings');
 			const enabled = await joplin.settings.value('enabled');
 			const debounceMs = await joplin.settings.value('debounceMs');
 			// Read live (not from `cfg`) exactly like the other two, so the value the content script
@@ -2463,10 +2447,7 @@ async function handleMessage(message: IncomingMessage | unknown): Promise<unknow
 			return {
 				enabled: enabled !== false,
 				debounceMs: typeof debounceMs === 'number' ? debounceMs : 500,
-				underlineStyle: (() => {
-					mainTrace('getConfig: replying');
-					return underlineStyle === 'solid' ? 'solid' : 'squiggly';
-				})(),
+				underlineStyle: underlineStyle === 'solid' ? 'solid' : 'squiggly',
 				// The content script sizes its tap targets off this (>=44 px on mobile).
 				platform: isMobile() ? 'mobile' : 'desktop',
 				// The multi-window refresh dedupe token: the content script records which generation a
@@ -2884,15 +2865,12 @@ joplin.plugins.register({
 		await registerSettings();
 		await loadSettings();
 
-		mainTrace('registering content script');
 		await joplin.contentScripts.register(
 			ContentScriptType.CodeMirrorPlugin,
 			CONTENT_SCRIPT_ID,
 			'./contentScript.js',
 		);
-		mainTrace('content script registered; wiring onMessage');
 		await joplin.contentScripts.onMessage(CONTENT_SCRIPT_ID, handleMessage);
-		mainTrace('onMessage wired');
 
 		// v1.5.0: the sync note (both platforms; appears in the command palette). This REPLACED
 		// "Harper: Create dictionary note", which is gone along with the note it made.

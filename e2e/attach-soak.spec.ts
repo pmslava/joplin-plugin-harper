@@ -40,7 +40,16 @@ function captureTraces(instance: JoplinInstance, sink: string[]): void {
   const wire = (page: import('@playwright/test').Page): void => {
     page.on('console', (msg) => {
       const text = msg.text();
-      if (text.includes('[harper')) sink.push(`${Date.now()} ${shortUrl(page.url())} ${text}`);
+      // Ours, plus the three lines Joplin itself prints when it DROPS a plugin message instead of
+      // answering it (PostMessageService.sendResponse, the plugin webview's ipcRenderer handler, and
+      // ElectronAppWrapper's 'pluginMessage' route), plus the loader's own "Loading plugin" line —
+      // whose ABSENCE is what a content script that was never loaded at all looks like.
+      const interesting =
+        text.includes('[harper') ||
+        /Loading plugin|no matching event handler|no responder was found|non-existing plugin window|ERR_/i.test(
+          text,
+        );
+      if (interesting) sink.push(`${Date.now()} ${shortUrl(page.url())} ${text}`);
     });
     page.on('pageerror', (err) => sink.push(`${Date.now()} ${shortUrl(page.url())} PAGEERROR ${err.message}`));
   };
@@ -67,8 +76,8 @@ async function readDurableTraces(instance: JoplinInstance): Promise<string[]> {
       if (p.isClosed()) continue;
       const lines = await p
         .evaluate(() => {
-          const w = window as unknown as { __harperTrace?: string[]; __harperTraceMain?: string[] };
-          return [...(w.__harperTrace ?? []), ...(w.__harperTraceMain ?? [])];
+          const w = window as unknown as { __harperTrace?: string[] };
+          return [...(w.__harperTrace ?? [])];
         })
         .catch(() => [] as string[]);
       out.push(...lines);
