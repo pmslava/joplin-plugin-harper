@@ -1809,6 +1809,34 @@ let syncNoteWriteTimer: ReturnType<typeof setTimeout> | null = null;
 let lastSyncNoteUpdatedTime: number | null = null;
 let warnedSyncNoteUnparseable = false;
 
+/**
+ * ONE SYNC-NOTE OPERATION AT A TIME.
+ *
+ * Reading and writing the mailbox are both read-modify-write over `lastSyncContentKey`, and they
+ * straddle real suspension points (a `data.get`, a `data.put`, a whole reconcile pass). Nothing
+ * upstream serializes them, and the overlap is the ordinary case rather than an exotic one: the
+ * startup refresh awaits the engine build, and a user who clicks a note during those two seconds
+ * fires the selection-change refresh straight into it. Both read a null key, both decide the note
+ * says something new, and the payload is applied twice — two reconciles and two engine imports for
+ * one piece of news.
+ *
+ * The apply is idempotent, so this was never corruption; the gate is here because "twice on every
+ * cold start" is exactly the kind of accident that stops being idempotent the first time someone
+ * adds a non-idempotent step to it.
+ *
+ * `.then(fn, fn)`, not `.then(fn)`: a rejected predecessor must not SKIP the next operation, which
+ * would silently wedge the sync for the rest of the session. The stored chain is kept un-rejected
+ * for the same reason. Nothing inside a flush or a refresh re-enters this gate, so it cannot
+ * deadlock on itself.
+ */
+let syncNoteChain: Promise<unknown> = Promise.resolve();
+
+function withSyncNote<T>(fn: () => Promise<T>): Promise<T> {
+	const next = syncNoteChain.then(fn, fn);
+	syncNoteChain = next.catch(() => undefined);
+	return next;
+}
+
 /** The dismissed side table in the note's field names. */
 function toSyncEntries(entries: readonly DismissedEntry[]): SyncContent['dismissed']['entries'] {
 	return entries.map((entry) => ({
@@ -1886,7 +1914,11 @@ function scheduleSyncNoteWrite(): void {
  *      obeyed (a plugin note write evicts the mobile editor), and for exactly the same reason.
  *   3. THE WORD LIST MUST BE PUBLISHABLE. See collectSyncContent.
  */
-async function flushSyncNote(reason: string): Promise<void> {
+function flushSyncNote(reason: string): Promise<void> {
+	return withSyncNote(() => flushSyncNoteLocked(reason));
+}
+
+async function flushSyncNoteLocked(reason: string): Promise<void> {
 	if (!syncNoteWritePending) return;
 	const noteId = cfg.syncNoteId;
 	if (!noteId) {
@@ -1945,7 +1977,11 @@ async function flushSyncNote(reason: string): Promise<void> {
  * schedules a write, and that write must already see itself as redundant. If the apply then throws,
  * the key is cleared again so the next read retries rather than silently believing it succeeded.
  */
-async function refreshFromSyncNote(reason: string): Promise<void> {
+function refreshFromSyncNote(reason: string): Promise<void> {
+	return withSyncNote(() => refreshFromSyncNoteLocked(reason));
+}
+
+async function refreshFromSyncNoteLocked(reason: string): Promise<void> {
 	const noteId = cfg.syncNoteId;
 	if (!noteId) {
 		syncNoteInitialized = true; // nothing to read; writes are irrelevant while the feature is off
@@ -2073,12 +2109,12 @@ async function createSyncNote(): Promise<void> {
 		body: buildSyncNoteBody(content, new Date().toISOString()),
 		parent_id: folderId,
 	});
-	// The note holds exactly this device's state, so there is nothing to apply and nothing to write.
-	// Recorded BEFORE the setting write, whose onChange runs the reconfigure that would otherwise
-	// schedule an immediate, pointless rewrite of the note we have just built.
-	lastSyncContentKey = syncContentKey(content);
-	syncNoteInitialized = true;
-	warnedSyncNoteUnparseable = false;
+	// The remembered key is deliberately NOT set here. Pointing the setting at a new note is a
+	// repoint like any other, and the onChange handler answers a repoint by forgetting everything it
+	// believed about the old mailbox and reading the new one — which would undo an assignment made
+	// here anyway. So the read path establishes the truth, exactly as it does on every other device.
+	// It costs one redundant apply of the state we have just written, and that apply is a no-op in
+	// every one of its three halves.
 	await joplin.settings.setValue(SYNC_NOTE_ID_KEY, note.id);
 }
 

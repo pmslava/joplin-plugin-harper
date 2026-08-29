@@ -5601,6 +5601,30 @@ async function main() {
 			assert.ok(putsAfterApply >= putsBefore, 'sanity: the counter only moves forward');
 		});
 
+		await test('sync note: two overlapping reads apply the note ONCE, not once each', async () => {
+			// THE COLD-START OVERLAP, reproduced: the startup refresh awaits the engine build, and a
+			// user who clicks a note during those two seconds fires the selection-change refresh
+			// straight into it. Both would read a null key, both would decide the note says something
+			// new, and the payload would be applied twice.
+			const noteId = sstate.settings.syncNoteId;
+			const current = parseSyncNoteBody(sstate.notes[noteId].body);
+			const remote = { ...current, ruleOverrides: { Overlaprule: false } };
+			sstate.notes[noteId].body = buildSyncNoteBody(remote, '2026-03-03T00:00:00.000Z');
+			sstate.notes[noteId].updated_time = 1500;
+
+			const writesBefore = sstate.settingWrites.filter((w) => w.key === 'ruleOverrides').length;
+			// Deliberately NOT awaited one after the other — that would be the sequential case the
+			// content key already handles.
+			await Promise.all([sstate.noteSelectionChangeHandler(), sstate.noteSelectionChangeHandler()]);
+			await drain();
+			assert.ok(
+				await waitFor(() => (sstate.settings.ruleOverrides || '').includes('Overlaprule')),
+				`the remote state was applied, got ${JSON.stringify(sstate.settings.ruleOverrides)}`,
+			);
+			const writes = sstate.settingWrites.filter((w) => w.key === 'ruleOverrides').length - writesBefore;
+			assert.strictEqual(writes, 1, `the payload was applied exactly once, saw ${writes} rule writes`);
+		});
+
 		await test('sync note: a mangled note is logged once, does not crash, and is rewritten by the next change', async () => {
 			const noteId = sstate.settings.syncNoteId;
 			sstate.notes[noteId].body = 'Someone pasted a shopping list in here.\n\n- milk\n- bread\n';

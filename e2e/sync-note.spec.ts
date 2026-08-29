@@ -58,11 +58,15 @@ function parseSyncBody(body: string): any {
  * is open evicts the mobile editor (the L3 rule the dictionary note has always obeyed), so the sync
  * note's write is deferred exactly the same way and lands on the next selection change. It is also
  * where the plugin reads the note back.
+ *
+ * It bounces through a THIRD, empty note rather than through the sync note itself: opening the sync
+ * note would put Joplin's own editor buffer over the very bytes the plugin is writing, and the
+ * spec would be racing the app's autosave instead of testing the plugin.
  */
-async function bounceNotes(win: Page, away: string, back: string): Promise<void> {
-  await openNoteFromList(win, away);
+async function bounce(win: Page): Promise<void> {
+  await openNoteFromList(win, 'Elsewhere');
   await win.waitForTimeout(1200);
-  await openNoteFromList(win, back);
+  await openNoteFromList(win, 'Scratch');
   await win.waitForTimeout(1200);
 }
 
@@ -84,6 +88,8 @@ test.describe('Harper sync note', () => {
     const { win } = joplin;
 
     await createNotebook(win, 'Harper Sync NB');
+    // A third, empty note the other tests bounce through — see `bounce`.
+    await createNote(win, 'Elsewhere');
     await createNote(win, 'Scratch');
     await expect.poll(() => editorIsPresent(win), { timeout: 20_000 }).toBe(true);
     await setEditorBody(win, `I ${PHRASE} gone.`);
@@ -124,7 +130,7 @@ test.describe('Harper sync note', () => {
     await expect.poll(() => lintRangeCountForWord(win, PHRASE), { timeout: 20_000 }).toBe(0);
 
     // The write is L3-deferred while an editor is open; leaving the note is the drain point.
-    await bounceNotes(win, 'Harper Sync', 'Scratch');
+    await bounce(win);
 
     await expect
       .poll(
@@ -153,7 +159,7 @@ test.describe('Harper sync note', () => {
     await writeNoteBodyViaApi(win, syncNoteId, remoteBody);
 
     // The plugin reads the note on a selection change (and on its 60 s poll).
-    await bounceNotes(win, 'Harper Sync', 'Scratch');
+    await bounce(win);
 
     // THE VISIBLE CONSEQUENCE: the rule is live again, so the underline is painted again. This is
     // the assertion that a settings write alone could not fake.
@@ -169,7 +175,7 @@ test.describe('Harper sync note', () => {
     // LOOP PREVENTION: applying wrote settings, which schedules a write. That write must recognise
     // itself as redundant, or the two devices rewrite the note at each other forever.
     const settled = await readNoteBodyViaApi(win, syncNoteId);
-    await bounceNotes(win, 'Harper Sync', 'Scratch');
+    await bounce(win);
     await win.waitForTimeout(6000); // longer than the write debounce
     expect(await readNoteBodyViaApi(win, syncNoteId)).toBe(settled);
   });
@@ -187,7 +193,7 @@ test.describe('Harper sync note', () => {
     await clickDismiss(win, card);
     await expect.poll(() => lintRangeCountForWord(win, PHRASE), { timeout: 20_000 }).toBe(0);
 
-    await bounceNotes(win, 'Harper Sync', 'Scratch');
+    await bounce(win);
 
     const payload = await (async () => {
       await expect

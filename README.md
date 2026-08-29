@@ -41,6 +41,9 @@ suggestion:
 - **Disable a rule.** The toggle in the card header turns off the rule that produced the finding,
   everywhere, from then on.
 - **Dialects.** Check against American, British, Australian, Canadian, or Indian English.
+- **Sync your settings between devices.** One note carries your rules, your dictionary and your
+  dismissed findings to every device through your normal Joplin sync (see
+  [Sync your settings](#sync-your-settings) below).
 - **A settings screen for everything else.** **Harper: Settings…** opens a searchable browser for all
   823 rules — each with its description shown inline — a dictionary editor, and the list of findings
   you dismissed, with a Restore button on each. Desktop and mobile (see
@@ -87,6 +90,49 @@ the plugin keeps them in sync with each other. A word added on your phone reache
 Joplin sync, then the file — and from there any external tool that reads it. Deletions travel the
 same way, in every direction.
 
+## Sync your settings
+
+The dictionary note above carries words. The **sync note** carries everything: your rule choices,
+your dictionary, and the findings you dismissed.
+
+Run the command **Harper: Create sync note** once, on any device. The plugin creates a note called
+"Harper Sync", seeds it with what that device already has, and remembers it in the **Sync note**
+setting. On your other devices, open the same note, copy its id, and paste it into their **Sync
+note** setting. From then on the plugin writes the note whenever you change something and reads it
+back on the other devices, through your normal Joplin sync.
+
+The note holds machine-readable data, so do not edit it by hand. It says so at the top.
+
+A few things are worth knowing:
+
+- **The dialect and "Ignore non-English text" do not sync.** They are per-device on purpose: you may
+  well want British on one machine and American on another.
+- **The whole note is replaced on each write, and the last write wins.** Change settings on two
+  devices at the same moment and Joplin will make a conflict copy, which you resolve yourself like
+  any other note conflict. The plugin always uses the note at the configured id and never touches
+  conflict copies.
+- **The old dictionary note keeps working.** If you have one and no sync note, nothing changes at
+  all. Once a sync note is set it takes over the word list and the old note is left alone, exactly
+  as you last saw it. The two formats are different, so there is no automatic migration: the Harper
+  window shows a one-line notice telling you to make a sync note.
+- **Nothing is written while you are typing.** Like the dictionary note, the sync note is only
+  written once you leave the note you are editing.
+
+## Use your rules in Zed
+
+`harper-ls` powers Harper in Zed, Neovim, Helix, and VS Code, and it reads its rules from that
+editor's own settings file. When you set an **External dictionary file**, the plugin keeps a
+`zed-harper-ls.json` next to it holding the matching `harper-ls` settings block, regenerated
+whenever you change a rule or the dialect. Copy the block into Zed's `settings.json` and your two
+editors agree.
+
+The Harper window also has a **Copy Zed settings block** button on the Rules tab, which gives you
+the same text without going near the file.
+
+The block lists only the rules you actually changed, so it stays short and Harper's own defaults
+keep applying to everything else. Dismissed findings are not included: `harper-ls` computes its
+ignore hashes differently, so exporting them would produce a file that silently ignores nothing.
+
 ## The settings dialog
 
 Run the command **Harper: Settings…** for the full settings screen. On desktop it is in
@@ -127,7 +173,8 @@ reflects it.
 | Setting | Default | What it does |
 | --- | --- | --- |
 | **Enable Harper grammar checking** | On | Master switch. When off, no underlines are shown. |
-| **Dictionary note** | *(empty)* | The Joplin note that holds your shared word list. Set automatically by the **Harper: Create dictionary note** command. See [Your dictionary](#your-dictionary). |
+| **Dictionary note** | *(empty)* | The Joplin note that holds your shared word list. Set automatically by the **Harper: Create dictionary note** command. See [Your dictionary](#your-dictionary). The sync note supersedes this note, so when a sync note is set this note is left alone. |
+| **Sync note** | *(empty)* | The Joplin note that syncs your rules, your dictionary and your dismissed findings between devices. Set automatically by the **Harper: Create sync note** command. See [Sync your settings](#sync-your-settings). |
 | **English dialect** | American | Which English variety Harper checks against: American, British, Australian, Canadian, or Indian. |
 | **Lint debounce (ms)** | `500` | How long the editor waits after you stop typing before re-checking, in milliseconds (0–10000). Changes apply immediately. |
 | **Underline style** | Squiggly | How findings are underlined: *Squiggly (default)* for Harper's wavy underline, or *Solid line* for a straight 2 px line with a light tint. Either way the colour is the issue type's. Changes apply immediately. |
