@@ -119,6 +119,9 @@ function makeJoplin(options) {
         // window — after the dictionary identity has flipped but before the merge base is reset, the
         // one span where cfg and syncBase genuinely disagree.
         beforeSettingRead: null,
+        // HARPER v1.5.0: every joplin.clipboard.writeText, in order.
+        clipboardWrites: [],
+        clipboardFails: false,
     }
 
     const notes = options.notes || {}
@@ -350,9 +353,24 @@ function makeJoplin(options) {
             },
             post: async (pathParts, _q, body) => {
                 state.dataPosts.push({ path: pathParts, body })
-                return Object.assign({ id: `created-${state.dataPosts.length}` }, body)
+                const created = Object.assign({ id: `created-${state.dataPosts.length}` }, body)
+                // A note real Joplin just created is READABLE immediately, and the plugin relies on
+                // that: the create-note commands persist the new id into a setting, whose onChange
+                // handler goes straight back and reads the note. Leaving it out of the map made every
+                // such read fail with "Not Found" — a state the real app never produces.
+                if (pathParts[0] === 'notes' && pathParts.length === 1) notes[created.id] = created
+                return created
             },
             delete: async (pathParts) => { state.dataDeletes.push(pathParts) },
+        },
+        // HARPER v1.5.0: the Zed block's "copy" half. Real Joplin has this on desktop only; a test can
+        // set state.clipboardFails to make writeText throw, which is what mobile looks like from here.
+        clipboard: {
+            writeText: async (text) => {
+                if (state.clipboardFails) throw new Error('no clipboard on this platform')
+                state.clipboardWrites.push(text)
+            },
+            readText: async () => state.clipboardWrites[state.clipboardWrites.length - 1] || '',
         },
     }
 

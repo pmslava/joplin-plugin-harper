@@ -5304,6 +5304,391 @@ async function main() {
 		});
 	}
 
+	// =========================================================================
+	// v1.5.0 — THE SYNC NOTE, and the Zed bridge beside it.
+	// =========================================================================
+	{
+		const syncNote = loadTsModule('src/syncNote.ts');
+		const {
+			SYNC_NOTE_SENTENCE,
+			buildSyncNoteBody,
+			parseSyncNoteBody,
+			syncContentKey,
+		} = syncNote;
+
+		// A REAL u64, above Number.MAX_SAFE_INTEGER (9007199254740991). Every assertion below that
+		// mentions it is the same assertion: nothing in this path may ever put it through a JSON
+		// number. `JSON.parse('{"h":18446744073709551615}')` yields 18446744073709552000.
+		const BIG_HASH = '18446744073709551615';
+		const RAW_IGNORES = `{"context_hashes":[${BIG_HASH},12345678901234567890,7]}`;
+
+		await test('sync note: the body carries the approved sentence and a fenced json block', () => {
+			const body = buildSyncNoteBody({ ruleOverrides: {}, dismissed: { ignoredLintsRaw: '', entries: [] }, words: [] }, '2026-01-01T00:00:00.000Z');
+			assert.ok(body.startsWith(SYNC_NOTE_SENTENCE), `the human sentence is the first thing in the body:\n${body}`);
+			assert.ok(/```json\n[\s\S]*\n```/.test(body), `the payload sits in a json fence:\n${body}`);
+			// The sentence is approved copy; a reflow into several lines would change what the user sees.
+			assert.ok(!/\n/.test(SYNC_NOTE_SENTENCE), 'the sentence is one unbroken line');
+		});
+
+		await test('sync note: u64 ignore hashes survive a full build/parse round trip as exact strings', () => {
+			const content = {
+				ruleOverrides: { SpelledNumbers: false, Spaces: true },
+				dismissed: {
+					ignoredLintsRaw: RAW_IGNORES,
+					entries: [{ hashes: [BIG_HASH, '7'], rule: 'SpelledNumbers', text: 'should of', date: '2026-01-02T03:04:05.000Z' }],
+				},
+				words: ['Zqx', 'Alpha', 'Alpha'],
+			};
+			const body = buildSyncNoteBody(content, '2026-01-01T00:00:00.000Z');
+			// The raw payload crosses as a JSON STRING, so its digits are escaped text in the body and
+			// no JSON parser ever sees them as numbers.
+			assert.ok(body.includes(JSON.stringify(RAW_IGNORES)), `ignoredLintsRaw is carried as a quoted string:\n${body}`);
+			const parsed = parseSyncNoteBody(body);
+			assert.ok(parsed, 'the note we just wrote parses back');
+			assert.strictEqual(parsed.dismissed.ignoredLintsRaw, RAW_IGNORES, 'harper\'s payload came back BYTE-IDENTICAL');
+			assert.deepStrictEqual(parsed.dismissed.entries[0].hashes, [BIG_HASH, '7'], 'entry hashes are still exact decimal strings');
+			assert.strictEqual(typeof parsed.dismissed.entries[0].hashes[0], 'string', 'and are strings, never numbers');
+			assert.deepStrictEqual(parsed.ruleOverrides, { SpelledNumbers: false, Spaces: true }, 'the rule map round-trips');
+			assert.deepStrictEqual(parsed.words, ['Alpha', 'Zqx'], 'words come back deduped and sorted');
+		});
+
+		await test('sync note: an unreadable body parses to null rather than throwing', () => {
+			for (const [label, body] of [
+				['no fence at all', 'Just some text a user typed.'],
+				['a fence with broken JSON', 'Hi\n\n```json\n{ not json\n```\n'],
+				['a fence holding an array', 'Hi\n\n```json\n[1,2,3]\n```\n'],
+				['a future schema version', 'Hi\n\n```json\n{"version":99,"words":["a"]}\n```\n'],
+				['an empty body', ''],
+			]) {
+				assert.strictEqual(parseSyncNoteBody(body), null, `${label} yields null`);
+			}
+		});
+
+		await test('sync note: the loop-prevention key ignores updatedAt and entry order, not content', () => {
+			const base = {
+				ruleOverrides: { A: false },
+				dismissed: {
+					ignoredLintsRaw: RAW_IGNORES,
+					entries: [
+						{ hashes: ['7'], rule: 'A', text: 'x', date: 'd1' },
+						{ hashes: [BIG_HASH], rule: 'B', text: 'y', date: 'd2' },
+					],
+				},
+				words: ['b', 'a'],
+			};
+			const key = syncContentKey(base);
+			// THE PING-PONG GUARD. Applying a body writes settings, which schedules a write; if the
+			// timestamp were part of the key, that write would differ from what was just applied and the
+			// two devices would rewrite the note at each other forever with the content never changing.
+			const later = parseSyncNoteBody(buildSyncNoteBody(base, '2099-12-31T23:59:59.000Z'));
+			assert.strictEqual(syncContentKey(later), key, 'a different updatedAt is the SAME content');
+			// Two devices list their dismissals newest-first in different orders; that is not a change.
+			const reordered = { ...base, dismissed: { ...base.dismissed, entries: [base.dismissed.entries[1], base.dismissed.entries[0]] } };
+			assert.strictEqual(syncContentKey(reordered), key, 'entry order is not content');
+			assert.strictEqual(syncContentKey({ ...base, words: ['a', 'b'] }), key, 'word order is not content');
+			// ...and every one of the three synced halves DOES move it.
+			assert.notStrictEqual(syncContentKey({ ...base, ruleOverrides: { A: true } }), key, 'a rule flip is a change');
+			assert.notStrictEqual(syncContentKey({ ...base, words: ['a'] }), key, 'a dropped word is a change');
+			assert.notStrictEqual(
+				syncContentKey({ ...base, dismissed: { ...base.dismissed, ignoredLintsRaw: '{"context_hashes":[7]}' } }),
+				key,
+				'a changed ignore payload is a change',
+			);
+		});
+
+		await test('zed export: sparse linters, dialect by name, and never a statsPath', () => {
+			const { buildZedSettings, sparseLinters, zedDialect } = loadTsModule('src/zedExport.ts');
+			const defaults = { KeepDefault: true, FlippedOff: true, FlippedOn: false };
+			const overrides = { KeepDefault: true, FlippedOff: false, FlippedOn: true, UnknownToThisBuild: false };
+			assert.deepStrictEqual(
+				sparseLinters(overrides, defaults),
+				{ FlippedOff: false, FlippedOn: true, UnknownToThisBuild: false },
+				'a rule explicitly set to its own default is dropped; one this build has no default for is KEPT',
+			);
+			const block = buildZedSettings({ overrides, defaults, dialect: 'British' });
+			// Zed nests harper-ls's own config root INSIDE its LSP block: the key appears twice, and
+			// getting it wrong yields a block that pastes cleanly and does nothing at all.
+			const inner = block.lsp['harper-ls'].settings['harper-ls'];
+			assert.strictEqual(inner.dialect, 'British', 'the dialect crosses by name');
+			assert.deepStrictEqual(inner.linters, { FlippedOff: false, FlippedOn: true, UnknownToThisBuild: false }, 'only the sparse map');
+			assert.ok(!JSON.stringify(block).includes('statsPath'), 'statsPath is NEVER emitted (it silently relocates harper-ls dictionaries)');
+			// An unrecognised dialect fails harper-ls's whole config parse, so it falls back instead.
+			assert.strictEqual(zedDialect('Klingon'), 'American', 'an unknown dialect degrades to American');
+		});
+
+		await test('the sync notice appears for a v1.4.x dictionary note, and goes away once a sync note is set', () => {
+			const { SYNC_UPGRADE_NOTICE, syncNoticeFor } = loadTsModule('src/settingsService.ts', (id) =>
+				id === './dismissedLog' ? loadTsModule('src/dismissedLog.ts') : require(id),
+			);
+			const base = { enabled: true, dialect: 'American', debounceMs: 500, underlineStyle: 'squiggly', ignoreNonEnglish: false };
+			assert.strictEqual(
+				syncNoticeFor({ ...base, dictionaryNoteId: 'dict-1', syncNoteId: '' }),
+				SYNC_UPGRADE_NOTICE,
+				'an old dictionary note with no sync note gets the notice',
+			);
+			assert.strictEqual(syncNoticeFor({ ...base, dictionaryNoteId: 'dict-1', syncNoteId: 'sync-1' }), null, 'a configured sync note silences it');
+			assert.strictEqual(syncNoticeFor({ ...base, dictionaryNoteId: '', syncNoteId: '' }), null, 'a user who never had a dictionary note sees nothing');
+			assert.ok(SYNC_UPGRADE_NOTICE.includes('Harper: Create sync note'), 'the notice names the command that resolves it');
+			assert.ok(!/\n|—/.test(SYNC_UPGRADE_NOTICE), 'the copy is one unbroken line with no em dashes');
+		});
+
+		// ---- the live plugin, driven end to end ------------------------------
+		const syncDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-syncnote-'));
+		const syncDictPath = path.join(syncDataDir, 'dictionary.txt');
+		fs.writeFileSync(syncDictPath, 'Alreadythere\n', 'utf8');
+		const snotes = {
+			'old-dict': { id: 'old-dict', body: '# header\n\nOldword\n', updated_time: 5 },
+		};
+		const sstate = await run({
+			dataDir: syncDataDir,
+			installationDir: DIST_DIR,
+			require: requireStub,
+			versionInfo: { version: '3.6.14', platform: 'desktop' },
+			// A v1.4.1 install: an old dictionary note AND an external file, no sync note yet.
+			initialSettings: { dictionaryNoteId: 'old-dict', dictionaryPath: syncDictPath },
+			notes: snotes,
+			selectedFolder: { id: 'folder-1' },
+		});
+		const sh = sstate.contentScriptMessageHandlers['harperCm'];
+		const zedFile = path.join(syncDataDir, 'zed-harper-ls.json');
+		const readZed = () => {
+			try {
+				return JSON.parse(fs.readFileSync(zedFile, 'utf8'));
+			} catch {
+				return null;
+			}
+		};
+		/** The sync note's latest body, or '' — the notes map is what the harness's data.put mutates. */
+		const syncNoteBody = () => (sstate.notes[sstate.settings.syncNoteId] || {}).body || '';
+		const syncNotePayload = () => parseSyncNoteBody(syncNoteBody());
+
+		await test('sync note: with none configured, v1.4.1 dictionary-note behaviour is untouched', async () => {
+			await sh({ type: 'getConfig' });
+			await sh({ type: 'addWord', word: 'Preupgradeword' });
+			const putsBefore = sstate.notePuts.length;
+			await sstate.noteSelectionChangeHandler();
+			assert.ok(await waitFor(() => sstate.notePuts.length > putsBefore), 'the old dictionary note was still written');
+			const put = sstate.notePuts[sstate.notePuts.length - 1];
+			assert.strictEqual(put.id, 'old-dict', 'and it is the OLD note, exactly as in v1.4.1');
+			assert.ok(/(^|\n)Preupgradeword(\n|$)/.test(put.body), 'with the new word in it');
+		});
+
+		await test('"Harper: Create sync note" posts a parseable note, seeded from local state, and stores its id', async () => {
+			const command = sstate.commands.find((c) => c.name === 'harper.createSyncNote');
+			assert.ok(command, 'the command is registered on both platforms');
+			assert.strictEqual(command.label, 'Harper: Create sync note', 'the approved command label');
+			const postsBefore = sstate.dataPosts.length;
+			await command.execute();
+			const posted = sstate.dataPosts.slice(postsBefore).filter((p) => p.path[0] === 'notes');
+			assert.strictEqual(posted.length, 1, 'exactly one note was created');
+			assert.strictEqual(posted[0].body.title, 'Harper Sync', 'titled "Harper Sync"');
+			assert.strictEqual(posted[0].body.parent_id, 'folder-1', 'in the selected notebook');
+			const payload = parseSyncNoteBody(posted[0].body.body);
+			assert.ok(payload, 'the freshly created note parses as sync state');
+			assert.ok(payload.words.includes('Preupgradeword'), `seeded from local state, got ${JSON.stringify(payload.words)}`);
+			assert.ok(payload.words.includes('Alreadythere'), 'the external file\'s words are in the seed too');
+			// The harness's post returns `created-N`; the plugin must persist exactly that.
+			assert.ok(await waitFor(() => !!sstate.settings.syncNoteId), 'the id landed in the setting');
+			assert.ok(sstate.notes[sstate.settings.syncNoteId], 'and the id addresses a note that exists');
+			// Idempotent: a second run must not create a second note.
+			const postsBefore2 = sstate.dataPosts.length;
+			await command.execute();
+			assert.strictEqual(sstate.dataPosts.length, postsBefore2, 'a live sync note is reused, not duplicated');
+		});
+
+		await test('sync note: the old dictionary note STANDS DOWN once a sync note owns the state', async () => {
+			const oldBodyBefore = sstate.notes['old-dict'].body;
+			await sh({ type: 'getConfig' });
+			await sh({ type: 'addWord', word: 'Standdownword' });
+			const oldPutsBefore = sstate.notePuts.filter((p) => p.id === 'old-dict').length;
+			await sstate.noteSelectionChangeHandler();
+			assert.ok(await waitFor(() => (syncNotePayload() || { words: [] }).words.includes('Standdownword')), 'the word reached the SYNC note');
+			assert.strictEqual(
+				sstate.notePuts.filter((p) => p.id === 'old-dict').length,
+				oldPutsBefore,
+				'and the old dictionary note was not written at all',
+			);
+			assert.strictEqual(sstate.notes['old-dict'].body, oldBodyBefore, 'the old note is left exactly as the user last saw it');
+		});
+
+		await test('sync note: a rule toggle from the content script lands in the note', async () => {
+			await sh({ type: 'getConfig' });
+			await sh({ type: 'disableRule', ruleName: 'SpelledNumbers' });
+			await sstate.noteSelectionChangeHandler();
+			assert.ok(
+				await waitFor(() => {
+					const p = syncNotePayload();
+					return !!p && p.ruleOverrides.SpelledNumbers === false;
+				}),
+				`the override reached the note, body was:\n${syncNoteBody()}`,
+			);
+		});
+
+		await test('sync note: a dismissal carries harper\'s ignore payload VERBATIM into the note', async () => {
+			await sh({ type: 'getConfig' });
+			// A real dismissal through the real engine, so the hashes are harper's own u64s.
+			const text = 'I could of gone.';
+			const lints = await sh({ type: 'lint', text });
+			const target = lints.find((l) => l.problemText && l.problemText.length);
+			assert.ok(target, `the fixture produced a finding, got ${JSON.stringify(lints.map((l) => l.ruleName))}`);
+			await sh({ type: 'ignoreLint', text, start: target.start, end: target.end, ruleName: target.ruleName });
+			await sstate.noteSelectionChangeHandler();
+			assert.ok(
+				await waitFor(() => (syncNotePayload() || { dismissed: { entries: [] } }).dismissed.entries.length > 0),
+				`the dismissal reached the note, body was:\n${syncNoteBody()}`,
+			);
+			const payload = syncNotePayload();
+			// The stored payload and the note's copy must be the SAME BYTES: this is the whole u64 rule.
+			const stored = fs.readFileSync(path.join(syncDataDir, 'ignoredLints.json'), 'utf8');
+			assert.strictEqual(payload.dismissed.ignoredLintsRaw, stored, 'the note carries exactly what the plugin persisted');
+			for (const hash of payload.dismissed.entries[0].hashes) {
+				assert.match(hash, /^\d+$/, `every entry hash is a decimal string, got ${JSON.stringify(hash)}`);
+			}
+			// Round-tripping the note body must not disturb a single digit.
+			assert.strictEqual(parseSyncNoteBody(syncNoteBody()).dismissed.ignoredLintsRaw, stored, 'and survives a re-parse unchanged');
+		});
+
+		await test('sync note: LOOP PREVENTION — nothing changed means nothing is written', async () => {
+			const putsBefore = sstate.notePuts.length;
+			// Every drain point, twice, with no local change in between.
+			await sstate.noteSelectionChangeHandler();
+			await sstate.noteSelectionChangeHandler();
+			for (const interval of sstate.intervals) await interval.fn();
+			await drain();
+			assert.strictEqual(sstate.notePuts.length, putsBefore, 'the device never rewrites a note whose content it already agrees with');
+		});
+
+		await test('sync note: a remote edit is APPLIED wholesale and is not written straight back', async () => {
+			const noteId = sstate.settings.syncNoteId;
+			const before = parseSyncNoteBody(sstate.notes[noteId].body);
+			// A second device's write: a different rule, a new word, no dismissals.
+			const remote = {
+				ruleOverrides: { Spaces: false },
+				dismissed: { ignoredLintsRaw: RAW_IGNORES, entries: [{ hashes: [BIG_HASH], rule: 'SpelledNumbers', text: 'should of', date: '2026-02-02T00:00:00.000Z' }] },
+				words: [...before.words, 'Remoteword'],
+			};
+			sstate.notes[noteId].body = buildSyncNoteBody(remote, '2026-02-02T00:00:00.000Z');
+			sstate.notes[noteId].updated_time = 999;
+			const putsBefore = sstate.notePuts.length;
+
+			await sstate.noteSelectionChangeHandler();
+			assert.ok(
+				await waitFor(() => (sstate.settings.ruleOverrides || '').includes('"Spaces":false')),
+				`the remote rule override was persisted, got ${JSON.stringify(sstate.settings.ruleOverrides)}`,
+			);
+			// The word list is replaced through the EXISTING machinery, so it reaches the engine and the
+			// desktop external file just as a local add would.
+			assert.ok(
+				await waitFor(() => fs.readFileSync(syncDictPath, 'utf8').includes('Remoteword')),
+				`the remote word reached the external dictionary file:\n${fs.readFileSync(syncDictPath, 'utf8')}`,
+			);
+			// The dismissed side table is replaced from the note, hashes intact.
+			const meta = JSON.parse(fs.readFileSync(path.join(syncDataDir, 'dismissedMeta.json'), 'utf8'));
+			assert.deepStrictEqual(meta.entries.map((e) => e.hashes), [[BIG_HASH]], 'the side table is exactly what the note said');
+			assert.strictEqual(fs.readFileSync(path.join(syncDataDir, 'ignoredLints.json'), 'utf8'), RAW_IGNORES, 'and harper\'s payload was stored verbatim');
+
+			// NOW the loop guard: applying wrote settings, which schedules a write. That write must see
+			// itself as redundant — a device that rewrites what it just applied ping-pongs forever.
+			await drain();
+			const putsAfterApply = sstate.notePuts.length;
+			await sstate.noteSelectionChangeHandler();
+			await drain();
+			assert.strictEqual(
+				sstate.notePuts.length,
+				putsAfterApply,
+				`the applied state was never written back, saw ${sstate.notePuts.length - putsAfterApply} extra put(s)`,
+			);
+			assert.ok(putsAfterApply >= putsBefore, 'sanity: the counter only moves forward');
+		});
+
+		await test('sync note: a mangled note is logged once, does not crash, and is rewritten by the next change', async () => {
+			const noteId = sstate.settings.syncNoteId;
+			sstate.notes[noteId].body = 'Someone pasted a shopping list in here.\n\n- milk\n- bread\n';
+			sstate.notes[noteId].updated_time = 1000;
+			// Reading it must be survivable: no throw, and the plugin keeps linting.
+			await sstate.noteSelectionChangeHandler();
+			await drain();
+			const lints = await sh({ type: 'lint', text: 'This is fine.' });
+			assert.ok(Array.isArray(lints), 'the plugin is still alive and linting after an unreadable note');
+
+			// The next local change rewrites it WHOLESALE, from local state.
+			await sh({ type: 'getConfig' });
+			await sh({ type: 'addWord', word: 'Afterthemangle' });
+			await sstate.noteSelectionChangeHandler();
+			assert.ok(
+				await waitFor(() => {
+					const p = syncNotePayload();
+					return !!p && p.words.includes('Afterthemangle');
+				}),
+				`the note was rewritten as valid sync state, body was:\n${syncNoteBody()}`,
+			);
+			const payload = syncNotePayload();
+			assert.ok(payload.words.includes('Remoteword'), 'and the rewrite carried the rest of local state, not just the new word');
+		});
+
+		await test('zed export: the file appears beside the dictionary and tracks a rule change', async () => {
+			// The startup pass already wrote it (a dictionaryPath was configured from the first run).
+			assert.ok(await waitFor(() => readZed() !== null), `${zedFile} exists`);
+			// The rule is picked from harper's OWN defaults rather than named here: the export is
+			// deliberately sparse, so a rule that already defaults to off would correctly produce no
+			// entry at all and the assertion below would be testing nothing.
+			const snapshot = await sh({ type: 'settings:snapshot', includeDescriptions: false });
+			const onByDefault = Object.keys(snapshot.defaults)
+				.filter((name) => snapshot.defaults[name] === true)
+				.sort()[0];
+			assert.ok(onByDefault, 'harper has at least one rule that is on by default');
+			await sstate.setSetting('ruleOverrides', JSON.stringify({ [onByDefault]: false }));
+			assert.ok(
+				await waitFor(() => {
+					const zed = readZed();
+					const linters = zed && zed.lsp['harper-ls'].settings['harper-ls'].linters;
+					return !!linters && linters[onByDefault] === false;
+				}),
+				`the export tracked turning "${onByDefault}" off:\n${fs.readFileSync(zedFile, 'utf8')}`,
+			);
+			// ...and the dialect, which is the OTHER half of what harper-ls takes from us.
+			await sstate.setSetting('dialect', 'British');
+			assert.ok(
+				await waitFor(() => {
+					const zed = readZed();
+					return !!zed && zed.lsp['harper-ls'].settings['harper-ls'].dialect === 'British';
+				}),
+				`the export tracked the dialect change:\n${fs.readFileSync(zedFile, 'utf8')}`,
+			);
+			assert.ok(!fs.readFileSync(zedFile, 'utf8').includes('statsPath'), 'and still never emits statsPath');
+		});
+
+		await test('zed export: the dialog\'s "Copy Zed settings block" returns the same bytes it copied', async () => {
+			const dialogCommand = sstate.commands.find((c) => c.name === 'harper.openSettings');
+			await dialogCommand.execute();
+			const handle = `dialog-${sstate.dialogs[sstate.dialogs.length - 1]}`;
+			const handler = sstate.viewMessageHandlers[handle];
+			const writesBefore = sstate.clipboardWrites.length;
+			const reply = await handler({ type: 'settings:zedBlock', copy: true });
+			assert.ok(reply && typeof reply.text === 'string' && reply.text.length, `the block came back, got ${JSON.stringify(reply)}`);
+			assert.strictEqual(reply.copied, true, 'and it reached the clipboard on desktop');
+			assert.strictEqual(sstate.clipboardWrites.length, writesBefore + 1, 'exactly one clipboard write');
+			assert.strictEqual(sstate.clipboardWrites[sstate.clipboardWrites.length - 1], reply.text, 'the clipboard got exactly what the dialog shows');
+			// ONE BUILDER for the file and the block, so a user pasting cannot get something subtly
+			// different from what the plugin maintains on disk.
+			assert.strictEqual(`${reply.text}\n`, fs.readFileSync(zedFile, 'utf8'), 'the block is the file, minus its trailing newline');
+			assert.strictEqual(reply.filePath, zedFile, 'and the dialog can say where that file is');
+		});
+
+		await test('the settings snapshot carries the sync notice and the new note id', async () => {
+			const handle = `dialog-${sstate.dialogs[sstate.dialogs.length - 1]}`;
+			const handler = sstate.viewMessageHandlers[handle];
+			const snapshot = await handler({ type: 'settings:snapshot', includeDescriptions: false });
+			assert.strictEqual(snapshot.settings.syncNoteId, sstate.settings.syncNoteId, 'the dialog sees the configured sync note');
+			// Both notes are set here, so the notice must be silent — it only fires for the stale pairing.
+			assert.strictEqual(snapshot.syncNotice, null, 'no notice while a sync note is configured');
+			const { UPDATABLE_SETTING_KEYS } = loadTsModule('src/settingsService.ts', (id) =>
+				id === './dismissedLog' ? loadTsModule('src/dismissedLog.ts') : require(id),
+			);
+			assert.ok(UPDATABLE_SETTING_KEYS.includes('syncNoteId'), 'and can write it back');
+		});
+	}
+
 	// ---- version quadruple --------------------------------------------------
 	// The four version fields (package.json, src/manifest.json, and BOTH package-lock fields) must
 	// stay pinned together; a stale lockfile drifted them once in the sibling project. Bump all four
