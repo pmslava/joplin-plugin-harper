@@ -112,9 +112,14 @@ test.describe('attach soak', () => {
     }
 
     const failures: number[] = [];
+    const invalidCycles: number[] = [];
+    // In 'restart' mode every cycle appends to the SAME profile log, so a plugin-load failure from an
+    // earlier cycle would otherwise re-flag every later one. Only a line we have not already seen counts.
+    let lastSeenLoadFailure = '';
     for (let cycle = 1; cycle <= CYCLES; cycle++) {
       const traces: string[] = [];
       let joplin: JoplinInstance | undefined;
+      let profileLog = '';
       let ok = false;
       let detail = '';
       const startedAt = Date.now();
@@ -145,24 +150,56 @@ test.describe('attach soak', () => {
       } finally {
         if (joplin) {
           traces.push(...(await readDurableTraces(joplin).catch(() => [])));
+          // Read the log BEFORE closing: a 'fresh' cycle's profile is deleted by closeJoplin.
+          try {
+            profileLog = fs.readFileSync(path.join(joplin.profileDir, 'log.txt'), 'utf8');
+          } catch {
+            profileLog = '';
+          }
           await closeJoplin(joplin, { keepProfile: !!sharedProfile }).catch(() => undefined);
         }
       }
+      // A CYCLE WHERE JOPLIN COULD NOT LOAD THE PLUGIN AT ALL IS NOT A DATA POINT.
+      //
+      // "No underlines" has two very different causes, and a soak that cannot tell them apart is
+      // worse than no soak: the plugin was loaded and failed to attach (the thing being measured), or
+      // the plugin was never loaded, in which case there was nothing to attach. The second happens
+      // for mundane reasons — most easily when something rebuilds dist/ while the soak is launching
+      // against it, which is exactly how this check came to be written — and Joplin says so plainly in
+      // the profile log. Read it and report those cycles as INVALID, so they can never be mistaken for
+      // the bug.
+      let invalid = false;
+      if (!ok && profileLog) {
+        const failed = profileLog
+          .split('\n')
+          .filter((l) => l.includes('Could not load plugin'))
+          .slice(-1)[0];
+        if (failed && failed !== lastSeenLoadFailure) {
+          lastSeenLoadFailure = failed;
+          invalid = true;
+          detail = `PLUGIN DID NOT LOAD — not an attach failure: ${failed.trim().slice(0, 200)}`;
+        }
+      }
+
       const secs = Math.round((Date.now() - startedAt) / 1000);
-      append(`--- cycle ${cycle}/${CYCLES}: ${ok ? 'ATTACHED' : 'DEAD'} (${secs}s) ${detail}`);
+      const verdict = ok ? 'ATTACHED' : invalid ? 'INVALID' : 'DEAD';
+      append(`--- cycle ${cycle}/${CYCLES}: ${verdict} (${secs}s) ${detail}`);
       if (!ok) {
-        failures.push(cycle);
+        if (invalid) invalidCycles.push(cycle);
+        else failures.push(cycle);
         append(`    trace (${traces.length} lines):`);
         for (const line of traces) append(`    ${line}`);
       } else {
-        // Keep the happy-path trace short but present, for timing comparison.
-        for (const line of traces.filter((l) => !l.includes('lint <-') && !l.includes('lint ->'))) {
-          append(`    ${line}`);
-        }
+        for (const line of traces) append(`    ${line}`);
       }
     }
 
-    append(`=== soak done: ${CYCLES - failures.length}/${CYCLES} attached; dead cycles: ${failures.join(', ') || 'none'}`);
+    const measured = CYCLES - invalidCycles.length;
+    append(
+      `=== soak done: ${measured - failures.length}/${measured} attached` +
+        `; dead cycles: ${failures.join(', ') || 'none'}` +
+        `; invalid (plugin never loaded): ${invalidCycles.join(', ') || 'none'}`,
+    );
     expect(failures, `dead sessions in cycles ${failures.join(', ')}`).toEqual([]);
   });
 });

@@ -13,6 +13,12 @@ import { LOCK_WAIT_MS } from './e2e/guard';
  */
 export default defineConfig({
   testDir: './e2e',
+  // The attach soak is not part of this suite. It is a diagnostic that deliberately launches Joplin
+  // dozens of times in a row and reports a rate rather than a pass/fail, which is minutes of runtime
+  // and a different question from "does this behaviour work". It has its own config
+  // (e2e-soak.config.ts) with its own — absent — timeouts; run it with
+  // `npx playwright test --config=e2e-soak.config.ts`.
+  testIgnore: /attach-soak\.spec\.ts/,
   // Resource discipline (see e2e/guard.ts): globalSetup takes a machine-wide lock so only one Joplin
   // E2E run happens at a time — across every sibling plugin repo, queueing behind a run that is
   // already going — sweeps orphaned processes/profiles/Xvfb left by previous dead runs, and
