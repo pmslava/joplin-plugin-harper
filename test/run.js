@@ -2761,28 +2761,31 @@ async function main() {
 	// =========================================================================
 	// v1.3.0 DELETION PROPAGATION — the user-reported bug, end to end.
 	// =========================================================================
-	// "Deleting a word from the dictionary note resurrects it after the next poll." Under v1.2.0 the
-	// note and the file were reconciled by UNION, so the surviving copy in the file put the word
-	// straight back. These tests drive the real bundle through the whole cycle: converge, delete,
-	// poll, and assert the word is gone from the note, from the file AND from the engine — and stays
-	// gone. The external file is deliberately UNSORTED and carries a comment, so the same tests also
-	// pin the "minimal diff" promise: surviving lines keep their order, comments survive, new words
-	// are appended at the end.
+	// "Deleting a word resurrects it after the next poll." Under v1.2.0 the sources were reconciled by
+	// UNION, so a surviving copy put the word straight back. These tests drive the real bundle through
+	// the whole cycle: converge, delete, poll, and assert the word is gone from the file AND from the
+	// engine — and stays gone.
+	//
+	// The DELETING PARTY has changed with v1.5.0 and the tests follow it. It used to be the dictionary
+	// note, edited on another device and arriving by sync. Now it is whoever writes the external file —
+	// harper-ls, Zed, rclone landing another machine's copy — or the user, through the settings
+	// dialog's dictionary editor. Both are covered below; both are real, and neither existed as a
+	// convenience for the note.
+	//
+	// The external file is deliberately UNSORTED and carries a comment, so these tests also pin the
+	// "minimal diff" promise: surviving lines keep their order, comments survive, new words are
+	// appended at the end.
 	{
 		const delDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-delete-'));
 		const delFile = path.join(delDataDir, 'dict.txt');
 		const INITIAL_FILE = '# my own words\nZuluqx\nAlphaqx\nBetaqx\n';
 		fs.writeFileSync(delFile, INITIAL_FILE, 'utf8');
-		const delNotes = {
-			dnote: { id: 'dnote', body: '# h\n\nAlphaqx\nBetaqx\nZuluqx\n', updated_time: 100 },
-		};
 		const dstate = await run({
 			dataDir: delDataDir,
 			installationDir: DIST_DIR,
 			require: requireStub,
 			versionInfo: { version: '3.6.14', platform: 'desktop' },
-			initialSettings: { dictionaryPath: delFile, dictionaryNoteId: 'dnote' },
-			notes: delNotes,
+			initialSettings: { dictionaryPath: delFile },
 		});
 		const dh = dstate.contentScriptMessageHandlers['harperCm'];
 		const readDelFile = () => fs.readFileSync(delFile, 'utf8');
@@ -2790,11 +2793,6 @@ async function main() {
 			const t = dstate.intervals.find((i) => i.ms === 60000 && !i.cleared);
 			assert.ok(t, 'a 60s dictionary poll interval was armed');
 			t.fn();
-		};
-		/** Change a note body as another device's sync would, and bump its updated_time so the poll sees it. */
-		const editNote = (body) => {
-			dstate.notes.dnote.body = body;
-			dstate.notes.dnote.updated_time = (dstate.notes.dnote.updated_time || 0) + 100;
 		};
 		/** Rewrite the external file as rclone/Zed would, guaranteeing an mtime the poll must notice. */
 		const editFile = (content) => {
@@ -2806,88 +2804,96 @@ async function main() {
 			(await dh({ type: 'lint', text })).filter((l) => l.kind === 'Spelling').map((l) => l.problemText);
 		const syncBase = () => JSON.parse(dstate.settings.syncBase || 'null');
 
-		await test('deletion: baseline — the first reconcile records a syncBase and writes NOTHING (sides already agree)', async () => {
+		await test('deletion: baseline — the first reconcile records a syncBase and writes NOTHING', async () => {
 			const based = await waitFor(() => Array.isArray(syncBase()));
 			assert.ok(based, 'a syncBase was persisted by the first reconcile');
 			assert.deepStrictEqual(syncBase(), ['Alphaqx', 'Betaqx', 'Zuluqx'], 'base = the reconciled set');
-			assert.strictEqual(dstate.notePuts.length, 0, 'nothing to add anywhere — no note write');
+			assert.strictEqual(dstate.notePuts.length, 0, 'a reconcile writes no note at all any more');
 			assert.strictEqual(readDelFile(), INITIAL_FILE, 'the file is untouched, order and comment intact');
 			const spelled = await spellingIn('Alphaqx Betaqx Zuluqx are known.');
 			assert.deepStrictEqual(spelled, [], 'all three words are known to the engine');
 		});
 
-		await test('deletion: a word ADDED in the note is appended at the END of the file, order preserved', async () => {
-			editNote('# h\n\nAlphaqx\nBetaqx\nMikeqx\nZuluqx\n');
-			delPoll();
+		await test('deletion: a BUFFERED word is appended at the END of the file, order preserved', async () => {
+			// The buffer is seeded directly rather than through add-to-dictionary, because that path
+			// APPENDS to the file itself (persistAddedWord) and would never reach the rewrite's append
+			// branch. A pending word the file does not list is exactly what a sync-note apply delivers.
+			await dstate.setSetting('pendingWords', ['Mikeqx']);
+			await dstate.noteSelectionChangeHandler(); // any reconcile trigger; the file's mtime has not moved
 			const landed = await waitFor(() => readDelFile().includes('Mikeqx'));
-			assert.ok(landed, 'the new note word reached the file');
+			assert.ok(landed, 'the buffered word reached the file');
 			assert.strictEqual(
 				readDelFile(),
 				'# my own words\nZuluqx\nAlphaqx\nBetaqx\nMikeqx\n',
 				'surviving lines keep their original (unsorted) order; the new word is appended last',
 			);
+			assert.deepStrictEqual(dstate.settings.pendingWords, [], 'and the buffer retired on the commit');
 		});
 
-		await test('deletion: THE BUG — deleting a word from the note removes it from the file AND the engine', async () => {
+		await test('deletion: THE BUG — deleting a word from the FILE removes it from the engine too', async () => {
 			assert.deepStrictEqual(await spellingIn('Betaqx alone.'), [], 'precondition: Betaqx is accepted');
-			editNote('# h\n\nAlphaqx\nMikeqx\nZuluqx\n'); // the user deletes "Betaqx" from the dictionary note
+			editFile('# my own words\nZuluqx\nAlphaqx\nMikeqx\n'); // harper-ls / Zed / rclone drops "Betaqx"
 			delPoll();
-			const removed = await waitFor(() => !readDelFile().includes('Betaqx'));
-			assert.ok(removed, 'the external file no longer contains the deleted word');
+			const forgotten = await waitFor(async () => (await spellingIn('Betaqx alone.')).includes('Betaqx'));
+			assert.ok(forgotten, 'the engine forgot the word: it is flagged as a misspelling again');
 			assert.strictEqual(
 				readDelFile(),
 				'# my own words\nZuluqx\nAlphaqx\nMikeqx\n',
-				'ONLY the deleted line was dropped — comment, order and the other words are untouched',
-			);
-			assert.ok(!dstate.notes.dnote.body.includes('Betaqx'), 'the note does not get it back');
-			assert.deepStrictEqual(
-				await spellingIn('Betaqx alone.'),
-				['Betaqx'],
-				'the engine forgot the word: it is flagged as a misspelling again',
+				'and the file itself is left exactly as its author wrote it — nothing to rewrite',
 			);
 			assert.deepStrictEqual(syncBase(), ['Alphaqx', 'Mikeqx', 'Zuluqx'], 'the base advanced past the deletion');
+			assert.deepStrictEqual(await spellingIn('Alphaqx Mikeqx Zuluqx.'), [], 'the survivors are still accepted');
 		});
 
 		await test('deletion: it STAYS gone across further poll cycles (no resurrection, no writes)', async () => {
-			const putsBefore = dstate.notePuts.length;
 			const fileBefore = readDelFile();
 			delPoll();
 			await drain();
 			delPoll();
 			await waitFor(() => false, 300); // let any async poll work settle
 			assert.strictEqual(readDelFile(), fileBefore, 'file unchanged at the new fixed point');
-			assert.strictEqual(dstate.notePuts.length, putsBefore, 'no note writes at the new fixed point');
-			assert.ok(!dstate.notes.dnote.body.includes('Betaqx'), 'still absent from the note');
+			assert.strictEqual(dstate.notePuts.length, 0, 'still no note writes');
 			assert.deepStrictEqual(await spellingIn('Betaqx alone.'), ['Betaqx'], 'still unknown to the engine');
 		});
 
-		await test('deletion: the REVERSE direction — deleting from the FILE rewrites the note and the engine', async () => {
-			editFile('# my own words\nZuluqx\nMikeqx\n'); // "Alphaqx" deleted from the file (Zed / rclone)
-			const putsBefore = dstate.notePuts.length;
-			delPoll();
-			const written = await waitFor(
-				() => dstate.notePuts.length > putsBefore && !dstate.notes.dnote.body.includes('Alphaqx'),
+		await test('deletion: a word deleted in the DICTIONARY EDITOR is dropped from the file, minimally', async () => {
+			// The other deleting party, and the one the user drives by hand. A stated removal reaches the
+			// file through pendingRemovals and the same rewrite, so the minimal-diff promise is on the
+			// line here: only the deleted line may go.
+			const reply = await dh({
+				type: 'settings:saveDictionary',
+				words: ['Mikeqx', 'Zuluqx'],
+				baseline: ['Alphaqx', 'Mikeqx', 'Zuluqx'],
+			});
+			assert.deepStrictEqual(reply.removes, ['Alphaqx'], 'the save reported exactly that removal');
+			const removed = await waitFor(() => !readDelFile().includes('Alphaqx'));
+			assert.ok(removed, 'the external file no longer contains the deleted word');
+			assert.strictEqual(
+				readDelFile(),
+				'# my own words\nZuluqx\nMikeqx\n',
+				'ONLY the deleted line was dropped — comment, order and the other words are untouched',
 			);
-			assert.ok(written, 'the note was rewritten without the word deleted from the file');
-			assert.ok(dstate.notes.dnote.body.includes('Zuluqx'), 'the surviving words stay in the note');
 			assert.deepStrictEqual(
 				await spellingIn('Alphaqx alone.'),
 				['Alphaqx'],
-				'the engine forgot the file-deleted word too',
+				'the engine forgot it too',
 			);
-			assert.deepStrictEqual(syncBase(), ['Mikeqx', 'Zuluqx']);
+			assert.deepStrictEqual(syncBase(), ['Mikeqx', 'Zuluqx'], 'the base advanced');
 		});
 
-		await test('deletion: CONFLICT — a local add-to-dictionary beats a concurrent note-side deletion', async () => {
-			// The user deletes the word in the note on another device while, on this one, they add the
-			// very same word via the card. The addition must win — losing a word the user just asked for
+		await test('deletion: CONFLICT — a local addition beats a concurrent file-side deletion', async () => {
+			// The word is deleted from the file on another device (rclone brings that copy over) while, on
+			// this one, it is being added. The addition must win — losing a word the user just asked for
 			// is far worse than keeping one they meant to drop.
-			editNote('# h\n\nZuluqx\n'); // "Mikeqx" deleted remotely
-			await dh({ type: 'addWord', word: 'Mikeqx' }); // ...and re-added locally (buffered in pendingWords)
+			//
+			// Seeded into the buffer directly for the same reason as the append test above: an
+			// add-to-dictionary would put the word back in the file itself and there would be no conflict
+			// left to resolve. This is the shape a sync-note apply arrives in.
+			editFile('# my own words\nZuluqx\n'); // "Mikeqx" deleted remotely
+			await dstate.setSetting('pendingWords', ['Mikeqx']); // ...and added locally, still buffered
 			delPoll();
-			const restored = await waitFor(() => dstate.notes.dnote.body.includes('Mikeqx'));
-			assert.ok(restored, 'the note carries the re-added word again');
-			assert.ok(readDelFile().includes('Mikeqx'), 'the file keeps it too');
+			const restored = await waitFor(() => readDelFile().includes('Mikeqx'));
+			assert.ok(restored, 'the file carries the re-added word again');
 			assert.deepStrictEqual(await spellingIn('Mikeqx alone.'), [], 'the engine still accepts it');
 			assert.deepStrictEqual(syncBase(), ['Mikeqx', 'Zuluqx'], 'the base keeps the word that won');
 			assert.deepStrictEqual(dstate.settings.pendingWords, [], 'the pending buffer was flushed');
@@ -2932,8 +2938,7 @@ async function main() {
 				throw new Error(`Unexpected joplin.require(${name})`);
 			},
 			versionInfo: { version: '3.6.14', platform: 'desktop' },
-			initialSettings: { dictionaryPath: raceFile, dictionaryNoteId: 'rnote' },
-			notes: { rnote: { id: 'rnote', body: '# h\n\nAlpharc\nBetarc\n', updated_time: 10 } },
+			initialSettings: { dictionaryPath: raceFile },
 		});
 		const racePoll = () => rstate.intervals.find((i) => i.ms === 60000 && !i.cleared).fn();
 		const rh = rstate.contentScriptMessageHandlers['harperCm'];
@@ -2946,10 +2951,14 @@ async function main() {
 			const known = await rh({ type: 'lint', text: 'Alpharc and Betarc.' });
 			assert.strictEqual(known.filter((l) => l.kind === 'Spelling').length, 0, 'precondition: both words known');
 			sabotage = true;
-			// A word is deleted from the note, so the file needs rewriting — and rclone lands mid-write.
-			rstate.notes.rnote.body = '# h\n\nAlpharc\n';
-			rstate.notes.rnote.updated_time = 20;
-			racePoll();
+			// A word is deleted in the dictionary editor, so the file needs rewriting — and rclone lands
+			// mid-write. (The trigger used to be a dictionary-note deletion; the note is gone, and the
+			// editor's stated removal reaches the same rewrite through pendingRemovals.)
+			await rh({
+				type: 'settings:saveDictionary',
+				words: ['Alpharc'],
+				baseline: ['Alpharc', 'Betarc'],
+			});
 			const raced = await waitFor(() => fs.readFileSync(raceFile, 'utf8').includes('Gammarc'));
 			assert.ok(raced, 'the concurrent writer got its word in');
 			assert.strictEqual(
@@ -2980,10 +2989,12 @@ async function main() {
 				'Alpharc\nGammarc\n',
 				'deleted word gone, concurrently-added word kept, order preserved',
 			);
-			const noteHasIt = await waitFor(() => rstate.notes.rnote.body.includes('Gammarc'));
-			assert.ok(noteHasIt, 'the raced-in file word reached the note');
-			assert.ok(!rstate.notes.rnote.body.includes('Betarc'), 'the note stays free of the deleted word');
-			assert.deepStrictEqual(JSON.parse(rstate.settings.syncBase), ['Alpharc', 'Gammarc']);
+			assert.deepStrictEqual(
+				JSON.parse(rstate.settings.syncBase),
+				['Alpharc', 'Gammarc'],
+				'and only now does the base absorb both the deletion and the raced-in word',
+			);
+			assert.deepStrictEqual(rstate.settings.pendingRemovals, [], 'the stated removal is finally retired');
 		});
 	}
 
@@ -2992,10 +3003,17 @@ async function main() {
 	// =========================================================================
 	// An absent side infers no deletions, which keeps ONE pass safe. It does not keep TWO passes safe:
 	// if the base is still advanced on a pass where a configured side was missing, that side comes back
-	// holding older content and the other side's additions read as deletions on it — and are destroyed,
-	// silently and permanently, then synced everywhere. The commit therefore also requires every
-	// configured side to have been PRESENT. These three sequences are the exact ones that lost words
-	// before that gate existed; each ends with "nothing was wiped and the sides converge".
+	// holding older content and the additions it never saw read as deletions on it — and are destroyed,
+	// silently and permanently. The commit therefore also requires the configured side to have been
+	// PRESENT.
+	//
+	// v1.5.0 MOVED THE GATE WITHOUT WEAKENING IT. With the dictionary note gone the file is the only
+	// side, so "a configured side was absent" is exactly `file === null` — which returns early, long
+	// before the commit, rather than being a conjunct at it. These sequences prove that structurally:
+	// the additions are LOCAL (buffered) rather than note-side, and the file is what goes missing.
+	//
+	// The two H1b cases — the NOTE going absent while the file gained a word — are gone. There is no
+	// second side left to be absent, and inventing one would be testing a shape the code no longer has.
 	{
 		// ---- H1: the FILE goes absent (rclone moves it aside), then returns with stale content ----
 		const h1Dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-absent-file-'));
@@ -3006,23 +3024,21 @@ async function main() {
 			installationDir: DIST_DIR,
 			require: requireStub,
 			versionInfo: { version: '3.6.14', platform: 'desktop' },
-			initialSettings: { dictionaryPath: h1File, dictionaryNoteId: 'h1note' },
-			notes: { h1note: { id: 'h1note', body: '# h\n\nAlphaqx\n', updated_time: 100 } },
+			initialSettings: { dictionaryPath: h1File },
 		});
 		const h1h = h1state.contentScriptMessageHandlers['harperCm'];
-		const h1poll = () => h1state.intervals.find((i) => i.ms === 60000 && !i.cleared).fn();
 		const h1base = () => JSON.parse(h1state.settings.syncBase || 'null');
 		const h1spell = async (t) =>
 			(await h1h({ type: 'lint', text: t })).filter((l) => l.kind === 'Spelling').map((l) => l.problemText);
 
-		await test('absent file: a note-side add is served to the engine but does NOT advance the base', async () => {
+		await test('absent file: a buffered add is served to the engine but does NOT advance the base', async () => {
 			assert.ok(await waitFor(() => Array.isArray(h1base())), 'precondition: converged with a base');
 			assert.deepStrictEqual(h1base(), ['Alphaqx'], 'precondition: base = the agreed word');
-			// rclone moves the file aside while another device adds a word to the note.
+			// rclone moves the file aside. A word arrives locally meanwhile — from the card, from the
+			// dictionary editor, or applied out of the sync note; all three land in the same buffer.
 			fs.renameSync(h1File, `${h1File}.moved`);
-			h1state.notes.h1note.body = '# h\n\nAlphaqx\nCharlieqx\n';
-			h1state.notes.h1note.updated_time += 100;
-			h1poll();
+			await h1state.setSetting('pendingWords', ['Charlieqx']);
+			await h1state.noteSelectionChangeHandler();
 			await waitFor(() => false, 300);
 			assert.deepStrictEqual(
 				await h1spell('Charlieqx alone.'),
@@ -3034,66 +3050,32 @@ async function main() {
 				['Alphaqx'],
 				'the base did NOT absorb a word the absent file has never seen',
 			);
+			assert.deepStrictEqual(
+				h1state.settings.pendingWords,
+				['Charlieqx'],
+				'and the buffer was NOT retired — nothing durable has absorbed the word yet',
+			);
 		});
 
-		await test('absent file: when it returns stale, the note-side word SURVIVES and is pushed into the file', async () => {
+		await test('absent file: when it returns stale, the buffered word SURVIVES and is pushed into it', async () => {
 			fs.renameSync(`${h1File}.moved`, h1File);
 			const future = new Date(Date.now() + 3000);
 			fs.utimesSync(h1File, future, future);
-			h1poll();
+			await h1state.noteSelectionChangeHandler();
 			const landed = await waitFor(() => fs.readFileSync(h1File, 'utf8').includes('Charlieqx'));
 			assert.ok(landed, 'the returning file receives the word it missed');
-			assert.ok(h1state.notes.h1note.body.includes('Charlieqx'), 'the note kept it — nothing was wiped');
-			assert.deepStrictEqual(await h1spell('Charlieqx alone.'), [], 'and the engine still accepts it');
-			assert.deepStrictEqual(h1base(), ['Alphaqx', 'Charlieqx'], 'only now does the base advance');
-		});
-
-		// ---- H1b: the NOTE goes absent (deleted / not yet synced), then returns with stale content ----
-		const h1bDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-absent-note-'));
-		const h1bFile = path.join(h1bDir, 'dict.txt');
-		fs.writeFileSync(h1bFile, 'Alphaqx\n', 'utf8');
-		const h1bstate = await run({
-			dataDir: h1bDir,
-			installationDir: DIST_DIR,
-			require: requireStub,
-			versionInfo: { version: '3.6.14', platform: 'desktop' },
-			initialSettings: { dictionaryPath: h1bFile, dictionaryNoteId: 'h1bnote' },
-			notes: { h1bnote: { id: 'h1bnote', body: '# h\n\nAlphaqx\n', updated_time: 100 } },
-		});
-		const h1bpoll = () => h1bstate.intervals.find((i) => i.ms === 60000 && !i.cleared).fn();
-		const h1bbase = () => JSON.parse(h1bstate.settings.syncBase || 'null');
-		let h1bSavedNote = null;
-
-		await test('absent note: a file-side add does NOT advance the base while the note is unreadable', async () => {
-			assert.ok(await waitFor(() => Array.isArray(h1bbase())), 'precondition: converged with a base');
-			// The note becomes unreadable (deleted on another device, or not yet synced here) while Zed
-			// adds a word to the external file.
-			h1bSavedNote = h1bstate.notes.h1bnote;
-			delete h1bstate.notes.h1bnote;
-			fs.writeFileSync(h1bFile, 'Alphaqx\nDeltaqx\n', 'utf8');
-			const future = new Date(Date.now() + 3000);
-			fs.utimesSync(h1bFile, future, future);
-			h1bpoll();
-			await waitFor(() => false, 300);
-			assert.deepStrictEqual(h1bbase(), ['Alphaqx'], 'the base stayed put with the note side missing');
-		});
-
-		await test('absent note: when it returns stale, the file-side word SURVIVES and reaches the note', async () => {
-			h1bstate.notes.h1bnote = h1bSavedNote;
-			h1bstate.notes.h1bnote.updated_time += 100;
-			h1bpoll();
-			const reached = await waitFor(() => h1bstate.notes.h1bnote.body.includes('Deltaqx'));
-			assert.ok(reached, 'the returning note receives the word it missed');
 			assert.ok(
-				fs.readFileSync(h1bFile, 'utf8').includes('Deltaqx'),
-				'the file kept it — the stale note did not read it as a deletion',
+				fs.readFileSync(h1File, 'utf8').includes('Alphaqx'),
+				'and keeps its own — nothing was wiped by the round trip',
 			);
-			assert.deepStrictEqual(h1bbase(), ['Alphaqx', 'Deltaqx'], 'only now does the base advance');
+			assert.deepStrictEqual(await h1spell('Charlieqx alone.'), [], 'the engine still accepts it');
+			assert.deepStrictEqual(h1base(), ['Alphaqx', 'Charlieqx'], 'only now does the base advance');
+			assert.deepStrictEqual(h1state.settings.pendingWords, [], 'and only now is the buffer retired');
 		});
 
 		// ---- H1c: FIRST RUN with the file absent (Joplin launched before the drive was mounted) ----
-		// The one that needs no race at all, and the worst: the first run would adopt the note as the
-		// base, commit it, and then delete every note-only word the moment the drive appeared.
+		// The one that needs no race at all, and the worst: the first run would adopt what it could see
+		// as the base, commit it, and then delete everything the moment the drive appeared.
 		const h1cDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-absent-first-'));
 		const h1cFile = path.join(h1cDir, 'dict.txt'); // deliberately NOT created yet
 		const h1cstate = await run({
@@ -3101,8 +3083,9 @@ async function main() {
 			installationDir: DIST_DIR,
 			require: requireStub,
 			versionInfo: { version: '3.6.14', platform: 'desktop' },
-			initialSettings: { dictionaryPath: h1cFile, dictionaryNoteId: 'h1cnote' },
-			notes: { h1cnote: { id: 'h1cnote', body: '# h\n\nAlphaqx\nBetaqx\nGammaqx\n', updated_time: 100 } },
+			// Words carried over from a previous session, exactly as an install that was closed while a
+			// word was buffered would start up.
+			initialSettings: { dictionaryPath: h1cFile, pendingWords: ['Betaqx', 'Gammaqx'] },
 		});
 		const h1ch = h1cstate.contentScriptMessageHandlers['harperCm'];
 		const h1cpoll = () => h1cstate.intervals.find((i) => i.ms === 60000 && !i.cleared).fn();
@@ -3110,33 +3093,36 @@ async function main() {
 		const h1cspell = async (t) =>
 			(await h1ch({ type: 'lint', text: t })).filter((l) => l.kind === 'Spelling').map((l) => l.problemText);
 
-		await test('first run with the drive unmounted: the note words load but NO base is recorded', async () => {
+		await test('first run with the drive unmounted: the buffered words load but NO base is recorded', async () => {
 			// Awaiting a lint awaits the engine warm-up, hence the whole startup reconcile.
 			assert.deepStrictEqual(
-				await h1cspell('Alphaqx Betaqx Gammaqx here.'),
+				await h1cspell('Betaqx Gammaqx here.'),
 				[],
-				'all three note words are known to the engine even with no file side',
+				'the buffered words are known to the engine even with no file side',
 			);
 			assert.strictEqual(h1cbase(), null, 'no base was committed: the configured file side was never seen');
+			assert.deepStrictEqual(
+				h1cstate.settings.pendingWords,
+				['Betaqx', 'Gammaqx'],
+				'and the buffer is intact — it is the only record of these words',
+			);
 		});
 
 		await test('first run: when the drive mounts, NOTHING is wiped — all three words survive and converge', async () => {
 			fs.writeFileSync(h1cFile, 'Alphaqx\n', 'utf8'); // the drive appears, holding only its own word
 			h1cpoll();
 			const converged = await waitFor(() => fs.readFileSync(h1cFile, 'utf8').includes('Gammaqx'));
-			assert.ok(converged, 'the mounted file receives the note words');
+			assert.ok(converged, 'the mounted file receives the buffered words');
 			assert.strictEqual(
 				fs.readFileSync(h1cFile, 'utf8'),
 				'Alphaqx\nBetaqx\nGammaqx\n',
-				'its own word is kept first, the note-only words are appended — no deletion inferred',
+				'its own word is kept first, the buffered ones are appended — no deletion inferred',
 			);
-			assert.ok(h1cstate.notes.h1cnote.body.includes('Betaqx'), 'the note kept Betaqx');
-			assert.ok(h1cstate.notes.h1cnote.body.includes('Gammaqx'), 'the note kept Gammaqx');
-			assert.deepStrictEqual(await h1cspell('Betaqx Gammaqx here.'), [], 'the engine still accepts both');
+			assert.deepStrictEqual(await h1cspell('Alphaqx Betaqx Gammaqx here.'), [], 'the engine accepts all three');
 			assert.deepStrictEqual(
 				h1cbase(),
 				['Alphaqx', 'Betaqx', 'Gammaqx'],
-				'the base is committed on the first pass that saw BOTH sides',
+				'the base is committed on the first pass that actually saw the file',
 			);
 		});
 	}
@@ -3156,11 +3142,9 @@ async function main() {
 			installationDir: DIST_DIR,
 			require: requireStub,
 			versionInfo: { version: '3.6.14', platform: 'desktop' },
-			initialSettings: { dictionaryPath: dupFile, dictionaryNoteId: 'dupnote' },
-			notes: { dupnote: { id: 'dupnote', body: '# h\n\nAlphadd\nBetadd\n', updated_time: 100 } },
+			initialSettings: { dictionaryPath: dupFile },
 		});
 		const duph = dupstate.contentScriptMessageHandlers['harperCm'];
-		const duppoll = () => dupstate.intervals.find((i) => i.ms === 60000 && !i.cleared).fn();
 
 		await test('no duplicates: add-to-dictionary of a word the file already lists appends NOTHING', async () => {
 			assert.ok(
@@ -3173,9 +3157,12 @@ async function main() {
 		});
 
 		await test('no duplicates: a rewrite collapses a repeated word to its FIRST line, order otherwise intact', async () => {
-			dupstate.notes.dupnote.body = '# h\n\nAlphadd\nBetadd\nMikedd\n'; // a new word forces a rewrite
-			dupstate.notes.dupnote.updated_time += 100;
-			duppoll();
+			// A buffered word the file lacks is what forces the rewrite. Seeded straight into the buffer
+			// rather than added through the card, because add-to-dictionary APPENDS to the file itself and
+			// would never reach the rewrite branch this test is about. (It used to be a dictionary-note
+			// edit; the note is gone, and this is the shape a sync-note apply arrives in anyway.)
+			await dupstate.setSetting('pendingWords', ['Mikedd']);
+			await dupstate.noteSelectionChangeHandler();
 			const rewritten = await waitFor(() => fs.readFileSync(dupFile, 'utf8').includes('Mikedd'));
 			assert.ok(rewritten, 'the new word reached the file');
 			assert.strictEqual(
@@ -3209,10 +3196,11 @@ async function main() {
 			installationDir: DIST_DIR,
 			require: requireStub,
 			versionInfo: { version: '3.6.14', platform: 'desktop' },
-			// The note side holds the two words the dialog WAS seeded with, and the file side is
-			// configured — exactly the state after "set External dictionary file" on the General tab.
-			initialSettings: { dictionaryPath: edFile, dictionaryNoteId: 'ednote' },
-			notes: { ednote: { id: 'ednote', body: '# h\n\nAlphaqx\nBetaqx\n', updated_time: 100 } },
+			// The BUFFER holds the two words the dialog was seeded with (carried over from a previous
+			// session, or just applied out of the sync note), and the file side is configured — exactly
+			// the state after "set External dictionary file" on the General tab, which is what makes the
+			// dialog's cached two-word snapshot stale against a 502-word effective list.
+			initialSettings: { dictionaryPath: edFile, pendingWords: ['Alphaqx', 'Betaqx'] },
 		});
 		const edh = edState.contentScriptMessageHandlers['harperCm'];
 		// What the dialog cached at load(), BEFORE the external file was configured: two words.
@@ -3241,7 +3229,6 @@ async function main() {
 				assert.ok(onDisk.includes(word), `the user's own file still holds ${word}`);
 			}
 			assert.ok(onDisk.startsWith('# my own words'), 'and its header comment is untouched');
-			assert.ok(edState.notes.ednote.body.includes('Unseenqx0'), 'the synced note keeps them too');
 
 			// The reply carries the reconciled TRUTH, so the dialog re-seeds from it and the next save's
 			// baseline is no longer stale — which is what stops this repeating.
@@ -3288,7 +3275,10 @@ async function main() {
 				before.split('\n').filter((l) => l.startsWith('# ')).length,
 				'the file gained no comment lines at all',
 			);
-			assert.ok(!edState.notes.ednote.body.includes('# proper nouns'), 'and the synced note gained none');
+			assert.ok(
+				!(edState.settings.syncBase || '').includes('# proper nouns'),
+				'and it never entered the merge base either',
+			);
 		});
 	}
 
@@ -3340,13 +3330,14 @@ async function main() {
 	// ---- a dictionary save must not be answered by a pass that predates it ---
 	{
 		const jnDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-join-'));
+		const jnFile = path.join(jnDir, 'dict.txt');
+		fs.writeFileSync(jnFile, 'Keepmeqx\n', 'utf8');
 		const jnState = await run({
 			dataDir: jnDir,
 			installationDir: DIST_DIR,
 			require: requireStub,
 			versionInfo: { version: '3.6.14', platform: 'desktop' },
-			initialSettings: { dictionaryNoteId: 'jnote' },
-			notes: { jnote: { id: 'jnote', body: '# h\n\nKeepmeqx\n', updated_time: 100 } },
+			initialSettings: { dictionaryPath: jnFile },
 		});
 		const jnh = jnState.contentScriptMessageHandlers['harperCm'];
 
@@ -3357,11 +3348,12 @@ async function main() {
 			);
 			await jnh({ type: 'lint', text: 'warm the engine' }); // so nothing below builds the linter
 
-			// A competing pass — the 60 s poll firing because sync moved the note, or a rule write from
-			// the dialog's own Rules tab reaching applyConfiguration — is started PARTWAY through the
-			// save's per-word loop, so it snapshots the pending buffers holding the first word but not
-			// the second. It is then parked on its note write, which is where a save that merely JOINS
-			// the pass in flight ends up waiting for a result that cannot contain its own edits.
+			// A competing pass — the 60 s poll firing because the file moved, or a rule write from the
+			// dialog's own Rules tab reaching applyConfiguration — is started PARTWAY through the save's
+			// per-word loop, so it snapshots the pending buffers holding the first word but not the
+			// second. It is then parked on its BASE COMMIT (this used to be its note write), which is
+			// where a save that merely JOINS the pass in flight ends up waiting for a result that cannot
+			// contain its own edits.
 			let openGate = null;
 			let gateEntered = null;
 			const parked = new Promise((resolve) => {
@@ -3370,8 +3362,9 @@ async function main() {
 			const gate = new Promise((resolve) => {
 				openGate = resolve;
 			});
-			jnState.beforeNotePut = async () => {
-				jnState.beforeNotePut = null; // park the competing pass only
+			jnState.beforeSettingWrite = async (key) => {
+				if (key !== 'syncBase') return;
+				jnState.beforeSettingWrite = null; // park the competing pass only
 				gateEntered();
 				await gate;
 			};
@@ -3392,14 +3385,18 @@ async function main() {
 			});
 			assert.deepStrictEqual(res.adds, ['Zalphaqx', 'Zbetaqx'], 'the dialog was told both words were saved');
 
-			// Joining the in-flight pass returned a word set the later edits were not in: the note was
-			// written WITHOUT them, the buffer was left holding them with nothing scheduled to retry
-			// (the poll returns early unless a side moved, and the user cannot change note while a modal
-			// dialog is open), and the stale clear-then-import took them back OUT of the live engine —
-			// so the dialog said "Saved. 2 added." while the words were underlined again.
+			// Joining the in-flight pass returned a word set the later edits were not in: the merge
+			// committed WITHOUT them, the buffer was left holding them with nothing scheduled to retry
+			// (the poll returns early unless the file moved, and the user cannot change note while a
+			// modal dialog is open), and the stale clear-then-import took them back OUT of the live
+			// engine — so the dialog said "Saved. 2 added." while the words were underlined again.
+			//
+			// Read off the merge BASE rather than the file: add-to-dictionary appends straight to the
+			// file (persistAddedWord), so the file would hold both words even on the broken path. The
+			// base is the merge's own output, and it is only correct if the save's own pass computed it.
 			assert.ok(
-				jnState.notes.jnote.body.includes('Zbetaqx'),
-				`the note actually holds every saved word: ${JSON.stringify(jnState.notes.jnote.body)}`,
+				(jnState.settings.syncBase || '').includes('Zbetaqx'),
+				`the committed base holds every saved word: ${JSON.stringify(jnState.settings.syncBase)}`,
 			);
 			assert.deepStrictEqual(jnState.settings.pendingWords, [], 'and the buffer was retired, not stranded');
 			const flagged = (await jnh({ type: 'lint', text: 'Zbetaqx and Zalphaqx are fine.' })).map((l) => l.problemText);
@@ -3410,13 +3407,14 @@ async function main() {
 	// ---- the pending buffers must be read as ONE consistent pair -------------
 	{
 		const pbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-pair-'));
+		const pbFile = path.join(pbDir, 'dict.txt');
+		fs.writeFileSync(pbFile, 'Alphapb\nKubernetes\n', 'utf8');
 		const pbState = await run({
 			dataDir: pbDir,
 			installationDir: DIST_DIR,
 			require: requireStub,
 			versionInfo: { version: '3.6.14', platform: 'desktop' },
-			initialSettings: { dictionaryNoteId: 'pbnote' },
-			notes: { pbnote: { id: 'pbnote', body: '# h\n\nAlphapb\nKubernetes\n', updated_time: 100 } },
+			initialSettings: { dictionaryPath: pbFile },
 		});
 		const pbh = pbState.contentScriptMessageHandlers['harperCm'];
 
@@ -3427,29 +3425,34 @@ async function main() {
 			);
 			await pbh({ type: 'lint', text: 'warm the engine' });
 
-			// A removal is queued and still uncommitted — normal, since the note write is deferred while
-			// an editor is open and the buffer is what carries it until a pass can land it.
+			// A removal is queued and still uncommitted — the ordinary state between the dictionary
+			// editor's Save and the pass that folds it into the file.
 			await pbState.setSetting('pendingRemovals', ['Kubernetes']);
 
-			// The user changes their mind and re-adds the word WHILE a pass is suspended on the note
-			// read. addPendingWord cancels the pending removal and queues the addition — so the two
+			// The user changes their mind and re-adds the word WHILE a pass is between its two buffer
+			// reads. addPendingWord cancels the pending removal and queues the addition — so the two
 			// buffers are disjoint in storage at every instant, but a pass that read them either side of
 			// this window saw the word in BOTH.
+			//
+			// The window used to be wide (the note `data.get` sat between the two reads, hence the old
+			// beforeNoteGet hook). With the note gone the reads are adjacent, but each is still an await
+			// and the hazard is unchanged — so the injection hangs on the second read itself.
 			let injected = false;
-			pbState.beforeNoteGet = async () => {
-				if (injected) return;
+			pbState.beforeSettingRead = async (key) => {
+				if (key !== 'pendingRemovals' || injected) return;
 				injected = true;
 				await pbh({ type: 'addWord', word: 'Kubernetes' });
 			};
 			await pbState.noteSelectionChangeHandler();
-			pbState.beforeNoteGet = null;
+			pbState.beforeSettingRead = null;
+			assert.ok(injected, 'the re-add really landed between the two buffer reads');
 
 			// Removals beat additions by design, so reading a non-disjoint pair dropped the word from the
-			// merge, rewrote the note without it, and then retired it from BOTH buffers — gone from the
-			// note, the file, the base and the engine, with the underline the user had just cleared back.
+			// merge, rewrote the file without it, and then retired it from BOTH buffers — gone from the
+			// file, the base and the engine, with the underline the user had just cleared back.
 			assert.ok(
-				pbState.notes.pbnote.body.includes('Kubernetes'),
-				`the note still lists the re-added word: ${JSON.stringify(pbState.notes.pbnote.body)}`,
+				fs.readFileSync(pbFile, 'utf8').includes('Kubernetes'),
+				`the file still lists the re-added word: ${JSON.stringify(fs.readFileSync(pbFile, 'utf8'))}`,
 			);
 			const snap = await pbh({ type: 'settings:snapshot', includeDescriptions: false });
 			assert.ok(snap.dictionaryWords.includes('Kubernetes'), 'and it is still in the effective list');
@@ -3469,13 +3472,14 @@ async function main() {
 	// made to queue, which is exactly what the assertions check.
 	{
 		const rtDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-retire-'));
+		const rtFile = path.join(rtDir, 'dict.txt');
+		fs.writeFileSync(rtFile, 'Aqx\nKeepqx\n', 'utf8');
 		const rtState = await run({
 			dataDir: rtDir,
 			installationDir: DIST_DIR,
 			require: requireStub,
 			versionInfo: { version: '3.6.14', platform: 'desktop' },
-			initialSettings: { dictionaryNoteId: 'rtnote' },
-			notes: { rtnote: { id: 'rtnote', body: '# h\n\nAqx\nKeepqx\n', updated_time: 100 } },
+			initialSettings: { dictionaryPath: rtFile },
 		});
 		const rth = rtState.contentScriptMessageHandlers['harperCm'];
 
@@ -3507,7 +3511,7 @@ async function main() {
 			await rth({ type: 'lint', text: 'warm the engine' }); // so addWord below builds nothing
 
 			// A word buffered but not yet retired — the ordinary state between an "Add to dictionary"
-			// and the pass that folds it into the note.
+			// and the pass that folds it into the file.
 			await rtState.setSetting('pendingWords', ['Aqx']);
 
 			// A reconcile commits and retires ['Aqx']. Park it with its survivor list already computed
@@ -3533,11 +3537,13 @@ async function main() {
 				'the retire drops only what it consumed; the new word survives',
 			);
 
-			// ...and it is durable, not just buffered: the next pass folds it into the synced note.
+			// ...and it is durable, not just buffered: the next pass folds it into the committed base.
+			// Read off the BASE, not the file — add-to-dictionary appends to the file directly, so the
+			// file would hold the word even on the broken path this test exists to catch.
 			await rtState.noteSelectionChangeHandler();
 			assert.ok(
-				rtState.notes.rtnote.body.includes('Bqx'),
-				`the word reaches the dictionary note: ${JSON.stringify(rtState.notes.rtnote.body)}`,
+				(rtState.settings.syncBase || '').includes('Bqx'),
+				`the word reaches the committed base: ${JSON.stringify(rtState.settings.syncBase)}`,
 			);
 			assert.deepStrictEqual(rtState.settings.pendingWords, [], 'and is retired once it is durable');
 
@@ -3570,8 +3576,8 @@ async function main() {
 			);
 
 			await rtState.noteSelectionChangeHandler();
-			const body = rtState.notes.rtnote.body;
-			assert.ok(body.includes('Cfirstqx') && body.includes('Csecondqx'), `both reach the note: ${JSON.stringify(body)}`);
+			const base = rtState.settings.syncBase || '';
+			assert.ok(base.includes('Cfirstqx') && base.includes('Csecondqx'), `both reach the base: ${base}`);
 			assert.strictEqual(raced, false, 'the second add queued behind the first instead of racing it');
 		});
 	}
@@ -3654,23 +3660,22 @@ async function main() {
 	//       ZERO joplin.data.put and ZERO fs reads have been awaited — while the content script, settings
 	//       and poll timer ARE already wired (fast path);
 	//   (b) the background then warms the engine + imports the dictionary WITHOUT any lint request, a
-	//       subsequent lint is served warm and reflects the imported words, and the deferred start flush
-	//       persists the previous-session pending word into the note (editor never open, L3-safe).
+	//       subsequent lint is served warm and reflects the imported words, and the deferred start
+	//       reconcile folds the previous-session pending word into the external file.
 	let budgetOnStartMs = -1;
 	{
-		const budgetNotes = {
-			'budget-note': { id: 'budget-note', title: 'Harper Dictionary', body: '# hdr\n\nAlreadyknown\n', updated_time: 10 },
-		};
+		const budgetDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-budget-'));
+		const budgetFile = path.join(budgetDir, 'dict.txt');
+		fs.writeFileSync(budgetFile, 'Alreadyknown\n', 'utf8');
 		const fsBefore = fsReadCount;
 		const bstate = await run({
-			dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'harper-budget-')),
+			dataDir: budgetDir,
 			installationDir: DIST_DIR,
 			require: requireStub, // counting fs-extra: proves fs reads are deferred, not awaited in onStart
 			versionInfo: { version: '3.6.14', platform: 'desktop' },
-			// A configured dictionary note + a word buffered from a "previous session" (editor NOT open),
-			// so there is a real dictionary import AND a real start flush to defer.
-			initialSettings: { dictionaryNoteId: 'budget-note', pendingWords: ['Zbudgetword'] },
-			notes: budgetNotes,
+			// A configured dictionary FILE (this used to be the dictionary note) + a word buffered from a
+			// "previous session", so there is a real dictionary import AND a real deferred write to defer.
+			initialSettings: { dictionaryPath: budgetFile, pendingWords: ['Zbudgetword'] },
 		});
 		budgetOnStartMs = bstate.onStartMs;
 		// Snapshot the counters at the instant onStart resolved (before draining any background macrotask).
@@ -3690,15 +3695,24 @@ async function main() {
 			assert.strictEqual(bstate.contentScripts.length, 1, 'content script registered eagerly');
 			assert.ok(bstate.contentScriptMessageHandlers['harperCm'], 'onMessage handler wired eagerly');
 			assert.ok(bstate.registeredSettings, 'settings registered eagerly');
-			assert.ok(bstate.commands.find((c) => c.name === 'harper.createDictionaryNote'), 'command registered eagerly');
+			// The create command, which v1.5.0's revision renamed along with the note it makes. This is the
+			// only place in the suite that pins the command's registration at all.
+			assert.ok(bstate.commands.find((c) => c.name === 'harper.createSyncNote'), 'command registered eagerly');
+			assert.ok(
+				!bstate.commands.find((c) => c.name === 'harper.createDictionaryNote'),
+				'and the dictionary-note command is gone, not merely inert',
+			);
 			assert.ok(bstate.intervals.find((i) => i.ms === 60000 && !i.cleared), 'poll timer armed eagerly (harness-captured)');
 		});
 
 		await test('budget: the background init issues the deferred dictionary read WITHOUT any lint request', async () => {
-			// No lint was ever requested; the data.get can only come from the background warm-up /
-			// start-flush that onStart kicked off after returning.
-			const ran = await waitFor(() => bstate.gets.length > 0);
-			assert.ok(ran, 'a background joplin.data.get ran on its own (deferred dictionary read)');
+			// No lint was ever requested; the fs read can only come from the background warm-up and start
+			// reconcile that onStart kicked off after returning. (It used to be watched through
+			// `bstate.gets` — the dictionary note's data.get — which no longer happens at all: with no
+			// sync note configured, a startup now touches Joplin's data API zero times.)
+			const ran = await waitFor(() => fsReadCount - fsBefore > 0);
+			assert.ok(ran, 'a background fs read ran on its own (deferred dictionary read)');
+			assert.strictEqual(bstate.gets.length, 0, 'and no joplin.data.get at all — there is no note to read');
 		});
 
 		const bh = bstate.contentScriptMessageHandlers['harperCm'];
@@ -3706,18 +3720,20 @@ async function main() {
 			const r = await bh({ type: 'lint', text: 'Alreadyknown but Qwertyxz is not.' });
 			assert.ok(Array.isArray(r) && r.length >= 1, 'lint returns issues once the engine is warm');
 			const spelled = r.filter((l) => l.kind === 'Spelling').map((l) => l.problemText);
-			assert.ok(!spelled.includes('Alreadyknown'), '"Alreadyknown" (a note word) was imported → not flagged');
+			assert.ok(!spelled.includes('Alreadyknown'), '"Alreadyknown" (a file word) was imported → not flagged');
 			assert.ok(spelled.includes('Qwertyxz'), '"Qwertyxz" (unknown) IS still flagged');
 		});
 
-		await test('budget: the deferred start flush persisted the previous-session pending word into the note (editor never open)', async () => {
-			const flushed = await waitFor(() =>
-				bstate.notePuts.some((p) => p.id === 'budget-note' && /(^|\n)Zbudgetword(\n|$)/.test(p.body || '')),
+		await test('budget: the deferred start reconcile folded the previous-session pending word into the file', async () => {
+			const flushed = await waitFor(() => fs.readFileSync(budgetFile, 'utf8').includes('Zbudgetword'));
+			assert.ok(flushed, 'the start reconcile folded the buffered pending word into the file');
+			assert.strictEqual(
+				fs.readFileSync(budgetFile, 'utf8'),
+				'Alreadyknown\nZbudgetword\n',
+				'the file keeps its existing word and gains the buffered one, appended',
 			);
-			assert.ok(flushed, 'the start flush folded the buffered pending word into the dictionary note');
-			const put = bstate.notePuts[bstate.notePuts.length - 1];
-			assert.ok(/(^|\n)Alreadyknown(\n|$)/.test(put.body), 'the note keeps its existing word');
-			assert.deepStrictEqual(bstate.settings.pendingWords, [], 'pendingWords cleared after the deferred flush');
+			assert.deepStrictEqual(bstate.settings.pendingWords, [], 'pendingWords cleared after the deferred write');
+			assert.strictEqual(bstate.notePuts.length, 0, 'and a startup writes no note whatsoever');
 		});
 	}
 
@@ -4338,105 +4354,10 @@ async function main() {
 		});
 	}
 
-	// ---- integration: repointing the dictionary mid-pass must not corrupt the new note ----
-	// `cfg` is a mutable module singleton the settings onChange handler rewrites in place. A pass used
-	// to read the note id at READ time and again at WRITE time, so a repoint landing in between put the
-	// OLD note's merged body straight over the NEWLY-POINTED note — and then committed a merge base
-	// over the `''` that resetSyncBase had just written, which is the one thing making a repoint safe.
-	{
-		const rpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-repoint-'));
-		const rpState = await run({
-			dataDir: rpDir,
-			installationDir: DIST_DIR,
-			require: requireStub,
-			versionInfo: { version: '3.6.14', platform: 'desktop' },
-			initialSettings: { dictionaryNoteId: 'note1' },
-			notes: {
-				note1: { id: 'note1', body: '# h\n\nAlpharp\nBetarp\n', updated_time: 100 },
-				// The user's OTHER note, which they are about to point the setting at. Its body is
-				// ordinary prose — this is the content the old pass used to destroy.
-				note2: {
-					id: 'note2',
-					body: '# My other dictionary note\n\nMyveryownwordrp\nSecondownwordrp\n',
-					updated_time: 200,
-				},
-			},
-		});
-		const rph = rpState.contentScriptMessageHandlers['harperCm'];
-
-		await test('repointing the dictionary note mid-pass writes nothing to the newly-pointed note', async () => {
-			assert.ok(
-				await waitFor(() => (rpState.settings.syncBase || '').includes('Alpharp')),
-				'precondition: converged against note1',
-			);
-			await rph({ type: 'lint', text: 'warm the engine' });
-			const note2Before = rpState.notes.note2.body;
-
-			// A word buffered but not yet folded in, so the pass in flight has a note write to perform.
-			await rpState.setSetting('pendingWords', ['Buffrp']);
-
-			// Park a pass at its dictionary-note read — a real suspension point, and the one the whole
-			// window hangs off. It has already resolved note1 as its side; everything after this is the
-			// user repointing the setting underneath it.
-			let release = null;
-			let onParked = null;
-			const parked = new Promise((resolve) => {
-				onParked = resolve;
-			});
-			const gate = new Promise((resolve) => {
-				release = resolve;
-			});
-			rpState.beforeNoteGet = async (noteId) => {
-				if (noteId !== 'note1') return;
-				rpState.beforeNoteGet = null;
-				onParked();
-				await gate;
-			};
-			const pass = rpState.noteSelectionChangeHandler();
-			await parked;
-
-			// The user pastes the new note id on the General tab. This fires the plugin's own onChange:
-			// cfg flips to note2 and resetSyncBase() writes '' so the next pass adopts note2's words
-			// instead of reading them as deletions.
-			const repoint = rpState.setSetting('dictionaryNoteId', 'note2');
-			await settle();
-			release();
-			await Promise.all([pass, repoint]);
-			await waitFor(() => false, 60); // let any follow-up pass settle
-
-			// The parked pass was reconciling against note1, so none of ITS writes may land on note2.
-			// (note2 legitimately gets rewritten afterwards by the repoint's own fresh pass, which
-			// adopts note2's words as a first run — that pass is correct and expected. What must never
-			// happen is note1's content arriving here.)
-			assert.ok(
-				rpState.notes.note2.body.includes('Myveryownwordrp') &&
-					rpState.notes.note2.body.includes('Secondownwordrp'),
-				'the newly-pointed note keeps its OWN words: ' + JSON.stringify(rpState.notes.note2.body),
-			);
-			assert.ok(
-				!rpState.notes.note2.body.includes('Alpharp') && !rpState.notes.note2.body.includes('Betarp'),
-				'and note1\'s words were never written over it: ' + JSON.stringify(rpState.notes.note2.body),
-			);
-			assert.ok(note2Before.includes('Myveryownwordrp'), 'sanity: the fixture had its own content');
-
-			// The base is the other half of the damage. `resetSyncBase()` writes '' on a repoint so the
-			// next pass is a FIRST RUN that adopts the new side's words instead of inferring deletions
-			// from them; an abandoned pass committing its note1 base over that would make every word
-			// note2 lacks look deleted on the very next reconcile.
-			const base = rpState.settings.syncBase || '';
-			assert.ok(
-				!base.includes('Alpharp') && !base.includes('Betarp'),
-				'the merge base describes the new note, never the old one: ' + JSON.stringify(base),
-			);
-			// And the buffered word was not silently retired by a pass that never landed it.
-			assert.ok(
-				(rpState.settings.pendingWords || []).includes('Buffrp') ||
-					rpState.notes.note2.body.includes('Buffrp'),
-				'the buffered word is still queued (or was legitimately folded into the new note)',
-			);
-		});
-
-	}
+	// The note-repoint block that stood here is gone with the dictionary note. Its claim — "a pass
+	// reconciling against the OLD note must not write its merged body over the NEWLY-POINTED one" —
+	// was about a side that no longer exists, and the file's version of exactly the same hazard (a
+	// repointed dictionaryPath mid-pass) is what the INV-A block below now drives end to end.
 
 	// ---- integration: INV-A, no durable write may outlive its configuration ----
 	// The identity guard that shipped was a check-then-act: evaluated once, with four suspension points
@@ -4446,24 +4367,24 @@ async function main() {
 		const mkRepoint = async (name) => {
 			const dir = fs.mkdtempSync(path.join(os.tmpdir(), `harper-${name}-`));
 			const dictFile = path.join(dir, 'dict.txt');
+			// The user's OTHER dictionary, which they are about to point the setting at. Its words are
+			// its own — this is the content an unguarded pass used to destroy.
+			const otherFile = path.join(dir, 'other.txt');
 			fs.writeFileSync(dictFile, 'Alpharp\nBetarp\n', 'utf8');
+			fs.writeFileSync(otherFile, 'Myveryownwordrp\n', 'utf8');
 			const st = await run({
 				dataDir: dir,
 				installationDir: DIST_DIR,
 				require: requireStub,
 				versionInfo: { version: '3.6.14', platform: 'desktop' },
-				initialSettings: { dictionaryNoteId: 'note1', dictionaryPath: dictFile },
-				notes: {
-					note1: { id: 'note1', body: '# h\n\nAlpharp\nBetarp\n', updated_time: 100 },
-					note2: { id: 'note2', body: '# other\n\nMyveryownwordrp\n', updated_time: 200 },
-				},
+				initialSettings: { dictionaryPath: dictFile },
 			});
 			assert.ok(
 				await waitFor(() => (st.settings.syncBase || '').includes('Alpharp')),
 				'precondition: converged',
 			);
 			await st.contentScriptMessageHandlers['harperCm']({ type: 'lint', text: 'warm' });
-			return { st, dictFile };
+			return { st, dictFile, otherFile };
 		};
 		const gate = () => {
 			let release = null;
@@ -4478,45 +4399,67 @@ async function main() {
 		};
 
 		await test('a pass repointed AFTER its guard still writes nothing (the check is at each write)', async () => {
-			const { st, dictFile } = await mkRepoint('postguard');
-			// Give the pass a note write to perform, then park it AT that write — i.e. already past any
-			// up-front guard, with the file rewrite and the base commit still ahead of it.
+			const { st, dictFile, otherFile } = await mkRepoint('postguard');
+			// Give the pass a durable write to perform, then park it BETWEEN its two writes — past the
+			// file rewrite, with the base commit still ahead. `writeSyncBase` re-reads syncBase before it
+			// writes, and that read is the second of the pass's two: the first is readSyncBase(), before
+			// the merge. Parking on the second one is therefore exactly the window this test needs, and
+			// it is the same window the note put used to provide.
 			await st.setSetting('pendingWords', ['Buffrp']);
 			const g = gate();
-			st.beforeNotePut = async (noteId) => {
-				if (noteId !== 'note1') return;
-				st.beforeNotePut = null;
+			let syncBaseReads = 0;
+			st.beforeSettingRead = async (key) => {
+				if (key !== 'syncBase') return;
+				syncBaseReads++;
+				if (syncBaseReads !== 2) return;
+				st.beforeSettingRead = null;
 				g.onParked();
 				await g.open;
 			};
 			const pass = st.noteSelectionChangeHandler();
 			await g.parked;
 
-			// The user repoints the dictionary note while the pass sits on its write. Given real time to
-			// land, so the pass really is resumed into a world that has already moved.
-			const repoint = st.setSetting('dictionaryNoteId', 'note2');
+			// The user repoints the dictionary file while the pass sits between its writes. Given real
+			// time to land, so the pass really is resumed into a world that has already moved.
+			const repoint = st.setSetting('dictionaryPath', otherFile);
 			await waitFor(() => false, 60);
 			g.release();
 			await Promise.all([pass, repoint]);
 			await waitFor(() => false, 300);
 
-			// Un-gated, the pass sailed on: it rewrote the user's external file to the new note's single
-			// word and committed its stale base over the '' resetSyncBase had just written, so the next
-			// reconcile read every missing word as a deletion.
-			const fileNow = fs.readFileSync(dictFile, 'utf8');
+			// Un-gated, the pass sailed on and committed its stale base over the '' resetSyncBase had
+			// just written — so the next reconcile read every word the new file lacks as a deletion and
+			// truncated it.
+			const otherNow = fs.readFileSync(otherFile, 'utf8');
 			assert.ok(
-				fileNow.includes('Alpharp') && fileNow.includes('Betarp'),
-				`the external dictionary file keeps its words: ${JSON.stringify(fileNow)}`,
+				otherNow.includes('Myveryownwordrp'),
+				`the newly-pointed file keeps its OWN word: ${JSON.stringify(otherNow)}`,
 			);
-			assert.ok(fileNow.includes('Myveryownwordrp'), 'and gains the newly-pointed note\'s word');
+			assert.ok(
+				!otherNow.includes('Alpharp') && !otherNow.includes('Betarp'),
+				`and the old file's words were never written over it: ${JSON.stringify(otherNow)}`,
+			);
+			// The base is the other half of the damage: it must describe the NEW file, never the old one.
 			const base = st.settings.syncBase || '';
-			assert.ok(base.includes('Alpharp') && base.includes('Myveryownwordrp'), `base is the union: ${base}`);
+			assert.ok(
+				!base.includes('Alpharp') && !base.includes('Betarp'),
+				`the merge base describes the new file, never the old one: ${JSON.stringify(base)}`,
+			);
+			// And the buffered word was not silently retired by a pass that never committed it.
+			assert.ok(
+				(st.settings.pendingWords || []).includes('Buffrp') || otherNow.includes('Buffrp'),
+				'the buffered word is still queued (or was legitimately folded into the new file)',
+			);
+			assert.ok(
+				fs.readFileSync(dictFile, 'utf8').includes('Alpharp'),
+				'and the file that was repointed AWAY from is left exactly as it was',
+			);
 		});
 
 		await test('a pass that STARTS mid-repoint is born stale and writes nothing', async () => {
-			const { st, dictFile } = await mkRepoint('basewindow');
-			// Park the repoint INSIDE resetSyncBase, right before it writes ''. `cfg` already names
-			// note2 while the base on disk still describes note1 — a world no snapshot can be
+			const { st, dictFile, otherFile } = await mkRepoint('basewindow');
+			// Park the repoint INSIDE resetSyncBase, right before it writes ''. `cfg` already names the
+			// other file while the base on disk still describes this one — a world no snapshot can be
 			// consistent with, and one no epoch comparison can detect, because nothing changes for the
 			// duration of a pass that both starts and finishes inside it.
 			const g = gate();
@@ -4526,7 +4469,7 @@ async function main() {
 				g.onParked();
 				await g.open;
 			};
-			const repoint = st.setSetting('dictionaryNoteId', 'note2');
+			const repoint = st.setSetting('dictionaryPath', otherFile);
 			await g.parked;
 
 			// Anything can start a reconcile here: the 60 s poll, or — as here — a note selection change.
@@ -4554,8 +4497,7 @@ async function main() {
 			installationDir: DIST_DIR,
 			require: requireStub,
 			versionInfo: { version: '3.6.14', platform: 'desktop' },
-			initialSettings: { dictionaryNoteId: 'nrnote', dictionaryPath: nrFile },
-			notes: { nrnote: { id: 'nrnote', body: '# h\n\nZorbulon\nQuixnar\n', updated_time: 100 } },
+			initialSettings: { dictionaryPath: nrFile },
 		});
 		const nrh = nrState.contentScriptMessageHandlers['harperCm'];
 
@@ -4566,8 +4508,10 @@ async function main() {
 			);
 			await nrh({ type: 'lint', text: 'warm' });
 
-			// The dictionary editor saves a new word; park its reconcile at the note read — one of the
-			// suspension points the write gates exist for.
+			// The dictionary editor saves a new word; park its reconcile at a real suspension point that
+			// precedes every durable write. That used to be the dictionary-note read; with the note gone
+			// the equivalent is the pass's own `pendingRemovals` snapshot, taken immediately before the
+			// merge.
 			let release = null;
 			let onParked = null;
 			const parked = new Promise((r) => {
@@ -4577,15 +4521,15 @@ async function main() {
 				release = r;
 			});
 			// A save reconciles TWICE: once to read the current list for the diff, then again inside
-			// applyWordEdits to land the edit. It is the SECOND one that reaches the write gates, so
-			// that is the one to park. Counting note reads is exact — nothing else reads this note
-			// while the save is running.
-			let noteReads = 0;
-			nrState.beforeNoteGet = async (noteId) => {
-				if (noteId !== 'nrnote') return;
-				noteReads += 1;
-				if (noteReads < 2) return;
-				nrState.beforeNoteGet = null;
+			// applyWordEdits to land the edit. It is the SECOND one that reaches the write gates, so that
+			// is the one to park. The reads are countable and deterministic: pass 1 takes one, the
+			// persistAddedWord in between takes one, and the third is pass 2's.
+			let removalReads = 0;
+			nrState.beforeSettingRead = async (key) => {
+				if (key !== 'pendingRemovals') return;
+				removalReads += 1;
+				if (removalReads < 3) return;
+				nrState.beforeSettingRead = null;
 				onParked();
 				await open;
 			};
@@ -4626,8 +4570,8 @@ async function main() {
 				reply.words.includes('Newword'),
 				`and its word list contains it: ${JSON.stringify(reply.words)}`,
 			);
-			assert.ok(nrState.notes.nrnote.body.includes('Newword'), 'the note really has it');
-			assert.ok(fs.readFileSync(nrFile, 'utf8').includes('Newword'), 'and so does the file');
+			assert.ok(fs.readFileSync(nrFile, 'utf8').includes('Newword'), 'the file really has it');
+			assert.ok((nrState.settings.syncBase || '').includes('Newword'), 'and the pass committed its base');
 
 			await nrState.setSetting('ignoreNonEnglish', false);
 		});
@@ -4635,13 +4579,14 @@ async function main() {
 		await test('a reconcile started inside the loadSettings window writes nothing', async () => {
 			// THE DIRECTION THE NARROWING COULD BREAK. `loadSettings` rewrites cfg through eight
 			// sequential reads, and the dictionary identity flips partway through — so between that
-			// flip and `resetSyncBase` the configuration names the NEW note while the merge base still
+			// flip and `resetSyncBase` the configuration names the NEW file while the merge base still
 			// describes the old one. A pass starting there reads a pair that was never simultaneously
 			// true, and nothing changes for its duration, so no epoch COMPARISON can catch it: only the
 			// bracket marking the whole span as a transition does. Parking at a durable write instead
 			// would prove nothing, because the identity comparison in passIsStale catches a repoint
 			// there whether or not the epoch is involved at all.
-			nrState.notes.nrwindow = { id: 'nrwindow', body: '# other\n\nWindowwordnr\n', updated_time: 400 };
+			const nrOther = path.join(nrDir, 'other.txt');
+			fs.writeFileSync(nrOther, 'Windowwordnr\n', 'utf8');
 			assert.ok(
 				await waitFor(() => (nrState.settings.syncBase || '').includes('Newword')),
 				'precondition: settled on the current note',
@@ -4649,7 +4594,7 @@ async function main() {
 			const fileBefore = fs.readFileSync(nrFile, 'utf8');
 			assert.ok(fileBefore.includes('Zorbulon') && fileBefore.includes('Quixnar'));
 
-			// Park inside loadSettings, on the read that follows dictionaryNoteId.
+			// Park inside loadSettings, on the last read — well after dictionaryPath has already flipped.
 			let release2 = null;
 			let onParked2 = null;
 			const parked2 = new Promise((r) => {
@@ -4664,7 +4609,7 @@ async function main() {
 				onParked2();
 				await open2;
 			};
-			const repoint = nrState.setSetting('dictionaryNoteId', 'nrwindow');
+			const repoint = nrState.setSetting('dictionaryPath', nrOther);
 			await parked2;
 
 			// A reconcile starting in that window — the 60 s poll, or a note selection change.
@@ -4674,19 +4619,24 @@ async function main() {
 			await repoint;
 			await waitFor(() => false, 200);
 
-			// Without the bracket the pass merges the NEW note against the OLD base, reads every word
-			// the new note lacks as a deletion, and truncates the user's external dictionary file.
+			// Without the bracket the pass merges the NEW file against the OLD base, reads every word the
+			// new file lacks as a deletion, and truncates the dictionary it was pointed away from.
 			const fileAfter = fs.readFileSync(nrFile, 'utf8');
 			assert.ok(
 				fileAfter.includes('Zorbulon') && fileAfter.includes('Quixnar'),
 				`the external dictionary file keeps its words: ${JSON.stringify(fileAfter)}`,
 			);
-			// ...and the base ends up describing the union the repoint's own fresh pass adopts, never
-			// the shrunken set the abandoned pass computed.
-			const baseAfter = nrState.settings.syncBase || '';
-			assert.ok(
-				baseAfter.includes('Zorbulon') && baseAfter.includes('Windowwordnr'),
-				`the merge base is the first-run union: ${baseAfter}`,
+			// ...and the base ends up describing the NEW file, exactly as the repoint's own fresh first-run
+			// pass computes it — never the shrunken set the abandoned pass derived by merging the new
+			// file against the old file's base.
+			//
+			// With the note gone this is the new file's own words alone, not a union: repointing the file
+			// replaces the only durable side there is, so the old file's words are simply not part of the
+			// new configuration. The old file keeps them (asserted above); the base does not claim them.
+			assert.deepStrictEqual(
+				JSON.parse(nrState.settings.syncBase || 'null'),
+				['Windowwordnr'],
+				`the merge base is the new file's own first run: ${nrState.settings.syncBase}`,
 			);
 		});
 	}
@@ -4701,8 +4651,7 @@ async function main() {
 			installationDir: DIST_DIR,
 			require: requireStub,
 			versionInfo: { version: '3.6.14', platform: 'desktop' },
-			initialSettings: { dictionaryNoteId: 'spnote', dictionaryPath: spFile },
-			notes: { spnote: { id: 'spnote', body: '# h\n\nAlphasp\nBetasp\n', updated_time: 100 } },
+			initialSettings: { dictionaryPath: spFile },
 		});
 		const sph = spState.contentScriptMessageHandlers['harperCm'];
 
@@ -4714,25 +4663,24 @@ async function main() {
 			// had just put into the engine directly.
 			const acDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-applyconf-'));
 			const acFile = path.join(acDir, 'dict.txt');
+			const acOther = path.join(acDir, 'other.txt');
 			fs.writeFileSync(acFile, 'Alphaac\nBetaac\n', 'utf8');
+			fs.writeFileSync(acOther, 'Otherac\n', 'utf8');
 			const acState = await run({
 				dataDir: acDir,
 				installationDir: DIST_DIR,
 				require: requireStub,
 				versionInfo: { version: '3.6.14', platform: 'desktop' },
-				initialSettings: { dictionaryNoteId: 'acnote', dictionaryPath: acFile },
-				notes: {
-					acnote: { id: 'acnote', body: '# h\n\nAlphaac\nBetaac\n', updated_time: 100 },
-					acother: { id: 'acother', body: '# other\n\nOtherac\n', updated_time: 200 },
-				},
+				initialSettings: { dictionaryPath: acFile },
 			});
 			const ach = acState.contentScriptMessageHandlers['harperCm'];
 			assert.ok(
 				await waitFor(() => (acState.settings.syncBase || '').includes('Alphaac')),
 				'precondition: converged',
 			);
-			// An editor is open, so the note write is L3-deferred and no durable-write gate is reached —
-			// the pass falls all the way through to the engine publish.
+			// An editor is open. add-to-dictionary appends the word to the file itself, so the merge that
+			// follows finds the file already correct and rewrites nothing — the pass reaches the engine
+			// publish with no file-rewrite gate having fired.
 			await ach({ type: 'getConfig' });
 			await ach({ type: 'addWord', word: 'Gammaac' });
 			assert.strictEqual(
@@ -4753,9 +4701,11 @@ async function main() {
 			const passOpen = new Promise((r) => {
 				releasePass = r;
 			});
-			acState.beforeNoteGet = async (noteId) => {
-				if (noteId !== 'acnote') return;
-				acState.beforeNoteGet = null;
+			// Parked on the pass's own merge-base read — the suspension point that used to be its
+			// dictionary-note read, and still the last one before anything is computed.
+			acState.beforeSettingRead = async (key) => {
+				if (key !== 'syncBase') return;
+				acState.beforeSettingRead = null;
 				onPassParked();
 				await passOpen;
 			};
@@ -4778,7 +4728,7 @@ async function main() {
 				onRepointParked();
 				await repointOpen;
 			};
-			const repoint = acState.setSetting('dictionaryNoteId', 'acother');
+			const repoint = acState.setSetting('dictionaryPath', acOther);
 			await repointParked;
 
 			// The stale pass now resolves and applyConfiguration decides whether to publish it. Awaiting
@@ -4801,9 +4751,9 @@ async function main() {
 				await waitFor(() => (spState.settings.syncBase || '').includes('Alphasp')),
 				'precondition: converged',
 			);
-			// An editor is open — the normal state, and what makes the note write L3-deferred so that
-			// NONE of the durable-write gates is reached. The pass then used to fall straight through
-			// and clear-then-import a merge computed against a configuration that no longer exists.
+			// An editor is open — the normal state. Nothing about the merge below changes the file, so no
+			// file-rewrite gate is reached either; the pass used to fall straight through and
+			// clear-then-import a merge computed against a configuration that no longer exists.
 			await sph({ type: 'getConfig' });
 			assert.strictEqual(
 				(await sph({ type: 'lint', text: 'Alphasp and Betasp are fine.' })).length,
@@ -4864,7 +4814,11 @@ async function main() {
 			release();
 			await repoint;
 			await waitFor(() => false, 300);
-			assert.strictEqual(spState.notePuts.length, 0, 'and the stale pass wrote nothing durable either');
+			assert.strictEqual(spState.notePuts.length, 0, 'and the stale pass wrote no note at all');
+			assert.ok(
+				fs.readFileSync(spFile, 'utf8').includes('Betasp'),
+				'nor did it truncate the file it was pointed away from',
+			);
 		});
 	}
 
@@ -4876,8 +4830,9 @@ async function main() {
 			installationDir: DIST_DIR,
 			require: requireStub,
 			versionInfo: { version: '3.6.14', platform: 'desktop' },
-			initialSettings: { dictionaryNoteId: 'dwnote' },
-			notes: { dwnote: { id: 'dwnote', body: '# h\n\nKeepdw\n', updated_time: 100 } },
+			// No durable dictionary side at all: this block is about the engine's IGNORE set, and the
+			// words are only here to give the reconcile something to do.
+			initialSettings: { pendingWords: ['Keepdw'] },
 		});
 		const dwh = dwState.contentScriptMessageHandlers['harperCm'];
 		const dwIgnore = path.join(dlDir2, 'ignoredLints.json');
@@ -4912,9 +4867,12 @@ async function main() {
 			const open = new Promise((r) => {
 				release = r;
 			});
-			dwState.beforeNoteGet = async (noteId) => {
-				if (noteId !== 'dwnote') return;
-				dwState.beforeNoteGet = null;
+			// Parked on the reconcile's own `pendingRemovals` snapshot — the suspension point that used to
+			// be the dictionary-note read. It is the first read of that key after the dialect change, so
+			// it is unambiguously the pass applyConfiguration started.
+			dwState.beforeSettingRead = async (key) => {
+				if (key !== 'pendingRemovals') return;
+				dwState.beforeSettingRead = null;
 				onParked();
 				await open;
 			};
@@ -5141,13 +5099,14 @@ async function main() {
 	// ---- integration: a stale dialog cannot resurrect a word deleted elsewhere ----
 	{
 		const rsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-resurrect-'));
+		const rsFile = path.join(rsDir, 'dict.txt');
+		fs.writeFileSync(rsFile, 'Alpharx\nBetarx\nCharlirx\n', 'utf8');
 		const rsState = await run({
 			dataDir: rsDir,
 			installationDir: DIST_DIR,
 			require: requireStub,
 			versionInfo: { version: '3.6.14', platform: 'desktop' },
-			initialSettings: { dictionaryNoteId: 'rsnote' },
-			notes: { rsnote: { id: 'rsnote', body: '# h\n\nAlpharx\nBetarx\nCharlirx\n', updated_time: 100 } },
+			initialSettings: { dictionaryPath: rsFile },
 		});
 		const rsh = rsState.contentScriptMessageHandlers['harperCm'];
 		const rspoll = () => rsState.intervals.find((i) => i.ms === 60000 && !i.cleared).fn();
@@ -5162,10 +5121,11 @@ async function main() {
 			const baseline = (await rsh({ type: 'settings:snapshot', includeDescriptions: false })).dictionaryWords;
 			assert.ok(baseline.includes('Charlirx'), 'precondition: the editor was seeded with Charlirx');
 
-			// Another device deletes Charlirx; the 60 s poll folds the sync in. No race, just an open
-			// dialog and wall-clock time.
-			rsState.notes.rsnote.body = '# h\n\nAlpharx\nBetarx\n';
-			rsState.notes.rsnote.updated_time += 100;
+			// Another device deletes Charlirx and rclone lands that copy; the 60 s poll folds it in. No
+			// race, just an open dialog and wall-clock time.
+			fs.writeFileSync(rsFile, 'Alpharx\nBetarx\n', 'utf8');
+			const future = new Date(Date.now() + 3000);
+			fs.utimesSync(rsFile, future, future);
 			rspoll();
 			assert.ok(await waitFor(() => !(rsState.settings.syncBase || '').includes('Charlirx')));
 
@@ -5176,13 +5136,16 @@ async function main() {
 				baseline: baseline,
 			});
 
-			// An add is NOT the harmless direction: a pendingWords entry outranks an inferred deletion
-			// by design and cancels a queued removal outright, so Charlirx would be written back into
-			// the note and synced to every device — silently undoing the deletion.
+			// An add is NOT the harmless direction: a pendingWords entry outranks an inferred deletion by
+			// design and cancels a queued removal outright, so Charlirx would be written back into the
+			// file and carried to every device by the sync note — silently undoing the deletion.
 			assert.deepStrictEqual(res.adds, ['Deltarx'], 'only the word the user actually typed is added');
 			assert.ok(!res.words.includes('Charlirx'), 'the deleted word stays deleted');
-			assert.ok(!rsState.notes.rsnote.body.includes('Charlirx'), 'and is not written back into the note');
-			assert.ok(rsState.notes.rsnote.body.includes('Deltarx'), 'while the real addition lands');
+			assert.ok(await waitFor(() => fs.readFileSync(rsFile, 'utf8').includes('Deltarx')), 'the real addition lands');
+			assert.ok(
+				!fs.readFileSync(rsFile, 'utf8').includes('Charlirx'),
+				'and the deleted word is not written back into the file',
+			);
 			assert.ok(
 				(await rsh({ type: 'lint', text: 'I said Charlirx today.' })).some((l) => l.problemText === 'Charlirx'),
 				'the engine flags it again, as the deletion asked',
@@ -5393,8 +5356,9 @@ async function main() {
 			);
 		});
 
-		await test('zed export: sparse linters, dialect by name, and never a statsPath', () => {
-			const { buildZedSettings, sparseLinters, zedDialect } = loadTsModule('src/zedExport.ts');
+		await test('settings export: sparse linters, dialect by name, flat, and never a statsPath', () => {
+			const { buildSettingsExport, buildSettingsExportFile, sparseLinters, exportDialect } =
+				loadTsModule('src/settingsExport.ts');
 			const defaults = { KeepDefault: true, FlippedOff: true, FlippedOn: false };
 			const overrides = { KeepDefault: true, FlippedOff: false, FlippedOn: true, UnknownToThisBuild: false };
 			assert.deepStrictEqual(
@@ -5402,18 +5366,39 @@ async function main() {
 				{ FlippedOff: false, FlippedOn: true, UnknownToThisBuild: false },
 				'a rule explicitly set to its own default is dropped; one this build has no default for is KEPT',
 			);
-			const block = buildZedSettings({ overrides, defaults, dialect: 'British' });
-			// Zed nests harper-ls's own config root INSIDE its LSP block: the key appears twice, and
-			// getting it wrong yields a block that pastes cleanly and does nothing at all.
-			const inner = block.lsp['harper-ls'].settings['harper-ls'];
-			assert.strictEqual(inner.dialect, 'British', 'the dialect crosses by name');
-			assert.deepStrictEqual(inner.linters, { FlippedOff: false, FlippedOn: true, UnknownToThisBuild: false }, 'only the sparse map');
+			const block = buildSettingsExport({ overrides, defaults, dialect: 'British' });
+			// FLAT, and in harper's own vocabulary. The first cut of this nested the object inside Zed's
+			// `lsp["harper-ls"].settings["harper-ls"]`; the file belongs to no particular editor now, so
+			// any nesting would be one editor's convention imposed on every other reader.
+			assert.deepStrictEqual(Object.keys(block).sort(), ['dialect', 'linters'], 'two keys, no wrapper');
+			assert.strictEqual(block.dialect, 'British', 'the dialect crosses by name');
+			assert.deepStrictEqual(block.linters, { FlippedOff: false, FlippedOn: true, UnknownToThisBuild: false }, 'only the sparse map');
 			assert.ok(!JSON.stringify(block).includes('statsPath'), 'statsPath is NEVER emitted (it silently relocates harper-ls dictionaries)');
+			assert.ok(!JSON.stringify(block).includes('lsp'), 'and no editor-specific nesting');
 			// An unrecognised dialect fails harper-ls's whole config parse, so it falls back instead.
-			assert.strictEqual(zedDialect('Klingon'), 'American', 'an unknown dialect degrades to American');
+			assert.strictEqual(exportDialect('Klingon'), 'American', 'an unknown dialect degrades to American');
+
+			// An empty override map OMITS `linters` rather than writing `{}` — the same thing to every
+			// reader, without inviting anyone to wonder whether Harper meant "disable everything".
+			const bare = buildSettingsExport({ overrides: {}, defaults, dialect: 'American' });
+			assert.deepStrictEqual(bare, { dialect: 'American' }, 'no linters key when nothing is overridden');
+
+			// DETERMINISTIC BYTES, which is what makes "write only when the content changed" a real
+			// no-op rather than a coin flip that would re-dirty the user's file on every warm-up.
+			const once = buildSettingsExportFile({ overrides, defaults, dialect: 'British' });
+			const twice = buildSettingsExportFile({
+				// Same map, different insertion order.
+				overrides: { UnknownToThisBuild: false, FlippedOn: true, FlippedOff: false, KeepDefault: true },
+				defaults,
+				dialect: 'British',
+			});
+			assert.strictEqual(once, twice, 'key order in the input cannot change the output bytes');
+			assert.ok(once.endsWith('}\n'), 'exactly one trailing newline');
+			assert.ok(once.includes('\t'), 'tab-indented');
+			assert.deepStrictEqual(JSON.parse(once), block, 'and it is just the block, pretty-printed');
 		});
 
-		await test('the sync notice appears for a v1.4.x dictionary note, and goes away once a sync note is set', () => {
+		await test('the upgrade notice appears for a legacy dictionary note, and goes away once a sync note is set', () => {
 			const { SYNC_UPGRADE_NOTICE, syncNoticeFor } = loadTsModule('src/settingsService.ts', (id) =>
 				id === './dismissedLog' ? loadTsModule('src/dismissedLog.ts') : require(id),
 			);
@@ -5427,6 +5412,13 @@ async function main() {
 			assert.strictEqual(syncNoticeFor({ ...base, dictionaryNoteId: '', syncNoteId: '' }), null, 'a user who never had a dictionary note sees nothing');
 			assert.ok(SYNC_UPGRADE_NOTICE.includes('Harper: Create sync note'), 'the notice names the command that resolves it');
 			assert.ok(!/\n|—/.test(SYNC_UPGRADE_NOTICE), 'the copy is one unbroken line with no em dashes');
+			// THE APPROVED COPY, verbatim. It has two jobs: say the old note is dead (not merely
+			// superseded — nothing reads it any more), and name the one command that replaces it.
+			assert.strictEqual(
+				SYNC_UPGRADE_NOTICE,
+				'Your dictionary note is no longer used. Create a sync note with the command ' +
+					'Harper: Create sync note, and delete the old dictionary note if you like.',
+			);
 		});
 
 		// ---- the live plugin, driven end to end ------------------------------
@@ -5436,21 +5428,29 @@ async function main() {
 		const snotes = {
 			'old-dict': { id: 'old-dict', body: '# header\n\nOldword\n', updated_time: 5 },
 		};
+		// The export path is chosen HERE, file name and all, because the setting is a full absolute path
+		// and the plugin has no default name to fall back on. A deliberately unremarkable name, so a
+		// hardcoded one anywhere in the plugin would fail this block rather than accidentally match it.
+		const exportFile = path.join(syncDataDir, 'my-harper-export.json');
 		const sstate = await run({
 			dataDir: syncDataDir,
 			installationDir: DIST_DIR,
 			require: requireStub,
 			versionInfo: { version: '3.6.14', platform: 'desktop' },
-			// A v1.4.1 install: an old dictionary note AND an external file, no sync note yet.
-			initialSettings: { dictionaryNoteId: 'old-dict', dictionaryPath: syncDictPath },
+			// A v1.4.x install upgrading: a LEGACY dictionary-note id still in the settings, an external
+			// file, an export path, and no sync note yet.
+			initialSettings: {
+				dictionaryNoteId: 'old-dict',
+				dictionaryPath: syncDictPath,
+				settingsPath: exportFile,
+			},
 			notes: snotes,
 			selectedFolder: { id: 'folder-1' },
 		});
 		const sh = sstate.contentScriptMessageHandlers['harperCm'];
-		const zedFile = path.join(syncDataDir, 'zed-harper-ls.json');
-		const readZed = () => {
+		const readExport = () => {
 			try {
-				return JSON.parse(fs.readFileSync(zedFile, 'utf8'));
+				return JSON.parse(fs.readFileSync(exportFile, 'utf8'));
 			} catch {
 				return null;
 			}
@@ -5459,15 +5459,24 @@ async function main() {
 		const syncNoteBody = () => (sstate.notes[sstate.settings.syncNoteId] || {}).body || '';
 		const syncNotePayload = () => parseSyncNoteBody(syncNoteBody());
 
-		await test('sync note: with none configured, v1.4.1 dictionary-note behaviour is untouched', async () => {
+		// This used to assert the opposite: that with no sync note configured, the old dictionary note was
+		// still written exactly as in v1.4.1. That was v1.5.0's "stand-down", and it is gone — the note
+		// is not deprecated, it is removed, so the claim to pin is that NOTHING touches it.
+		await test('the legacy dictionary note is inert: a local add goes to the file and never to the note', async () => {
+			const oldBodyBefore = sstate.notes['old-dict'].body;
 			await sh({ type: 'getConfig' });
 			await sh({ type: 'addWord', word: 'Preupgradeword' });
-			const putsBefore = sstate.notePuts.length;
 			await sstate.noteSelectionChangeHandler();
-			assert.ok(await waitFor(() => sstate.notePuts.length > putsBefore), 'the old dictionary note was still written');
-			const put = sstate.notePuts[sstate.notePuts.length - 1];
-			assert.strictEqual(put.id, 'old-dict', 'and it is the OLD note, exactly as in v1.4.1');
-			assert.ok(/(^|\n)Preupgradeword(\n|$)/.test(put.body), 'with the new word in it');
+			assert.ok(
+				await waitFor(() => fs.readFileSync(syncDictPath, 'utf8').includes('Preupgradeword')),
+				'the word reached the external file',
+			);
+			assert.strictEqual(sstate.notePuts.length, 0, 'and no note was written at all');
+			assert.strictEqual(
+				sstate.notes['old-dict'].body,
+				oldBodyBefore,
+				'the legacy note is left exactly as the user last saw it',
+			);
 		});
 
 		await test('"Harper: Create sync note" posts a parseable note, seeded from local state, and stores its id', async () => {
@@ -5484,6 +5493,32 @@ async function main() {
 			assert.ok(payload, 'the freshly created note parses as sync state');
 			assert.ok(payload.words.includes('Preupgradeword'), `seeded from local state, got ${JSON.stringify(payload.words)}`);
 			assert.ok(payload.words.includes('Alreadythere'), 'the external file\'s words are in the seed too');
+			// THE ONE-TIME LEGACY FOLD. "Oldword" exists only in the old dictionary note, in the old
+			// one-word-per-line format. A device whose vocabulary lived solely there would otherwise lose
+			// it the moment the note stopped being read.
+			assert.ok(
+				payload.words.includes('Oldword'),
+				`the legacy note's words were folded into the seed, got ${JSON.stringify(payload.words)}`,
+			);
+			assert.ok(
+				!payload.words.some((w) => w.startsWith('# ')),
+				'and its "# " header line was dropped, not stored as a word',
+			);
+			// Folded into LOCAL state as well, not just into the note body: this device records the
+			// seed's own content key, so it never applies its own handwriting back — a word that reached
+			// only the note would sit there unrecognised by the engine that is supposed to accept it.
+			assert.ok(
+				fs.readFileSync(syncDictPath, 'utf8').includes('Oldword'),
+				'the folded word reached the external file too',
+			);
+			assert.deepStrictEqual(
+				(await sh({ type: 'lint', text: 'Oldword alone.' })).filter((l) => l.kind === 'Spelling'),
+				[],
+				'and the engine accepts it',
+			);
+			// READ-ONLY, ALWAYS. The old note is never written and never deleted.
+			assert.strictEqual(sstate.notes['old-dict'].body, '# header\n\nOldword\n', 'the old note is untouched');
+			assert.strictEqual(sstate.dataDeletes.length, 0, 'and nothing was deleted');
 			// The harness's post returns `created-N`; the plugin must persist exactly that.
 			assert.ok(await waitFor(() => !!sstate.settings.syncNoteId), 'the id landed in the setting');
 			assert.ok(sstate.notes[sstate.settings.syncNoteId], 'and the id addresses a note that exists');
@@ -5493,17 +5528,16 @@ async function main() {
 			assert.strictEqual(sstate.dataPosts.length, postsBefore2, 'a live sync note is reused, not duplicated');
 		});
 
-		await test('sync note: the old dictionary note STANDS DOWN once a sync note owns the state', async () => {
+		await test('sync note: local words reach it, and the legacy note is still never written', async () => {
 			const oldBodyBefore = sstate.notes['old-dict'].body;
 			await sh({ type: 'getConfig' });
 			await sh({ type: 'addWord', word: 'Standdownword' });
-			const oldPutsBefore = sstate.notePuts.filter((p) => p.id === 'old-dict').length;
 			await sstate.noteSelectionChangeHandler();
 			assert.ok(await waitFor(() => (syncNotePayload() || { words: [] }).words.includes('Standdownword')), 'the word reached the SYNC note');
 			assert.strictEqual(
 				sstate.notePuts.filter((p) => p.id === 'old-dict').length,
-				oldPutsBefore,
-				'and the old dictionary note was not written at all',
+				0,
+				'and the old dictionary note has never been written, before the fold or after it',
 			);
 			assert.strictEqual(sstate.notes['old-dict'].body, oldBodyBefore, 'the old note is left exactly as the user last saw it');
 		});
@@ -5647,9 +5681,27 @@ async function main() {
 			assert.ok(payload.words.includes('Remoteword'), 'and the rewrite carried the rest of local state, not just the new word');
 		});
 
-		await test('zed export: the file appears beside the dictionary and tracks a rule change', async () => {
-			// The startup pass already wrote it (a dictionaryPath was configured from the first run).
-			assert.ok(await waitFor(() => readZed() !== null), `${zedFile} exists`);
+		await test('settings export: the file appears at the configured path and tracks a rule change', async () => {
+			// The warm-up already wrote it (a settingsPath was configured from the first run), at exactly
+			// the path the setting names — the plugin picks no file name of its own.
+			assert.ok(await waitFor(() => readExport() !== null), `${exportFile} exists`);
+			// No SECOND copy anywhere: the removed sidecar had a hardcoded name, and the point of the
+			// setting being a full path is that the plugin never picks one. (dismissedMeta.json and
+			// ignoredLints.json are the plugin's own dataDir bookkeeping, which happens to live here.)
+			const strays = fs
+				.readdirSync(syncDataDir)
+				.filter((f) => f.endsWith('.json'))
+				.filter((f) => f !== 'my-harper-export.json' && f !== 'dismissedMeta.json' && f !== 'ignoredLints.json');
+			assert.deepStrictEqual(strays, [], `no second, plugin-named export was written: ${strays.join(',')}`);
+			// Flat, two keys at most. (The "no `linters` key at all until a rule moves" case is pinned by
+			// the pure builder test above; by the time this serial block reaches here an earlier test has
+			// already toggled a rule, so it cannot be asserted from this fixture.)
+			assert.ok(
+				Object.keys(readExport()).every((k) => k === 'dialect' || k === 'linters'),
+				`only harper's own keys: ${JSON.stringify(Object.keys(readExport()))}`,
+			);
+			assert.ok(readExport().dialect, 'the dialect is always present');
+
 			// The rule is picked from harper's OWN defaults rather than named here: the export is
 			// deliberately sparse, so a rule that already defaults to off would correctly produce no
 			// entry at all and the assertion below would be testing nothing.
@@ -5661,44 +5713,73 @@ async function main() {
 			await sstate.setSetting('ruleOverrides', JSON.stringify({ [onByDefault]: false }));
 			assert.ok(
 				await waitFor(() => {
-					const zed = readZed();
-					const linters = zed && zed.lsp['harper-ls'].settings['harper-ls'].linters;
+					const linters = (readExport() || {}).linters;
 					return !!linters && linters[onByDefault] === false;
 				}),
-				`the export tracked turning "${onByDefault}" off:\n${fs.readFileSync(zedFile, 'utf8')}`,
+				`the export tracked turning "${onByDefault}" off:\n${fs.readFileSync(exportFile, 'utf8')}`,
 			);
-			// ...and the dialect, which is the OTHER half of what harper-ls takes from us.
+			// ...and the dialect, which is the OTHER half of what a consumer takes from us.
 			await sstate.setSetting('dialect', 'British');
 			assert.ok(
-				await waitFor(() => {
-					const zed = readZed();
-					return !!zed && zed.lsp['harper-ls'].settings['harper-ls'].dialect === 'British';
-				}),
-				`the export tracked the dialect change:\n${fs.readFileSync(zedFile, 'utf8')}`,
+				await waitFor(() => (readExport() || {}).dialect === 'British'),
+				`the export tracked the dialect change:\n${fs.readFileSync(exportFile, 'utf8')}`,
 			);
-			assert.ok(!fs.readFileSync(zedFile, 'utf8').includes('statsPath'), 'and still never emits statsPath');
+			const text = fs.readFileSync(exportFile, 'utf8');
+			assert.ok(!text.includes('statsPath'), 'and still never emits statsPath');
+			assert.ok(!text.includes('lsp'), 'flat: no editor-specific nesting reached the file');
+			assert.ok(!text.includes(syncDictPath), 'and no per-device path leaked into it');
 		});
 
-		await test('zed export: the dialog\'s "Copy Zed settings block" returns the same bytes it copied', async () => {
-			const dialogCommand = sstate.commands.find((c) => c.name === 'harper.openSettings');
-			await dialogCommand.execute();
-			const handle = `dialog-${sstate.dialogs[sstate.dialogs.length - 1]}`;
-			const handler = sstate.viewMessageHandlers[handle];
-			const writesBefore = sstate.clipboardWrites.length;
-			const reply = await handler({ type: 'settings:zedBlock', copy: true });
-			assert.ok(reply && typeof reply.text === 'string' && reply.text.length, `the block came back, got ${JSON.stringify(reply)}`);
-			assert.strictEqual(reply.copied, true, 'and it reached the clipboard on desktop');
-			assert.strictEqual(sstate.clipboardWrites.length, writesBefore + 1, 'exactly one clipboard write');
-			assert.strictEqual(sstate.clipboardWrites[sstate.clipboardWrites.length - 1], reply.text, 'the clipboard got exactly what the dialog shows');
-			// ONE BUILDER for the file and the block, so a user pasting cannot get something subtly
-			// different from what the plugin maintains on disk.
-			assert.strictEqual(`${reply.text}\n`, fs.readFileSync(zedFile, 'utf8'), 'the block is the file, minus its trailing newline');
-			assert.strictEqual(reply.filePath, zedFile, 'and the dialog can say where that file is');
+		await test('settings export: rewritten only when the exported state actually changes', async () => {
+			// The plugin OWNS this file and overwrites it wholesale, so the only thing standing between a
+			// user and a dotfile that re-dirties its sync on every warm-up is the unchanged-content guard.
+			const before = fs.statSync(exportFile).mtimeMs;
+			const bytesBefore = fs.readFileSync(exportFile, 'utf8');
+			// A settings change the export is NOT a projection of. It reconfigures the plugin and pokes
+			// every window, so it exercises the full refresh path — and must still leave the file alone.
+			await sstate.setSetting('underlineStyle', 'solid');
+			await waitFor(() => false, 120);
+			assert.strictEqual(fs.readFileSync(exportFile, 'utf8'), bytesBefore, 'content unchanged');
+			assert.strictEqual(fs.statSync(exportFile).mtimeMs, before, 'and the file was not rewritten at all');
+
+			// ...whereas a change it IS a projection of rewrites it wholesale.
+			await sstate.setSetting('dialect', 'Australian');
+			assert.ok(
+				await waitFor(() => (readExport() || {}).dialect === 'Australian'),
+				'a dialect change rewrites the file',
+			);
+			assert.notStrictEqual(fs.readFileSync(exportFile, 'utf8'), bytesBefore, 'with different bytes');
+		});
+
+		await test('settings export: an empty path turns the whole mechanism off', async () => {
+			const otherPath = path.join(syncDataDir, 'should-never-appear.json');
+			await sstate.setSetting('settingsPath', '');
+			const bytesAtSwitchOff = fs.readFileSync(exportFile, 'utf8');
+			await sstate.setSetting('dialect', 'Canadian');
+			await waitFor(() => false, 120);
+			assert.strictEqual(
+				fs.readFileSync(exportFile, 'utf8'),
+				bytesAtSwitchOff,
+				'with no path configured the last-written file is left exactly as it was',
+			);
+			assert.ok(!fs.existsSync(otherPath), 'and nothing is written anywhere else');
+			// Re-pointing it is itself a request to put the block there, honoured without waiting for
+			// the user's next rule toggle.
+			await sstate.setSetting('settingsPath', otherPath);
+			assert.ok(
+				await waitFor(() => fs.existsSync(otherPath)),
+				'pointing the setting at a new path writes it there straight away',
+			);
+			assert.strictEqual(JSON.parse(fs.readFileSync(otherPath, 'utf8')).dialect, 'Canadian', 'with current state');
 		});
 
 		await test('the settings snapshot carries the sync notice and the new note id', async () => {
+			// The dialog is opened HERE now. It used to be opened by the "Copy Zed settings block" test
+			// that ran just above this one, which went with the button.
+			await sstate.commands.find((c) => c.name === 'harper.openSettings').execute();
 			const handle = `dialog-${sstate.dialogs[sstate.dialogs.length - 1]}`;
 			const handler = sstate.viewMessageHandlers[handle];
+			assert.ok(typeof handler === 'function', 'the dialog registered its message endpoint');
 			const snapshot = await handler({ type: 'settings:snapshot', includeDescriptions: false });
 			assert.strictEqual(snapshot.settings.syncNoteId, sstate.settings.syncNoteId, 'the dialog sees the configured sync note');
 			// Both notes are set here, so the notice must be silent — it only fires for the stale pairing.
