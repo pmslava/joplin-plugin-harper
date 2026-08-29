@@ -697,9 +697,14 @@
 			field(
 				'Sync note id',
 				noteId,
-				'A Joplin note Harper uses to sync your rules, dictionary and dismissed findings between ' +
-					'devices. It holds machine-readable data, so do not edit it by hand. Run ' +
-					'"Harper: Create sync note" to make one. Leave empty to turn the sync off.',
+				// APPROVED COPY, verbatim — the same words the native settings page carries for this key.
+				// Other rows here shorten their native description, but this one is load-bearing: it is
+				// the only place that says "do not edit it by hand", and the Harper window is where most
+				// users will meet the field at all (the native page hides it in the default mode).
+				'The id of a Joplin note that Harper uses to sync your rules, your dictionary and your ' +
+					'dismissed findings between devices. The note holds machine-readable data, so do not ' +
+					'edit it by hand. Use the "Harper: Create sync note" command to make one, or paste an ' +
+					'existing note id here. Leave empty to turn the sync off.',
 			),
 		);
 
