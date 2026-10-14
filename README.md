@@ -253,6 +253,13 @@ talking to it over Joplin's `postMessage` bridge.
 For the full design, the WASM loading approach, the UI spec, and the research behind the plugin, see
 [`docs/`](docs/) — in particular [`docs/SPEC.md`](docs/SPEC.md).
 
+## Support
+
+If this plugin is useful to you, support the work:
+[GitHub Sponsors](https://github.com/sponsors/pmslava) for monthly or one-time sponsorship, or
+[Ko-fi](https://ko-fi.com/pmslava) for a one-off tip by PayPal or card without an account. All
+options: [pmslava.com/support](https://pmslava.com/support/).
+
 ## License
 
 The plugin is licensed under the [MIT License](LICENSE).
